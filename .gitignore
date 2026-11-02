@@ -1,0 +1,44 @@
+# Go build and test outputs
+/bin/
+/qflux
+/quotes
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+/coverage.out
+/coverage.html
+
+# Generated runtime data
+/artifacts/
+/downloads/
+/connect.cfg
+/spec.json
+*.log
+*.tmp
+*.temp
+
+# Node tooling
+node_modules/
+
+# Python helper scripts
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

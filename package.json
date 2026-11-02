@@ -1,0 +1,11 @@
+{
+  "name": "qflux-quotes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Go 并发通达信行情下载台",
+  "scripts": {
+    "dev": "node scripts/go.mjs run",
+    "build": "node scripts/go.mjs build -o bin/quotes.exe ./cmd/qflux",
+    "test": "node scripts/go.mjs test ./..."
+  }
+}

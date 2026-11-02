@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>QFLUX · 行情下载台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%230c1220'/%3E%3Cpath d='M3 18h5l3-9 5 16 4-12 3 5h6' fill='none' stroke='%2322d3ee' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="QFLUX 行情下载台">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M3 18h5l3-9 5 16 4-12 3 5h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"/>
+        </svg>
+        <span class="brand-word">QFLUX</span>
+        <span class="brand-divider"></span>
+        <span class="brand-name">行情下载台</span>
+      </div>
+      <div class="topbar-meta">
+        <span class="connection"><i class="status-dot"></i><span id="connection-label">本地服务已连接</span></span>
+        <time id="clock" class="mono">--:--:--</time>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="config-panel">
+        <div class="section-heading">
+          <span class="eyebrow">01 / DOWNLOAD SETUP</span>
+          <h1>新建下载</h1>
+          <p>从通达信行情主站批量拉取 K 线，按证券分别保存为 CSV。</p>
+        </div>
+
+        <form id="download-form" novalidate>
+          <fieldset id="form-fields">
+            <div class="field-group">
+              <div class="label-row"><label>证券范围</label><span class="field-hint">SH / SZ / BJ</span></div>
+              <div class="segmented" role="group" aria-label="证券范围">
+                <button type="button" class="active" data-scope="markets" aria-pressed="true">市场码表</button>
+                <button type="button" data-scope="codes" aria-pressed="false">指定代码</button>
+              </div>
+              <div id="market-options" class="market-options">
+                <label class="check-row"><input type="checkbox" name="market" value="1" checked><span class="check-control"></span><span>上海</span><span class="market-code mono">SH</span></label>
+                <label class="check-row"><input type="checkbox" name="market" value="0" checked><span class="check-control"></span><span>深圳</span><span class="market-code mono">SZ</span></label>
+                <label class="check-row"><input type="checkbox" name="market" value="2"><span class="check-control"></span><span>北京</span><span class="market-code mono">BJ</span></label>
+              </div>
+              <div id="code-options" class="code-options" hidden>
+                <textarea id="codes" rows="3" placeholder="600000, 000001, 430047" spellcheck="false"></textarea>
+                <p class="help-text">逗号或换行分隔；可带 sh / sz / bj 前缀，无前缀时自动识别。</p>
+              </div>
+            </div>
+
+            <div class="form-grid">
+              <div class="field-group">
+                <label for="category">K 线周期</label>
+                <select id="category">
+                  <option value="9" selected>日线</option>
+                  <option value="4">日线（兼容类别 4）</option>
+                  <option value="5">周线</option>
+                  <option value="6">月线</option>
+                  <option value="0">5 分钟</option>
+                  <option value="1">15 分钟</option>
+                  <option value="2">30 分钟</option>
+                  <option value="3">60 分钟</option>
+                  <option value="7">1 分钟</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="count">每只条数</label>
+                <input id="count" type="number" min="1" max="800" value="800" inputmode="numeric">
+              </div>
+              <div class="field-group">
+                <label for="workers">并发 worker</label>
+                <input id="workers" type="number" min="1" max="64" value="12" inputmode="numeric">
+              </div>
+              <div class="field-group">
+                <label for="start" title="0 表示最新一段；800 表示跳过最新 800 根">跳过最新 K 线（根）</label>
+                <input id="start" type="number" min="0" value="0" inputmode="numeric" title="0 表示最新一段；800 表示跳过最新 800 根">
+              </div>
+            </div>
+
+            <div class="field-group">
+              <label for="output-dir">保存到</label>
+              <div class="path-control">
+                <input id="output-dir" type="text" value="downloads" spellcheck="false">
+                <button id="pick-output" class="path-picker" type="button" aria-label="选择保存目录" title="选择保存目录">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5h5l1.6 2h8.4v8h-15zM2.5 5.5v9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+              <p class="help-text">可手动输入或选择目录；每只股票一个文件，同名文件会替换。</p>
+            </div>
+
+            <details class="advanced">
+              <summary>复权与高级设置<span>OPTIONS</span></summary>
+              <div class="advanced-content">
+                <div class="field-group">
+                  <div class="label-row"><span>行情线路</span><span class="field-hint">BUILT-IN / AUTO</span></div>
+                  <p class="help-text">程序内置站点模板，自动生成并回读校验配置；每次任务都会用真实码表与逐笔数据筛选线路，无需 connect.cfg。</p>
+                </div>
+                <div class="field-group">
+                  <label for="gbbq-path">复权因子 gbbq <span class="optional">可选</span></label>
+                  <div class="path-control">
+                    <input id="gbbq-path" type="text" spellcheck="false" placeholder="留空则不保存复权因子">
+                    <button id="pick-gbbq" class="path-picker" type="button" aria-label="选择 gbbq 复权因子文件" title="选择 gbbq 复权因子文件">
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5h5l1.6 2h8.4v8h-15zM2.5 5.5v9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+                    </button>
+                  </div>
+                  <p class="help-text">因子单独保存为 *_gbbq.csv，原始行情价格保持不变。</p>
+                </div>
+                <div class="field-group">
+                  <label for="timeout">单次请求超时（秒）</label>
+                  <input id="timeout" type="number" min="2" max="60" value="8" inputmode="numeric">
+                </div>
+              </div>
+            </details>
+          </fieldset>
+
+          <div id="form-message" class="form-message" role="status" aria-live="polite">内置线路已就绪，下载前会自动完成业务自检。</div>
+          <div class="form-actions">
+            <button id="test-hosts" class="button button-secondary" type="button">检测内置线路</button>
+            <button id="start-task" class="button button-primary" type="submit">
+              <span>开始下载</span>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h13M11 5l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+            </button>
+          </div>
+        </form>
+        <div class="config-note">
+          <span class="note-index mono">NOTE</span>
+          <p>并发按 worker 复用连接；请求失败会断开并换线重试，避免损坏后续报文。</p>
+        </div>
+      </aside>
+
+      <section class="monitor-panel">
+        <div class="monitor-heading">
+          <div><span class="eyebrow">02 / LIVE MONITOR</span><h2>下载监视器</h2></div>
+          <span id="task-state" class="state-badge" data-state="idle"><i></i><span>待命</span></span>
+        </div>
+
+        <div class="progress-stage">
+          <div class="progress-heading">
+            <div><span id="task-message">配置任务后即可开始</span><span id="task-id" class="task-id mono"></span></div>
+            <strong id="progress-percent" class="mono">—</strong>
+          </div>
+          <div class="progress-track" role="progressbar" aria-label="下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <div class="progress-caption mono"><span id="progress-count">0 / 0 SECURITIES</span><span id="progress-bars">0 BARS</span></div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat"><span class="stat-label">实时速度</span><strong id="stat-speed" class="mono">0.0</strong><span class="stat-unit">只 / 秒</span></div>
+          <div class="stat"><span class="stat-label">已完成</span><strong id="stat-success" class="mono">0</strong><span class="stat-unit">个文件</span></div>
+          <div class="stat"><span class="stat-label">失败</span><strong id="stat-failed" class="mono danger-text">0</strong><span class="stat-unit">自动重试后</span></div>
+          <div class="stat"><span class="stat-label">运行时间</span><strong id="stat-elapsed" class="mono">00:00</strong><span class="stat-unit">MM : SS</span></div>
+        </div>
+
+        <div class="throughput-section">
+          <div class="subsection-heading"><h3>吞吐曲线</h3><span class="mono">SEC / SECOND · LIVE</span></div>
+          <div class="chart-wrap">
+            <svg id="throughput-chart" viewBox="0 0 720 128" preserveAspectRatio="none" role="img" aria-label="最近下载速度曲线">
+              <line x1="0" y1="112" x2="720" y2="112" class="chart-axis"/>
+              <line x1="0" y1="64" x2="720" y2="64" class="chart-grid"/>
+              <path id="chart-area" class="chart-area" d=""/>
+              <path id="chart-line" class="chart-line" d=""/>
+              <circle id="chart-dot" class="chart-dot" r="3" cx="0" cy="112"/>
+            </svg>
+            <span id="chart-empty" class="chart-empty">任务运行后记录实时速度</span>
+          </div>
+        </div>
+
+        <div class="recent-section">
+          <div class="subsection-heading"><h3>最近写入</h3><span id="file-count" class="mono">0 FILES</span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件</th><th>市场 / 代码</th><th>K 线</th><th>大小</th><th>耗时</th></tr></thead>
+              <tbody id="recent-files"></tbody>
+            </table>
+            <div id="files-empty" class="table-empty">完成的文件会按时间倒序列在这里</div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="logs-panel">
+        <div class="logs-heading"><div><span class="eyebrow">03 / EVENT STREAM</span><h2>运行日志</h2></div><span class="live-label mono"><i></i>LIVE</span></div>
+        <div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">
+          <div class="logs-empty"><span class="mono">READY_</span><p>等待任务事件。线路、码表与写入状态会显示在这里。</p></div>
+        </div>
+        <div class="logs-footer">
+          <span>保留最近 120 条</span>
+          <button id="cancel-task" class="text-button" type="button" disabled>停止任务</button>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span><i class="status-dot"></i>TDX 7709 <span class="statusbar-separator">/</span> ZLIB <span class="statusbar-separator">/</span> CSV</span>
+      <span id="output-status" class="output-status" title="输出目录">OUTPUT: downloads</span>
+      <span>GO WORKER POOL <span class="statusbar-separator">/</span> MAX 64</span>
+    </footer>
+  </div>
+
+  <dialog id="price-preview" class="price-preview">
+    <div class="preview-header">
+      <div><span class="eyebrow">PRICE INSPECTOR / READ ONLY</span><h2 id="preview-title">行情预览</h2></div>
+      <button id="close-preview" class="preview-close" type="button" aria-label="关闭预览">×</button>
+    </div>
+    <div class="preview-toolbar">
+      <div class="segmented preview-modes" role="group" aria-label="复权方式">
+        <button type="button" class="active" data-adjust="raw" aria-pressed="true">不复权</button>
+        <button type="button" data-adjust="qfq" aria-pressed="false">前复权</button>
+        <button type="button" data-adjust="hfq" aria-pressed="false">后复权</button>
+      </div>
+      <span id="preview-factor" class="preview-factor mono"></span>
+    </div>
+    <p class="preview-note">复权结果在读取时实时计算；原始行情 CSV 始终保持不变。</p>
+    <div id="preview-error" class="preview-error" role="alert" hidden></div>
+    <div class="preview-chart">
+      <svg id="preview-chart-svg" viewBox="0 0 800 210" preserveAspectRatio="none" role="img" aria-label="复权收盘价曲线">
+        <line x1="0" y1="190" x2="800" y2="190" class="chart-axis"/>
+        <line x1="0" y1="105" x2="800" y2="105" class="chart-grid"/>
+        <path id="preview-chart-area" class="chart-area" d=""/>
+        <path id="preview-chart-line" class="chart-line" d=""/>
+      </svg>
+      <span id="preview-loading" class="chart-empty">正在读取行情…</span>
+    </div>
+    <div class="preview-table-wrap">
+      <table class="preview-table">
+        <thead><tr><th>日期</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th><th>成交量</th></tr></thead>
+        <tbody id="preview-rows"></tbody>
+      </table>
+    </div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
