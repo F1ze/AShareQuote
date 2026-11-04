@@ -13,6 +13,9 @@
 # Generated runtime data
 /artifacts/
 /downloads/
+/data/
+*.duckdb
+*.duckdb.wal
 /connect.cfg
 /spec.json
 *.log
@@ -21,6 +24,8 @@
 
 # Node tooling
 node_modules/
+/frontend/dist/
+*.tsbuildinfo
 
 # Python helper scripts
 __pycache__/
@@ -42,3 +47,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Project-local native compiler
+/.tools/

@@ -82,7 +82,7 @@ _CFG_B64 是压缩后 base64 的 JSON（4.6 KB，分片存放，单行不要手�
 | index | --out | tdxzs.cfg 板块指数 | 0 |
 | futures | --out | code2name.ini 期货规格 | 0 |
 | options | --out | ggqqcode/szqqcode 期权链 | 0 |
-| snapshot | --out | tdxzsbase.cfg 横截面，raw 列折成 cols 计数 | 0 |
+| snapshot | --out、--top(默认 20，0 为全部) | tdxzsbase.cfg 板块横截面，按总市值降序，字段已命名 | 0 |
 | rules | --out | hqrule.dat 键值对（加 --out 写文件） | 0 |
 | files | --out | 只列 lday 文件名与大小 | 0 |
 | bars | --market(sh/sz/bj/ds)、--code、--kind(lday/minline/fzline)、--out | 行情 CSV | 缺文件返回 2 |
@@ -91,6 +91,10 @@ _CFG_B64 是压缩后 base64 的 JSON（4.6 KB，分片存放，单行不要手�
 | sitecfg-check | --path | 错误/警告/结论 | 有错误 1，缺文件 2，通过 0 |
 | sitecfg-build | --spec（必填）、--out | 生成并自检 | 0 |
 | sitecfg-defaults | --ref、--out | 起始 spec JSON | 0 |
+| hosts-update | --path、--from 或 --url、--dry | 合并新站表并刷新主机段 | 0，缺文件或缺来源 2 |
+| autoup-probe | --base、候选名… | 试候选包名，打印状态码与字节数 | 0 |
+| autoup-list | --url | 取清单并列出条目 | 0，取清单失败 2 |
+| autoup-get | --url、--dest、--only、--version、--dry | 按清单下文件或整包 | 0，失败 2 |
 
 所有相对路径都按当前目录解析（含 --path、--out、--spec），因此在仓库根执行、写相对路径即可；安装目录本身由 ROOT 从仓库位置推导，不再写死盘符。
 
@@ -103,6 +107,83 @@ _CFG_B64 是压缩后 base64 的 JSON（4.6 KB，分片存放，单行不要手�
 base.dbf 三件套：BASE_FIELDS 定义布局，write_dbf 写 dBASE III（头 32 字节 + 每字段 32 字节描述 + 0x0D + 记录 + 0x1A，数值右对齐、字符左对齐），gen_base 只填 SC 与 GPDM、其余留 0 与空。seed_spec() 返回内置站点的最小可用 spec。
 
 spec 顶层键：identity、hosts、try_hosts、info_hosts、wt_hosts、ds_hosts、single、otherhost、primary、sections。
+
+### 2.5 站点地址自更新（hosts-update）
+
+官方客户端换行情地址走的是更新器：它把 newhost.lst 写进 T0002，再合并进 connect.cfg（第 21 章有证据）。本命令照这个格式刷自己的配置。
+
+- 来源优先级：--from 本地文件 > --url 远端 > 环境变量 TDX_HOSTS_URL > 客户端自己维护的 <根>/T0002/newhost.lst 或 <根>/newhost.lst。
+- 只重写 HQHOST、TRYHQHOST、INFOHOST、DSHOST 四段，编号从 1 连续重排，HostNum 同步；其它分区一字节不动。
+- 合并结果先过 sitecfg-check 那套自检，有错误就放弃写入；写盘前留 connect.cfg.hosts.bak。
+- 只比 IP:端口，改名单独计；--dry 只打印不落盘。
+
+~~~powershell
+python tdx_local.py hosts-update --path $root\connect.cfg --dry
+python tdx_local.py hosts-update --path $root\connect.cfg
+python tdx_local.py hosts-update --path $root\connect.cfg --url http://<主机>/update/<通道>/newhost.lst
+~~~
+
+远端地址目前仍要外部给：服务端包名换过，本机配置里的旧名全 404。挑战已经能解（见 2.6），所以给对地址就能一条命令取回。客户端侧 load_hosts 只把 newhost.lst 当兜底（配置里一个站点都没有时才读），不会盖掉你手选的站。
+
+### 2.6 直接取升级包（autoup-*）
+
+不跑 AutoUpEx 也能取包：按它的契约走，三条命令分工是“找名、看清单、下文件”（第 22 章有全部证据）。
+
+- http_fetch 遇到 EdgeOne 挑战页会自己算 cookie 重取一次，算不出来就原样返回挑战页，不会把 HTML 当 zip 用。
+- autoup-list 把地址末 3 个字符换成 txt 当清单，打印版本、文件数与每条的大小、路径。
+- autoup-get 按清单落盘；--only 只取关心的条目（如只取 newhost.lst），--version 传本地版本，清单不比它新就不动，--dry 只列不写。清单第二行是 0 时按整包处理，取同目录的 update/<通道>.zip。
+- autoup-probe 在包名被换掉后用来重新发现：--base 给目录，后面跟候选名，200 才算命中。
+- 改了解挑战、清单解析或取文件逻辑，跑 re-tools\probes\_autoup_selftest.py，它会起本地假服务把四条路径全验一遍。
+
+~~~powershell
+python tdx_local.py autoup-probe --base https://data.tdx.com.cn/autoup tdxw3_yhzqnewjy_tcpip1168.zip
+python tdx_local.py autoup-list --url https://data.tdx.com.cn/autoup/update/<通道>.zip
+python tdx_local.py autoup-get --url https://data.tdx.com.cn/autoup/update/<通道>.zip --dest build\au --only newhost.lst
+python tdx_local.py hosts-update --path connect.cfg --from build\au\newhost.lst
+~~~
+
+现网没有可猜的默认名，地址只能外部给。最省事的办法是让客户端自己走一次：在 connect.cfg 的 [Other] 段手工加 ManualAutoupUrl=<完整包地址>（这一条优先级最高），点一次自动升级，然后把安装根 tmp\needautoup.dat 里那串地址抄下来喂给 autoup-get。
+
+另有“从行情站取更新”分支：[Version] 的 AutoupFromHQHost 为 1 时客户端把地址改写成相对的 update/<通道>.zip，并把当前主站 IP/端口写进 [Autoup] 的 HQIPStr/HQPort（缺省 7709），由升级器接成完整 URL。实测 12 台主站的 7709 与 7711 对 HTTP 都是零字节断开，这条分支在现网不通，别指望它。
+
+安装包（自制 MFC 自解压器，整树内嵌、装时不联网）里没有地址，别去里面找。
+
+拿到地址的四条来路：安装根 tmp\needautoup.dat（网页下发时写的，一次 2173 字节）、connect.cfg 的 [Other] ManualAutoupUrl（优先，填了就直接用）、[Version] 的 AutoupURLDir 加 [Other] 的 AutoUpZip 拼、以及自己在网页源码里看。
+
+函数契约：
+
+- http_fetch(url, timeout=20, cookie=None) -> (状态码, body)：GET 一次，命中挑战页则解 cookie 重取。HTTP 错误也返回响应体，不抛栈。
+- challenge_cookie(page) -> str：从挑战页解 __tst_status 与 EO_Bot_Ssid；格式不符返回空串，调用方按未放行处理。
+- manifest_url(url) -> str：末 3 字符换 txt。地址短于 4 字符抛 ValueError。
+- parse_manifest(text) -> (版本, 文件数, [(路径, 字节数)])：头两行不是数字抛 ValueError。
+- autoup_get(url, dest, only=None, version=None, dry=False) -> [落盘路径]：only 是文件名或相对路径集合；version 有值时先比版本；清单文件数为 0 改取整包。
+- autoup_probe(base, names) -> [(名称, 状态码, 字节数, 头 4 字节)]：逐个试，只打印不判断。
+
+### 2.7 直接调升级器（GUI 按钮不可用时的正路）
+
+本渠道的“自动升级”按钮本身是坏的：它把地址交给升级器时那一格是空的，命令行永远是 autoupex &tdxw&11.68&0_，升级器只回一句“升级地址错误！”。原因是 conf\ff_cfg.ini 与 loading.exe 两件东西都没装，而地址取自一个从未被赋值的变量（详见报告 23.4）。所以要么补这两件，要么直接按契约调升级器。
+
+契约（AutoUpEx 0x549268 一带）：参数是一整串，用 & 分段，形如 autoupex <完整地址含扩展名>&tdxw&<本机版本>&<标志>_<说明>。段数含 exe 必须 3 或 4，否则直接退；末段之前最后三字符会被换成 txt 当清单地址；工作目录必须是安装根；SEPlugins\TEncrypt.dll 与 res_autoup.dll 缺一不可。
+
+已实测通过的走法（本地假站，整包模式）：
+
+~~~
+cd C:\neptune
+.\AutoUpEx.exe "http://127.0.0.1:8899/tdxw3_yhzqnewjy_tcpip1168.zip&tdxw&11.68&0_"
+~~~
+
+清单文件内容是 1169 与 0 两行，服务器日志先后收到清单与包的 GET 并均回 200，包落到 Update\tdx_update\，进程退出码 0。若只想拿包不想装，用 2.6 的 autoup-get 更省事。
+
+如果确实要让按钮自己跑起来，可以伪造运行期数据：T0002\tmp\needautoup.dat 是 2173 字节，偏移 0 是标志字节（非 0 表示有更新），偏移 125 起是 2046 字节地址槽，末尾 2171 起两字节，读入后 123 与 2171 会被强制置零。注意每次点击都会先用零字节覆盖这个文件再读，所以造好之后必须设成只读（attrib +R），否则白造；生效的表现是提示变成“升级地址错误！”。但即便如此地址槽仍会被空地址顶掉，所以这条路只解决“走不走进升级分支”，不解决“地址从哪来”。
+
+#### snapshot 的列
+
+26 列全部命名返回（market、code、free_cap、total_cap、float_cap、chg、amount 等），空串给 None。列 4 总市值、列 5 流通市值、列 19 成交额已用成分求和核实；列 2 自由流通市值、列 12 振幅等是强推断，全部口径见报告 24.2 与 24.3。某行的市值列整组为空表示该板块当天没重算（全文件有 5 行残值）。
+
+~~~
+python tdx_local.py snapshot --top 20
+python tdx_local.py snapshot --out zs.csv --top 0
+~~~
 
 ## 3. tdx_client.py —— 7709 客户端
 
@@ -154,6 +235,8 @@ spec 顶层键：identity、hosts、try_hosts、info_hosts、wt_hosts、ds_hosts
 | security_bars(category, market, code, start, count) | K 线 | [{dt, open, high, low, close, vol, amount}] | 单次 ≤800；价格 ÷1000；收盘是基准递推 |
 | minute_time_data(market, code) | 当日分时 | [{price, vol}] | 记录自偏移 13 起，价格累加 |
 | transaction_data(market, code, start, count) | 逐笔 | [{time, price, vol, num, buyorsell}] | buyorsell 0 买 1 卖 2 中性 |
+| request_raw(commtype, payload=b"", catword=1, ver=0, flag=0) | 裸帧请求 | 按 commtype 对齐的应答体 | 命令字在头 10..12、body 原样、两段长度相等即不压缩；最多丢 8 条夹带推送，3 次重连 |
+| info_hello() | 资讯口问候（0x1F7E） | {raw,time,build,path,f10,table} | 打 INFOHOST，必须先 handshake=False 与 sections=(INFOHOST,DSHOST) |
 
 重试语义：_request 内 3 次，每次失败先 _close() 再重连——实测该服务端每连接只服务一次业务请求，不重连就必然拿不到第二条。上层不需要再包重试。
 
@@ -177,6 +260,7 @@ spec 顶层键：identity、hosts、try_hosts、info_hosts、wt_hosts、ds_hosts
 | xdxr | --market --code | 除权除息明细 |
 | local | --vipdoc --market --code --out | 读本地 .day，可叠加 --adjust |
 | login | --cfg、--out | 探测 7709 的 0x0004 与 UserHost 登录口 TCP 可达性，写 JSON |
+| info-hello | --cfg | 发资讯口问候帧，打印服务时间/版本/路径/F10 与表格能力位，有版本串返回 0 |
 
 复权参数：--adjust none|hfq|qfq（默认 none），--gbbq 可指定文件，缺省按 <vipdoc 的上级>/T0002/hq_cache/gbbq 找。因子缺失时打印提示并按不复权输出，不静默。--adjust 只有 bars 与 local 生效。
 
@@ -202,7 +286,8 @@ bars 与 local 加 --out 会额外写一份 CSV（列 date,open,high,low,close,a
 | CATEGORIES | 1..15 → 中文名 | 事件类别字典。只有 1 除权除息带比例 |
 | PRICE_CATEGORY | 1 | 除权除息主类别，公式主体 |
 | SHRINK_CATEGORIES | (11, 12) | 缩股/扩缩股，f3 是份额拆分比，价格除以它 |
-| WARRANT_CATEGORIES | (13, 14) | 送认购/认沽权证，按内在价值折价（推断） |
+| WARRANT_CATEGORIES | (13, 14) | 送认购/认沽权证，默认不参与折算（报告 25 章实测） |
+| WARRANT_IN_PRICE | False | 置真则按权证内在价值折价，属可选强推断；命令行用 --warrant 打开 |
 | KEY_HEX | 4176 字节十六进制（分 14 段） | Feistel 密钥：0x00 起 k0、0x44 起 k44、0x48/0x448/0x848/0xC48 四张 256 项轮表、0x04..0x40 是 16 个轮常量 |
 
 布局要点：每条记录 29 字节，前 24 字节加密（3 个 8 字节块），后 5 字节明文是日期 u32 + 类别 u8。头部 u32 条数，必须满足 4 + 条数×29 == 文件长度。
@@ -248,8 +333,8 @@ ratio = (前收 - f1/10 + f2*f4/10) / (前收 * (1 + f3/10 + f4/10))
 |---|---|---|
 | check | --gbbq | 条数/证券数/区间/类别分布/问题/结论 |
 | dump | --gbbq --out --category --since | CSV：market,code,date,category,name,dividend_per10,rights_price,bonus_per10,rights_per10 |
-| factors | --gbbq --market --code --closes-csv --mode | 逐事件前收与系数，有前收时再打印整段曲线 |
-| apply | --gbbq --csv --market --code --mode --out | 复权后 CSV，多一列 mode |
+| factors | --gbbq --market --code --closes-csv --mode、--warrant | 逐事件前收与系数，有前收时再打印整段曲线 |
+| apply | --gbbq --csv --market --code --mode --out、--warrant | 复权后 CSV，多一列 mode |
 
 退出码：check 有问题返回 1，其余 0。
 
@@ -319,7 +404,7 @@ build_factors 的前收查找是“日期严格小于事件日、且在库中最
 1. build 会清空 factor，别在有下游的情况下并发跑。
 2. 没有 vipdoc 时空有 factor 行但全是 share，复权会偏——先有行情再建因子。
 3. 主键会吃掉完全重复记录（好事），导入条数可能比源少几条。
-4. sync 是串行逐只，6331 只约十几分钟，中途失败只计数不中断。
+4. sync 默认 8 条并发连接，中途失败只计数不中断；--jobs 1 退回串行。6000 只的整市场同步仍以十几分钟计，瓶颈在服务端每连接只答一次。
 
 ## 6. tdx_bootstrap.py —— 从零造树
 
@@ -346,7 +431,7 @@ build_factors 的前收查找是“日期严格小于事件日、且在库中最
 | probe_login(root, cfg) | 探测登录链路写 login.json | (结果, 路径) |
 | regen(root, spec_path, ref) | 重造 connect.cfg 并刷新清单哈希 | 配置路径 |
 | fill(root, market, codes, days, cfg) | 抓日线写成 .day | [(code, 条数)] |
-| sync_gbbq(root, market, codes, limit, cfg, redo) | 抓权息写 gbbq，断点续传、按主键去重 | {records, added, symbols, failed, codes, skipped} |
+| sync_gbbq(root, market, codes, limit, cfg, redo, jobs=8) | 抓权息写 gbbq，断点续传、按主键去重；jobs 是并发连接数 | {records, added, symbols, failed, codes, skipped} |
 | verify(root) | 五项校验 | (问题列表, 统计字典) |
 
 verify 检查：目录齐全、connect.cfg 可解析且有主站、gbbq 长度与条数自洽、bootstrap.json 存在、清单里的配置哈希与现文件相符。任一不过返回问题列表，CLI 退出码 1。
@@ -362,7 +447,7 @@ fill 与 sync_gbbq 都从目标树自己的 connect.cfg 取站点（--cfg 可覆
 | plan | root | 0 |
 | init | root --spec --ref | 0 |
 | fill | root --market --codes --days --cfg、--no-merge | 0 |
-| sync | root --market --codes --limit --cfg、--redo | 0 |
+| sync | root --market --codes --limit --cfg、--redo、--jobs(默认 8) | 0 |
 | base | root --markets --limit --cfg | 0 |
 | login | root --cfg | 0 |
 | regen | root --spec --ref | 0 |
@@ -513,6 +598,58 @@ python tdx_local.py sitecfg-check --path $root\connect.cfg
 | 生成配置 UserHost.IPAddress 为空 | 用了旧 spec 或旧树 | 重跑 sitecfg-defaults；老树用 regen 重造 |
 | 客户端不认 base.dbf | 头里记录数或记录长写错 | 用 gen_base 重生成，别手改头 |
 | sync 反复重抓同一批 | 断点表被清或用了 --redo | 查 done 表 / .xdxr_state.json |
+| 抓 7715 时行情一起断 | 登录与行情共用一个主站 IP，端口不同 | 用 build\\pw201p.py 的分流转发器，按命令字小于 0x0100 走 7715、其余走 7709，别只改端口 |
+| 分流后两边都没回包 | 单口转发器的上游端口写死 7715，行情命令被打到交易口 | 换 build\\pw249.py 双端口（17709 转 7709、17715 转 7715）加 build\\pw250.py |
+| 转发器端口被占 | 起过两个监听同一端口 | 先 Get-Process py 全杀再起，SO_REUSEADDR 会让两个进程都绑上却不平分连接 |
+| 抓完行情全红 | connect.cfg 还指向 127.0.0.1 | py build\\pw227.py 从 build\\cfg_info.bak 恢复，再 netstat 确认 7709 直连 |
+
+### 11.1 登录通道 7715 的抓法
+
+登录口与行情口同 IP 不同端口，改端口会把行情带断，所以用分流器：build\pw201p.py 监听 17715，窥探首帧命令字，小于 0x0100 转 7715，其余转 7709，日志落 build\route.log；build\pw202.py 把 HQHOST01 指向 127.0.0.1:17715，改前留 build\cfg_info.bak，抓完用 build\pw227.py 还原。7715 不认行情口的 Setup 握手，先发握手会被 RST。交易窗口是自绘面板，UIA 与 ToolBar 都枚举不到按钮，登录要靠 CEF 调试口或静态组包。调试口试过两种：TdxW.exe 加 --remote-debugging-port 能起 DevTools（Chrome/81），但交易这条不经过网页；xiadan\config.ini 的 [CefCmdLine] 里加 --remote-debugging-port=9333 重启下单程序，端口仍不开，故 CEF 一路要先解决怎么把它点起来。改 xiadan\config.ini 前留备份，改完记得还原。
+
+### 11.2 双端口分流器与界面观察（30 章）
+
+单口分流器后来发现上游端口写死 7715，把 0x000D、0x0015 这些行情命令送进了交易口，全静默有一半是这个造成的。改用双端口：buildpw249.py 同时监听 17709 与 17715，前者固定转主站 7709，后者固定转主站 7715，日志落 buildoute2.log；buildpw250.py 把 HQHOST01 指 127.0.0.1:17709、UserHost 指 127.0.0.1:17715。改完重启客户端，0x0015 立刻有应答。还原仍用 buildpw227.py。
+
+界面侧四条经验：
+
+1. 交易窗（类 #32770，标题含 V6）是空壳，子窗口只有停靠条，抓图只能用 PrintWindow 标志 2，标志 0 是整幅灰；没有子控件就没有焦点，SendKeys 键入无处落。
+2. 枚举模块要用 32 位宿主：& "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -File build\mods.ps1。64 位 PowerShell 只会给出 wow64 桩。
+3. UIA 的元素矩形是子坐标不是屏幕坐标，本机屏幕 2559 宽而帧自报 2561（DPI 虚拟化），点击坐标要乘 2559/3840 再送。
+4. 想脱离鼠标就用消息注入：对帧 PostMessage WM_COMMAND（0x0111），扫 id 会真的弹出对话框，但帧没有 Win32 菜单（GetMenu 为 0），id 拿不到只能盲扫，见 build\cmd.ps1 与 build\sweep2.ps1。
+
+另外 xiadan.exe 是同花顺的独立下单端（sysconfig\NetWorkSetting.json 里是 115.236.34.168:8009、CRYPTEXTEND=HEXIN），不是 7715 的客户端；它的登录窗可以被 UIA 枚举（1237 客户号、1108 通讯密码、1006 委托登录），但元素都是 Pane、没有 ValuePattern，只能按矩形点。观察交易失败原因看 T0002\log\DataModule.log。
+
+### 11.3 点击前必须先收走 Edge（31 章）
+
+31 章查明：本机屏幕上有一个最大化的 Edge 窗口（msedge.exe，-7,-7,2566x1239）压在最上层。它是个顶层窗口，不属于应用，但 WindowFromPoint 在整屏任何一点都返回它，于是所有鼠标点击都被 Edge 吃掉。应用的窗口照样能被 SetForegroundWindow，GetForegroundWindow 回读也正确，光看这两个调用发现不了。
+
+所以动界面前固定先跑：
+
+~~~
+python build\pw291.py
+~~~
+
+它把 msedge 的可见窗口逐个 ShowWindow(6) 最小化，跑完再点。之后 WindowFromPoint 才会返回应用自己的 AfxWnd100。
+
+坐标：UIA 的子坐标除以 1.5 就是屏幕坐标（版面容器 y=123 对 MDIClient 屏幕 y=82，123 除以 1.5 正好 82）。顶栏按钮在屏幕 y 约 8 至 22。
+
+验证点击是否真被处理，用 PrintWindow 前后比像素，别凭感觉：
+
+~~~
+python build\pw294.py
+~~~
+
+期望输出一行“像素总数 …… 变化 ……”，变化占比到百分级就说明点击进了消息映射（点 1000 号按钮实测 93634 / 3171668 即 3.0%）。
+
+现成的两个盲扫器都带判据（17715 接入数或 V6 子窗数变化），命中即停：
+
+~~~
+python build\pw292.py
+python build\pw295.py
+~~~
+
+写到本手册这一版时两处都没命中，说明交易入口不在顶栏也不在标签带，别把重跑当成新结论。
 
 ## 12. 变更须知
 

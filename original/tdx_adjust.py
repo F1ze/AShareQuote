@@ -28,7 +28,8 @@ CATEGORIES = {1: "除权除息", 2: "送配股上市", 3: "非流通股上市", 
               13: "送认购权证", 14: "送认沽权证", 15: "其他"}
 PRICE_CATEGORY = 1          # 带派息/送转/配股比例，主算法类别
 SHRINK_CATEGORIES = (11, 12)  # 缩股/扩缩股：股本按比例变，价格反向
-WARRANT_CATEGORIES = (13, 14)  # 送认购/认沽权证：按权证内在价值折价，需前收
+WARRANT_CATEGORIES = (13, 14)  # 送认购/认沽权证：默认不参与除权价（报告 25 章实测）
+WARRANT_IN_PRICE = False       # 置真则按权证内在价值折价，属可选的强推断
 
 
 # 文件读法：常量 → 解密/加密 → 装载与因子公式 → 复权应用 → 校验 → CLI。
@@ -158,8 +159,11 @@ def ratio(event, prev_close):
         if f <= 0:
             return 1.0 if f == 1.0 else None
         return 1.0 / f
-    # 类别 13/14：按权证内在价值折价，f1 行权价、f3 每 10 股份数；内在价值为负时视作 1。
+    # 类别 13/14：默认不折价（实测比带折价更贴连续性，见报告 25 章）；
+    # 打开 WARRANT_IN_PRICE 才按权证内在价值折价，f1 行权价、f3 每 10 股份数，内在价值为负时视作 1。
     if cat in WARRANT_CATEGORIES:
+        if not WARRANT_IN_PRICE:
+            return 1.0
         strike = event.get("warrant_price") or event.get("dividend") or 0.0
         n = (event.get("warrant_ratio") or event.get("bonus") or 0.0) / 10.0
         if strike <= 0 or n <= 0:
@@ -279,6 +283,7 @@ def main(argv=None):
     p.add_argument("--code", required=True)
     p.add_argument("--closes-csv")
     p.add_argument("--mode", default="hfq", choices=["qfq", "hfq", "none"])
+    p.add_argument("--warrant", action="store_true", help="把 13/14 权证按内在价值折价（默认不计）")
     p = sub.add_parser("dump")
     p.add_argument("--gbbq", required=True)
     p.add_argument("--out", required=True)
@@ -290,8 +295,12 @@ def main(argv=None):
     p.add_argument("--market", type=int, required=True)
     p.add_argument("--code", required=True)
     p.add_argument("--mode", default="hfq", choices=["qfq", "hfq", "none"])
+    p.add_argument("--warrant", action="store_true", help="把 13/14 权证按内在价值折价（默认不计）")
     p.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    if getattr(a, "warrant", False):
+        global WARRANT_IN_PRICE
+        WARRANT_IN_PRICE = True
     a.gbbq = os.path.abspath(a.gbbq)
     if getattr(a, "csv", None):
         a.csv = os.path.abspath(a.csv)

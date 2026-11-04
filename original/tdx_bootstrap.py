@@ -246,12 +246,14 @@ def _save_state(root, state):
         json.dump(state, fh, ensure_ascii=False, indent=1)
 
 
-def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False):
+def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False, jobs=8):
     """从服务端逐只抓除权除息，写成合法 gbbq。
 
     断点续传：已成功的代码记在 hq_cache/.xdxr_state.json，默认跳过，
-    redo 为真时清空该市场的进度重来。gbbq 每只写完即落盘，中途断掉不丢已抓部分。
+    redo 为真时清空该市场的进度重来。gbbq 每只记完即更新状态，中途断掉不丢已抓部分。
+    jobs 是并发连接数：服务端一个连接只答一次业务请求，靠多条连接并行才快得起来。
     """
+    import threading
     import tdx_adjust
     import tdx_client
     state = _load_state(root)
@@ -266,9 +268,10 @@ def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False):
                 break
             codes += [c for _m, c, _n in batch]
             start += len(batch)
-    # 已完成的代码直接跳过；每抓完一只就把进度写盘，中断重跑从这里接着走。
+    conn._close()
+    # 已完成的代码直接跳过；每抓完一只就更新进度，中断重跑从这里接着走。
     todo = [c for c in codes if c not in done]
-    print("待同步 %d 只（已完成跳过 %d 只）" % (len(todo), len(codes) - len(todo)))
+    print("待同步 %d 只（已完成跳过 %d 只，并发 %d）" % (len(todo), len(codes) - len(todo), max(1, jobs)))
     path = os.path.join(root, "T0002", "hq_cache", "gbbq")
     events = {}
     if os.path.exists(path):
@@ -277,26 +280,62 @@ def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False):
                                       "dividend": f1, "rights_price": f2, "bonus": f3,
                                       "rights": f4}
     base = len(events)
-    failed = 0
-    try:
-        for code in todo:
-            try:
-                got = conn.xdxr_info(market, code)
-            except Exception:
-                failed += 1
-                continue
-            for ev in got:
-                events[(ev["market"], ev["code"], ev["date"], ev["category"])] = ev
-            done[code] = len(got)
-            state["done"][str(market)] = done
-            _save_state(root, state)
-            # limit 按已完成的代码数收口，不是按请求数；配合断点正好可以分几次拉完。
-            if limit and len(done) >= limit:
-                break
-    finally:
-        conn._close()
+    lock = threading.Lock()
+    stop = threading.Event()
+    stats = {"failed": 0, "saved": 0.0}
+    jobs = max(1, int(jobs or 1))
+    cfg_path = cfg or os.path.join(root, "connect.cfg")
+
+    def worker(chunk):
+        try:
+            conn = tdx_client.TdxConnection(cfg_path=cfg_path)
+            conn.connect()
+        except Exception:
+            with lock:
+                stats["failed"] += len(chunk)
+            return
+        try:
+            for code in chunk:
+                if stop.is_set():
+                    return
+                try:
+                    got = conn.xdxr_info(market, code)
+                except Exception:
+                    with lock:
+                        stats["failed"] += 1
+                    continue
+                with lock:
+                    for ev in got:
+                        events[(ev["market"], ev["code"], ev["date"], ev["category"])] = ev
+                    done[code] = len(got)
+                    state["done"][str(market)] = done
+                    # 状态写盘按 2 秒节流：几百只时每只都写会把磁盘拖慢。
+                    if time.time() - stats["saved"] > 2:
+                        _save_state(root, state)
+                        stats["saved"] = time.time()
+                    # limit 按已完成的代码数收口，不是按请求数；配合断点正好可以分几次拉完。
+                    if limit and len(done) >= limit:
+                        stop.set()
+                        return
+        finally:
+            conn._close()
+
+    threads = []
+    for i in range(jobs):
+        chunk = todo[i::jobs]
+        if not chunk:
+            continue
+        t = threading.Thread(target=worker, args=(chunk,), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    with lock:
+        _save_state(root, state)
+    failed = stats["failed"]
     n = tdx_adjust.write_gbbq(list(events.values()), path)
-    return {"records": n, "added": n - base, "symbols": len({(e["market"], e["code"]) for e in events}),
+    return {"records": n, "added": n - base,
+            "symbols": len({(e["market"], e["code"]) for e in events.values()}),
             "failed": failed, "codes": len(codes), "skipped": len(codes) - len(todo)}
 
 
@@ -375,6 +414,7 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=20, help="本轮最多同步多少只证券")
     p.add_argument("--cfg")
     p.add_argument("--redo", action="store_true", help="忽略断点，清空该市场进度重抓")
+    p.add_argument("--jobs", type=int, default=8, help="并发连接数，1 为串行")
     p = sub.add_parser("regen")
     p.add_argument("root")
     p.add_argument("--spec")
@@ -423,7 +463,7 @@ def main(argv=None):
         return 0
     if a.cmd == "sync":
         codes = [c.strip() for c in a.codes.split(",")] if a.codes else None
-        got = sync_gbbq(a.root, a.market, codes, a.limit, a.cfg, a.redo)
+        got = sync_gbbq(a.root, a.market, codes, a.limit, a.cfg, a.redo, a.jobs)
         print("同步 %d 只（跳过 %d，失败 %d），新增 %d 条，gbbq 共 %d 条"
               % (got["symbols"], got["skipped"], got["failed"], got["added"], got["records"]))
         return 0

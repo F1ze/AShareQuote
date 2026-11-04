@@ -372,9 +372,41 @@ def options(root):
 
 # ---------------------------------------------------------------- 横截面缓存 / 规则
 
-# tdxzsbase.cfg 是单日横截面：26 列定长，raw 拆成 cols 计数，不做字段语义推断。
+# tdxzsbase.cfg：板块与指数单日横截面，26 列。列 4 总市值、列 5 流通市值、
+# 列 19 成交额已按成分股本与成交额求和核实（报告 24.2）；列 2 自由流通市值、列 12 振幅
+# 等是强推断（24.3）。空串列表示该板块当天没重算，各列空值成组出现。
+ZS_COLS = {
+    0: ("market", "市场"),
+    1: ("code", "代码"),
+    2: ("free_cap", "自由流通市值", "万元"),
+    3: ("free_cap_prev", "前一日自由流通市值", "万元"),
+    4: ("total_cap", "总市值", "万元"),
+    5: ("float_cap", "流通市值", "万元"),
+    6: ("pe", "市盈率"),
+    7: ("date", "日期"),
+    8: ("kind", "类别"),
+    9: ("chg", "涨跌幅", "%"),
+    10: ("chg_prev", "前一日涨跌幅", "%"),
+    11: ("chg_3", "3 日涨跌幅", "%"),
+    12: ("amplitude", "振幅", "%"),
+    13: ("chg_5", "5 日涨跌幅", "%"),
+    14: ("chg_10", "10 日涨跌幅", "%"),
+    15: ("chg_20", "20 日涨跌幅", "%"),
+    16: ("chg_60", "60 日涨跌幅", "%"),
+    17: ("chg_ytd", "年初至今涨跌幅", "%"),
+    18: ("volume", "成交量", "万手"),
+    19: ("amount", "成交额", "万元"),
+    20: ("chg_120", "120 日涨跌幅", "%"),
+    21: ("chg_250", "250 日涨跌幅", "%"),
+    22: ("chg_all", "上市至今涨跌幅", "%"),
+    23: ("chg_2", "次日涨跌幅", "%"),
+    24: ("buy_amt", "买入金额", "万元"),
+    25: ("sell_amt", "卖出金额", "万元"),
+}
+
+
 def snapshot(root):
-    """tdxzsbase.cfg：逐股横截面指标缓存（流通市值/总市值/换手/涨跌…，列语义见文档）。"""
+    """tdxzsbase.cfg：板块横截面。返回命名字段加 raw，空列给 None。"""
     path = os.path.join(hq(root), "tdxzsbase.cfg")
     if not os.path.exists(path):
         return
@@ -383,7 +415,19 @@ def snapshot(root):
             p = gbk(line).strip().split("|")
             if len(p) < 10:
                 continue
-            yield {"market": to_i(p[0]), "code": p[1], "date": p[7], "raw": p}
+            row = {"raw": p, "cols": len(p)}
+            for i, spec in ZS_COLS.items():
+                val = p[i] if i < len(p) else ""
+                name = spec[0]
+                if name == "code":
+                    row[name] = val
+                elif name in ("market", "kind"):
+                    row[name] = to_i(val)
+                elif name == "date":
+                    row[name] = val
+                else:
+                    row[name] = to_f(val)
+            yield row
 
 
 def rules(root):
@@ -628,6 +672,296 @@ def _fill_hosts(sections, sec, items, default_name, default_port, primary=0):
 # 生成顺序固定按 SITECFG_ORDER，逐分区逐键写；spec 缺的键回落到 SITECFG_DEFAULTS，
 # UserHost 的 IPAddress/Port 再空就取 SEED_USERHOST，保证登录落点永远有值。
 # spec 里 hosts 是主站、try_hosts 是候选站、其他段各管一摊；每段写完都要回填 HostNum。
+# ---------------------------------------------------------------- 站点更新
+
+NEWHOST_NAME = "newhost.lst"
+HOST_UPDATE_SECTIONS = ("HQHOST", "TRYHQHOST", "INFOHOST", "DSHOST")
+
+
+def newhost_files(root):
+    """客户端自己维护的新站表位置：T0002 下优先，根目录次之。"""
+    out = [os.path.join(hq(root), NEWHOST_NAME), os.path.join(root, NEWHOST_NAME)]
+    return [p for p in out if os.path.isfile(p)]
+
+
+def newest_newhost(root):
+    """取最近改动的本地新站表；一个都没有返回 None。"""
+    got = newhost_files(root)
+    return max(got, key=os.path.getmtime) if got else None
+
+
+def fetch_text(url, timeout=10):
+    """取远端文本，按 GBK 解码；非 200 由 urllib 抛 HTTPError。"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "TdxW"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("gbk", "replace")
+
+
+def split_blocks(text):
+    """按分区切行块：返回 (分区顺序, {分区: 行列表})，分区外的行归到 None。"""
+    order, blocks, cur = [], {}, None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s[1:-1].strip()
+            order.append(cur)
+            blocks[cur] = [line]
+            continue
+        if cur is None:
+            blocks.setdefault(None, []).append(line)
+        else:
+            blocks[cur].append(line)
+    return order, blocks
+
+
+def _hosts_of(block):
+    """从一段行里取 (编号 -> (IP, 端口, 名称))，只认完整成组的编号。"""
+    got = {}
+    for line in block:
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        for field, idx in (("IPAddress", 0), ("Port", 1), ("HostName", 2), ("Weight", 3)):
+            if k.startswith(field) and k[len(field):].isdigit():
+                got.setdefault(k[len(field):], ["", "", "", ""])[idx] = v
+    return {n: tuple(v[:3]) for n, v in got.items() if v[0]}
+
+
+def merge_hostlist(cfg_text, new_text):
+    """把新站表里的主机段整段换成新表内容，其余分区原样保留。
+
+    返回 (合并后的全文, 每段变化明细)。新表没写的段不动；编号重排成从 1 连续。
+    """
+    order, blocks = split_blocks(cfg_text)
+    norder, nblocks = split_blocks(new_text)
+    missing = [s for s in HOST_UPDATE_SECTIONS if s not in nblocks]
+    if len(missing) == len(HOST_UPDATE_SECTIONS):
+        raise ValueError("新表里没有任何主机段（%s）" % "/".join(HOST_UPDATE_SECTIONS))
+    changes = {}
+    for sec in HOST_UPDATE_SECTIONS:
+        if sec not in nblocks:
+            continue
+        old = _hosts_of(blocks.get(sec, []))
+        new = _hosts_of(nblocks[sec])
+        if not new:
+            continue
+        old_ep = {v[0:2] for v in old.values()}
+        new_ep = {v[0:2] for v in new.values()}
+        renamed = sum(1 for n, v in new.items() if n in old and old[n][2] != v[2])
+        changes[sec] = {"added": sorted(new_ep - old_ep),
+                        "removed": sorted(old_ep - new_ep),
+                        "renamed": renamed, "count": (len(old), len(new))}
+        lines = ["[%s]" % sec, "HostNum=%d" % len(new)]
+        for i, (_n, (ip, port, name)) in enumerate(sorted(new.items(), key=lambda x: int(x[0])), 1):
+            lines.append("HostName%02d=%s" % (i, name or "行情主站%d" % i))
+            lines.append("IPAddress%02d=%s" % (i, ip))
+            lines.append("Port%02d=%s" % (i, port or 7709))
+            lines.append("Weight%02d=90" % i)
+        if sec in ("HQHOST", "TRYHQHOST"):
+            key = "PrimaryHost" if sec == "HQHOST" else "TryPrimaryHost"
+            lines.insert(1, "%s=0" % key)
+        blocks[sec] = lines
+    if not changes:
+        raise ValueError("新表的主机段都是空的")
+    out = []
+    for sec in order:
+        out += blocks[sec]
+    return "\n".join(out) + "\n", changes
+
+
+def update_hosts(cfg_path, src=None, url=None, dry=False):
+    """用本地新站表或远端地址刷新 connect.cfg 的主机段。
+
+    来源优先级：src 文件 > url > 环境变量 TDX_HOSTS_URL > 客户端自己维护的
+    newhost.lst。合并结果先过 _selfcheck，有错误就放弃；写盘前留 .bak。
+    """
+    cfg_path = os.path.abspath(cfg_path)
+    if not os.path.isfile(cfg_path):
+        raise ValueError("缺配置文件 %s" % cfg_path)
+    root = os.path.dirname(cfg_path)
+    if src:
+        src = os.path.abspath(src)
+        text = open(src, encoding="gbk", errors="replace").read()
+        from_what = src
+    elif url or os.environ.get("TDX_HOSTS_URL"):
+        u = url or os.environ["TDX_HOSTS_URL"]
+        text = fetch_text(u)
+        from_what = u
+    else:
+        found = newest_newhost(root) or newest_newhost(os.path.dirname(root))
+        if not found:
+            raise ValueError("没有新站表：传 --from 文件或 --url 地址，或先把 newhost.lst 放到 %s 或 %s"
+                             % (hq(root), root))
+        text = open(found, encoding="gbk", errors="replace").read()
+        from_what = found
+    old_text = open(cfg_path, encoding="gbk", errors="replace").read()
+    merged, changes = merge_hostlist(old_text, text)
+    errs, warns = _selfcheck(merged)
+    if errs:
+        raise ValueError("合并后自检 %d 个错误，未写入：%s" % (len(errs), "；".join(errs[:5])))
+    for sec in sorted(changes):
+        c = changes[sec]
+        print("%s: %d -> %d 台（新增 %d、删除 %d、改名 %d）" % (
+            sec, c["count"][0], c["count"][1], len(c["added"]), len(c["removed"]), c["renamed"]))
+        for ip, port in c["added"]:
+            print("  + %s:%s" % (ip, port))
+        for ip, port in c["removed"]:
+            print("  - %s:%s" % (ip, port))
+    print("来源：%s" % from_what)
+    if dry:
+        print("试运行，未写盘")
+        return changes
+    bak = cfg_path + ".hosts.bak"
+    with open(bak, "wb") as fh:
+        fh.write(old_text.encode("gbk", "replace"))
+    with open(cfg_path, "wb") as fh:
+        fh.write(merged.encode("gbk", "replace"))
+    print("已写入 %s（备份 %s），自检 %d 警告" % (cfg_path, bak, len(warns)))
+    return changes
+
+
+# ---------------------------------------------------------- 升级包直取（不依赖 exe）
+# 升级器 AutoUpEx 的取名规则：把传入地址末 3 个字符换成 txt 就是清单地址，
+# 清单首行是版本、次行是文件数（0 表示整包 zip），其余行是 路径<TAB>字节数。
+# 服务端是 EdgeOne，直连只会拿到一段 JS 挑战页，先解出 cookie 再取一次。
+
+AUTOUP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+CHALLENGE_MARK = b"EO_Bot_Ssid"
+
+
+def http_fetch(url, timeout=20, cookie=None):
+    """GET 一次；拿到 EdgeOne 挑战页就自己算 cookie 重取一次，返回 (状态码, body)。
+
+    挑战页把三个常量相加的十进制串当 __tst_status、把调用参数当 EO_Bot_Ssid，
+    两者写进同一个 Cookie 头后即可放行。算不出来就原样返回挑战页。
+    """
+    import urllib.error
+    import urllib.request
+
+    def once(ck):
+        """发一次请求，HTTP 错误也返回响应体，别抛栈。"""
+        hdr = {"User-Agent": AUTOUP_UA, "Accept": "*/*",
+               "Accept-Language": "zh-CN,zh;q=0.9"}
+        if ck:
+            hdr["Cookie"] = ck
+        req = urllib.request.Request(url, headers=hdr)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.getcode(), resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    code, body = once(cookie)
+    if cookie is None and CHALLENGE_MARK in body and b"<script" in body[:64]:
+        ck = challenge_cookie(body)
+        if ck:
+            code, body = once(ck)
+    return code, body
+
+
+def challenge_cookie(page):
+    """从挑战页里解出放行 cookie；页面对不上就返回空串。"""
+    import re
+    parts = [re.search(k + rb":(\d+)", page) for k in (b"WTKkN", b"bOYDu", b"wyeCN")]
+    arg = re.search(rb"\(t,\s*(\d+)\)", page)
+    if not all(parts) or arg is None:
+        return ""
+    total = sum(int(p.group(1)) for p in parts)
+    return "__tst_status=%d#; EO_Bot_Ssid=%d" % (total, int(arg.group(1)))
+
+
+def manifest_url(url):
+    """把升级地址末 3 个字符换成 txt，得到清单地址（exe 就是这么做 的）。"""
+    if len(url) < 4:
+        raise ValueError("升级地址太短：%s" % url)
+    return url[:-3] + "txt"
+
+
+def parse_manifest(text):
+    """解析清单：返回 (版本, 文件数, [(相对路径, 字节数)])，格式不对直接报。"""
+    lines = [ln.rstrip("\r") for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError("清单不足两行，没法判断版本和文件数")
+    try:
+        version = float(lines[0])
+        count = int(lines[1])
+    except ValueError:
+        raise ValueError("清单头两行不是版本和文件数：%r / %r" % (lines[0], lines[1]))
+    files = []
+    for line in (lines[2:2 + count] if count else lines[2:]):
+        path, _, rest = line.partition("\t")
+        path = path.strip().replace("\\", "/")
+        if not path:
+            continue
+        try:
+            size = int(rest.split("\t")[0] or 0)
+        except ValueError:
+            size = 0
+        files.append((path, size))
+    return version, count, files
+
+
+def autoup_get(url, dest, only=None, version=None, dry=False):
+    """按清单把升级文件下到 dest，返回落盘路径列表。
+
+    only 是相对路径集合，只取关心的文件（比如 newhost.lst）；version 有值时先比
+    清单版本，不比它新就跳过。清单第二行是 0 表示整包 zip，这时取同目录同名 zip。
+    """
+    os.makedirs(dest, exist_ok=True)
+    code, raw = http_fetch(manifest_url(url))
+    if code != 200:
+        raise ValueError("取清单失败：HTTP %d %s" % (code, manifest_url(url)))
+    man_version, count, files = parse_manifest(raw.decode("gbk", "replace"))
+    print("清单版本 %.4f，文件 %d 个%s" % (man_version, count, "（整包）" if not count else ""))
+    if version is not None and man_version <= float(version):
+        print("清单版本不比本地 %.4f 新，跳过" % float(version))
+        return []
+    base = url.rsplit("/", 1)[0] + "/"
+    if not count:
+        stem = url.rsplit("/", 1)[-1][:-3]
+        jobs = [("update/" + stem + ".zip", 0)]
+    else:
+        jobs = [f for f in files if not only or f[0] in only
+                or f[0].rsplit("/", 1)[-1] in only]
+    if not jobs:
+        print("清单里没有要取的文件")
+        return []
+    if dry:
+        for path, size in jobs:
+            print("  = %s（%d 字节）" % (path, size))
+        return []
+    saved = []
+    for path, size in jobs:
+        target = os.path.join(dest, os.path.basename(path) if only else path)
+        code, body = http_fetch(base + path)
+        if code != 200:
+            print("  ! %s HTTP %d" % (path, code))
+            continue
+        if size and len(body) != size:
+            print("  ! %s 大小不符：清单 %d，实收 %d" % (path, size, len(body)))
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(body)
+        print("  + %s（%d 字节）" % (target, len(body)))
+        saved.append(target)
+    return saved
+
+
+def autoup_probe(base, names, timeout=12):
+    """按候选文件名逐个试 base 下的地址，返回 (名称, 状态码, 字节数, 头 4 字节)。
+
+    包名会被服务端换掉，猜名字时用它；文件 200 才算命中。
+    """
+    out = []
+    for name in names:
+        url = base.rstrip("/") + "/" + name.lstrip("/")
+        code, body = http_fetch(url, timeout=timeout)
+        out.append((name, code, len(body), body[:4]))
+        print("%-40s %d %8d %r" % (name, code, len(body), body[:4]))
+    return out
+
+
 def build_sitecfg(spec):
     """从零重建 connect.cfg 文本；缺省键取自内置模板，自检有错则抛 ValueError。
 
@@ -822,6 +1156,7 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--out")
         p.add_argument("--limit", type=int, default=0)
+    sub.choices["snapshot"].add_argument("--top", type=int, default=20, help="按总市值取前多少行，0 为全部")
     p = sub.add_parser("blocks")
     p.add_argument("--out")
     p.add_argument("--custom", action="store_true")
@@ -835,6 +1170,22 @@ def main(argv=None):
     p.add_argument("--hosts-out")
     p = sub.add_parser("sitecfg-check")
     p.add_argument("--path", default="connect.cfg")
+    p = sub.add_parser("hosts-update")
+    p.add_argument("--path", default="connect.cfg", help="要刷新的 connect.cfg")
+    p.add_argument("--from", dest="src", help="本地 newhost.lst 路径")
+    p.add_argument("--url", help="远端 newhost.lst 地址（也认环境变量 TDX_HOSTS_URL）")
+    p.add_argument("--dry", action="store_true", help="只打印变化，不写盘")
+    p = sub.add_parser("autoup-list")
+    p.add_argument("--url", required=True, help="升级包地址（末 3 个字符会被换成 txt 当清单）")
+    p = sub.add_parser("autoup-get")
+    p.add_argument("--url", required=True, help="升级包地址")
+    p.add_argument("--dest", required=True, help="落盘目录")
+    p.add_argument("--only", action="append", help="只取指定文件，可重复（如 newhost.lst）")
+    p.add_argument("--version", help="本地版本，清单不比它新就跳过")
+    p.add_argument("--dry", action="store_true", help="只列要取的文件")
+    p = sub.add_parser("autoup-probe")
+    p.add_argument("--base", required=True, help="包所在的目录地址")
+    p.add_argument("names", nargs="+", help="候选文件名")
     p = sub.add_parser("sitecfg-build")
     p.add_argument("--spec", required=True)
     p.add_argument("--out", default="connect.new.cfg")
@@ -872,7 +1223,16 @@ def main(argv=None):
         write_csv(rows[: a.limit] if a.limit else rows, a.out)
     elif a.cmd == "snapshot":
         rows = list(snapshot(r))
-        write_csv([{k: v for k, v in x.items() if k != "raw"} | {"cols": len(x["raw"])} for x in rows], a.out)
+        rows.sort(key=lambda x: -(x.get("total_cap") or 0))
+        if a.top:
+            rows = rows[: a.top]
+        if a.out:
+            write_csv([{k: v for k, v in x.items() if k != "raw"} for x in rows], a.out)
+        else:
+            for x in rows[:20]:
+                print("%s %s 总市值%.0f万 涨跌%+.2f%% 成交%.0f万" % (
+                    x["market"], x["code"], x.get("total_cap") or 0, x.get("chg") or 0, x.get("amount") or 0))
+            print("共 %d 行" % len(rows))
     elif a.cmd == "blocks":
         rows = list(custom_blocks(r) if a.custom else blocks(r))
         summary = [{"file": b["file"], "name": b["name"], "count": len(b["members"])} for b in rows]
@@ -884,6 +1244,41 @@ def main(argv=None):
             for s in summary[:20]:
                 print(s)
             print("... 共 %d 个板块" % len(rows))
+    elif a.cmd == "hosts-update":
+        try:
+            update_hosts(a.path, src=a.src, url=a.url, dry=a.dry)
+            return 0
+        except (ValueError, OSError) as exc:
+            print("错误:", exc)
+            return 2
+    elif a.cmd == "autoup-list":
+        try:
+            code, raw = http_fetch(manifest_url(a.url))
+            if code != 200:
+                print("错误: 取清单 HTTP %d %s" % (code, manifest_url(a.url)))
+                return 2
+            ver, cnt, files = parse_manifest(raw.decode("gbk", "replace"))
+        except (ValueError, OSError) as exc:
+            print("错误:", exc)
+            return 2
+        print("清单版本 %.4f，文件 %d 个%s" % (ver, cnt, "（整包）" if not cnt else ""))
+        for path, size in files:
+            print("  %10d  %s" % (size, path))
+        return 0
+    elif a.cmd == "autoup-get":
+        try:
+            got = autoup_get(a.url, a.dest, only=set(a.only or ()), version=a.version, dry=a.dry)
+        except (ValueError, OSError) as exc:
+            print("错误:", exc)
+            return 2
+        return 0 if got or a.dry else 2
+    elif a.cmd == "autoup-probe":
+        try:
+            autoup_probe(a.base, a.names)
+        except (ValueError, OSError) as exc:
+            print("错误:", exc)
+            return 2
+        return 0
     elif a.cmd in ("sitecfg-parse", "sitecfg-check"):
         path = a.path if os.path.isabs(a.path) else os.path.abspath(a.path)
         if not os.path.exists(path):

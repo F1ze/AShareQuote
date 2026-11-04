@@ -17,8 +17,9 @@ r"""通达信 7709 行情客户端（协议依据：TDX_接口逆向分析报告
     python tdx_client.py minute   --market 1 --code 600000
     python tdx_client.py tick     --market 1 --code 600000 --start 0 --count 50
     python tdx_client.py local    --market 1 --code 600000 --out x.csv
+    python tdx_client.py info-hello           # 资讯口问候帧（INFOHOST，不吃登录态）
 """
-import argparse, collections, configparser, csv, json, os, socket, struct, sys, threading, time, zlib
+import argparse, collections, configparser, csv, json, os, re, socket, struct, sys, threading, time, zlib
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 安装目录用相对路径推导，TDX_ROOT 或 TDX_CFG 可覆盖
@@ -188,12 +189,12 @@ class TdxConnection:
                 return host, 7709
         return item, 7709                                  # 裸 IPv6 / 裸主机
 
-    def load_hosts(self):
+    def _hosts_from(self, path):
+        """从一个 ini 风格文件里取 (权重, IP, 端口)；只认 IPAddressNN 这类编号键。"""
         cp = configparser.ConfigParser(strict=False)
-        cp.read(self.cfg_path or CFG_DEFAULT, encoding="gbk")
-        hosts = []
-        # 只认 IPAddressNN 这类编号键，按 Weight 从高到低排，连不通就换下一个。
-        for section in ("HQHOST", "TRYHQHOST"):
+        cp.read(path, encoding="gbk")
+        got = []
+        for section in getattr(self, "sections", ("HQHOST", "TRYHQHOST")):
             if not cp.has_section(section):
                 continue
             for m in __import__("re").finditer(r"^ipaddress(\d+)$", "\n".join(cp.options(section)),
@@ -203,10 +204,27 @@ class TdxConnection:
                 if not ip:
                     continue
                 port = cp.getint(section, "Port" + idx, fallback=7709)
-                weight = cp.getint(section, "Weight" + idx, fallback=0)
-                hosts.append((weight, ip, port))
+                got.append((cp.getint(section, "Weight" + idx, fallback=0), ip, port))
+        return got
+
+    def load_hosts(self):
+        """主机来源：connect.cfg 优先；没有站点时退到客户端维护的 newhost.lst。
+
+        两个地址都可被 TDX_CFG 覆盖；newhost.lst 由官方更新器写入，
+        路径是 <安装根>/T0002/newhost.lst 或 <安装根>/newhost.lst。
+        """
+        cfg = self.cfg_path or CFG_DEFAULT
+        root = os.path.dirname(os.path.abspath(cfg))
+        hosts = self._hosts_from(cfg)
         if not hosts:
-            raise TdxError("connect.cfg 中没有可用主机")
+            for cand in (os.path.join(root, "T0002", "newhost.lst"),
+                         os.path.join(root, "newhost.lst")):
+                if os.path.isfile(cand):
+                    hosts = self._hosts_from(cand)
+                    if hosts:
+                        break
+        if not hosts:
+            raise TdxError("connect.cfg 与 newhost.lst 都没有可用主机")
         hosts.sort(key=lambda x: -x[0])
         return [(ip, port) for _w, ip, port in hosts]
 
@@ -217,7 +235,8 @@ class TdxConnection:
                 s = socket.create_connection((host, port), timeout=self.timeout)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock = s
-                self._handshake()
+                if getattr(self, "handshake", True):
+                    self._handshake()
                 self.host, self.port = host, port
                 return host, port
             except Exception as exc:                        # noqa: BLE001
@@ -305,6 +324,47 @@ class TdxConnection:
             self._read_message()
         self._send_raw(bytes.fromhex(
             "0c0318990001200020000fdbd5d0c9ccd6a4a8af0000008fc22540130000d500c9ccbdf0d7ea00000002"))
+
+    ## 通用裸帧
+    # 给不走 _request（它把 commtype 塞进 body）的那些命令用：commtype 在头 10..12，body 原样，
+    # 两段长度相等即不压缩。应答同样按 commtype 对齐，最多丢弃 8 条夹带推送。
+    def request_raw(self, commtype, payload=b"", catword=1, ver=0, flag=0):
+        body = payload
+        frame = b"\x0c" + struct.pack("<HHBHH", catword, ver, flag, len(body), len(body))
+        frame += struct.pack("<H", commtype) + body
+        with self._sem:
+            with self._lock:
+                last_exc = None
+                for _attempt in range(3):
+                    try:
+                        if self.sock is None:
+                            self.connect()
+                        self._send_raw(frame)
+                        for _ in range(8):
+                            got = self._read_message()
+                            if self._last_commtype == commtype:
+                                return got
+                        last_exc = TdxError("应答 commtype 不匹配（期望 0x%04X）" % commtype)
+                    except (TdxError, OSError) as exc:
+                        last_exc = exc
+                    self._close()
+                raise TdxError("请求失败: %r" % (last_exc,))
+
+    ## 资讯服务器（INFOHOST 7711）的问候帧
+    # 0x1F7E 是客户端连上资讯口后的第一条命令，body 固定两个零字节；应答是明文段里的问候，
+    # 带服务端时间、版本串、路径前缀 /tdx/infohost 和 F10/表格两个能力标志。不吃登录态。
+    def info_hello(self):
+        body = self.request_raw(0x1F7E, b"\x00\x00")
+        out = {"raw": body}
+        stamp = body[9:40].split(b"\x00")[0]
+        out["time"] = stamp.decode("gbk", "ignore")
+        m = re.search(rb"[0-9][0-9.]*\s*build[^\x00]*", body)
+        out["build"] = m.group(0).decode("ascii", "ignore") if m else ""
+        at = body.find(b"/tdx/")
+        out["path"] = body[at:body.find(b"\x00", at)].decode("ascii", "ignore") if at >= 0 else ""
+        out["f10"] = b"F10: Y" in body
+        out["table"] = b"Table: Y" in body
+        return out
 
     def heartbeat(self):
         self._send_raw(bytes.fromhex("0c0108000101000000000000"))
@@ -553,7 +613,7 @@ def _write_bars_csv(recs, out):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="通达信 7709 行情客户端")
     ap.add_argument("cmd", choices=["smoke", "count", "codes", "bars", "minute", "tick",
-                                    "local", "xdxr", "login"])
+                                    "local", "xdxr", "login", "info-hello"])
     ap.add_argument("--market", type=int, default=1)
     ap.add_argument("--code", default="600000")
     ap.add_argument("--category", type=int, default=9)
@@ -619,6 +679,18 @@ def main(argv=None):
     host, port = conn.connect()
     print("已连接 %s:%d" % (host, port))
 
+    if args.cmd == "info-hello":
+        # 资讯口问候帧，用来确认 INFOHOST 可达与服务端能力位。
+        conn = TdxConnection(cfg_path=args.cfg)
+        conn.sections = ("INFOHOST", "DSHOST")   # 问候帧打资讯口，不打行情口
+        conn.handshake = False                   # 资讯口不认 Setup1-3，连上直接发命令
+        try:
+            got = conn.info_hello()
+        finally:
+            conn._close()
+        print("时间=%s 版本=%s 路径=%s F10=%s 表格=%s"
+              % (got["time"], got["build"], got["path"], got["f10"], got["table"]))
+        return 0 if got["build"] else 1
     if args.cmd == "smoke":
         n = conn.security_count(args.market)
         print("market=%d 证券数=%d" % (args.market, n))

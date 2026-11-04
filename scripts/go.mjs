@@ -1,3 +1,4 @@
+import { nativeEnvironment } from "./native-env.mjs";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -9,7 +10,7 @@ if (process.platform === "win32") {
 candidates.push("go");
 const go = candidates.find((candidate) => candidate && (candidate === "go" || existsSync(candidate)));
 if (!go) {
-  console.error("未找到 Go。请安装 Go 1.23+，或设置 GO_BINARY 为 go.exe 的完整路径。");
+  console.error("未找到 Go。请安装 Go 1.24+，或设置 GO_BINARY 为 go.exe 的完整路径。");
   process.exit(1);
 }
 
@@ -19,7 +20,14 @@ if (!command) {
   process.exit(1);
 }
 const goArgs = command === "run" ? ["run", "./cmd/qflux", ...args] : [command, ...args];
-const child = spawn(go, goArgs, { stdio: "inherit", windowsHide: true });
+let env;
+try {
+  env = nativeEnvironment();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+const child = spawn(go, goArgs, { stdio: "inherit", windowsHide: true, env });
 const forward = (signal) => {
   if (!child.killed) child.kill(signal);
 };

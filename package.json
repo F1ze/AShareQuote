@@ -1,11 +1,20 @@
 {
   "name": "qflux-quotes",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Go 并发通达信行情下载台",
+  "description": "A-share research data platform with resumable ingestion and DuckDB",
   "scripts": {
+    "setup:data": "node scripts/setup-data.mjs",
+    "test:data": "node scripts/test-data.mjs",
     "dev": "node scripts/go.mjs run",
-    "build": "node scripts/go.mjs build -o bin/quotes.exe ./cmd/qflux",
-    "test": "node scripts/go.mjs test ./..."
+    "build": "npm run frontend:build && node scripts/go.mjs build -o bin/quotes.exe ./cmd/qflux",
+    "backend:build": "node scripts/go.mjs build -o bin/quotes.exe ./cmd/qflux",
+    "frontend:install": "npm --prefix frontend ci",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "frontend:lint": "npm --prefix frontend run lint",
+    "test": "node scripts/go.mjs test ./...",
+    "lint": "npm run frontend:lint",
+    "setup:native": "node scripts/setup-native.mjs"
   }
 }
