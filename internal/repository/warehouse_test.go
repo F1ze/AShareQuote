@@ -101,15 +101,73 @@ func TestNativeWarehouseIdempotenceUnitsRevisionsAndSearch(t *testing.T) {
 		t.Fatalf("bars %+v", bars)
 	}
 	ingestFixture(t, d, "2024-01-02,10,13,9,12,100,120000\n", "correction", "fixture")
+	sourceBefore := scalarFixture[string](t, d, "SELECT source FROM bars WHERE code='600000' AND ts='2024-01-02'")
+	ingestedBefore := scalarFixture[string](t, d, "SELECT ingested_at::VARCHAR FROM bars WHERE code='600000' AND ts='2024-01-02'")
 	ingestFixture(t, d, "2024-01-02,10,13,9,12,100,120000\n", "repeat", "another_source")
 	s = summaryFixture(t, d)
 	if s.Rows != 2 || s.Revisions != 1 {
 		t.Fatalf("unexpected revisions %+v", s)
 	}
+	if oldClose := scalarFixture[string](t, d, "SELECT old_close::VARCHAR FROM bar_revisions"); oldClose != "11.000000" {
+		t.Fatalf("revision old close %s", oldClose)
+	}
+	if sourceAfter := scalarFixture[string](t, d, "SELECT source FROM bars WHERE code='600000' AND ts='2024-01-02'"); sourceAfter != sourceBefore {
+		t.Fatalf("identical replay changed source: %q -> %q", sourceBefore, sourceAfter)
+	}
+	if ingestedAfter := scalarFixture[string](t, d, "SELECT ingested_at::VARCHAR FROM bars WHERE code='600000' AND ts='2024-01-02'"); ingestedAfter != ingestedBefore {
+		t.Fatalf("identical replay changed ingestion time: %q -> %q", ingestedBefore, ingestedAfter)
+	}
 	if n := scalarFixture[int64](t, d, "SELECT count(*) FROM ingestion_receipts"); n != 3 {
 		t.Fatalf("receipts %d", n)
 	}
 }
+
+// 行情模型也按 500 行分批写入；完整归档重放不能新增行或修订。
+func TestNativeWarehouseORMLargeBarBatches(t *testing.T) {
+	d := fixtureDB(t)
+	var body strings.Builder
+	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 620; i++ {
+		fmt.Fprintf(&body, "%s,10,12,9,11,1,1100\n", start.AddDate(0, 0, i).Format("2006-01-02"))
+	}
+	ingestFixture(t, d, body.String(), "large", "fixture")
+	ingestFixture(t, d, body.String(), "large_replay", "fixture")
+	if s := summaryFixture(t, d); s.Rows != 620 || s.Revisions != 0 {
+		t.Fatalf("large ORM batches: %+v", s)
+	}
+	if n := scalarFixture[int64](t, d, "SELECT count(*) FROM ingestion_receipts"); n != 2 {
+		t.Fatalf("large batch receipts: %d", n)
+	}
+}
+
+// 数据集组装保持窗口查询的排序规则，以及摘要/分页对缺失证券名称的不同空值契约。
+func TestNativeWarehouseORMDatasetAssemblyCompatibility(t *testing.T) {
+	d := fixtureDB(t)
+	ctx := context.Background()
+	for _, item := range []struct{ run, warning string }{{"a", "old warning"}, {"z", "latest warning"}} {
+		b, r := fixtureArchive(t, d, "", item.run, "fixture")
+		b.Warning = item.warning
+		mustOK(t, d.Ingest(ctx, b, r))
+	}
+	db, err := d.open(ctx)
+	mustOK(t, err)
+	fixed := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	mustOK(t, db.Model(&receiptRecord{}).Where("exchange=? AND code=?", "SH", "600000").Update("imported_at", fixed).Error)
+	if item := summaryFixture(t, d).Datasets[0]; item.Warning != "latest warning" {
+		t.Fatalf("latest receipt tie-break: %+v", item)
+	}
+
+	mustOK(t, db.Where("exchange=? AND code=?", "SH", "600000").Delete(&instrumentRecord{}).Error)
+	if item := summaryFixture(t, d).Datasets[0]; item.Name != nil || item.Status != "unknown" {
+		t.Fatalf("summary missing instrument contract: %+v", item)
+	}
+	page, err := d.Datasets(ctx, domain.DatasetQuery{Period: "day"})
+	mustOK(t, err)
+	if len(page.Items) != 1 || page.Items[0].Name == nil || *page.Items[0].Name != "" {
+		t.Fatalf("dataset missing instrument contract: %+v", page.Items)
+	}
+}
+
 func TestNativeWarehouseExactDecimals(t *testing.T) {
 	d := fixtureDB(t)
 	ctx := context.Background()
@@ -124,6 +182,52 @@ func TestNativeWarehouseExactDecimals(t *testing.T) {
 		t.Fatal(text)
 	}
 }
+func TestWarehouseDecimalNormalizationAndVolumeRounding(t *testing.T) {
+	cases := []struct {
+		name             string
+		input            string
+		precision, scale int
+		want             string
+		valid            bool
+	}{
+		{"fixed scale", "0.95", 24, 8, "0.95000000", true},
+		{"positive half away from zero", "1.2345675", 18, 6, "1.234568", true},
+		{"negative half away from zero", "-1.2345675", 18, 6, "-1.234568", true},
+		{"no negative zero", "-0.0000004", 18, 6, "0.000000", true},
+		{"eight decimal rounding", "0.000000005", 24, 8, "0.00000001", true},
+		{"rounded overflow", "999999999999.9999995", 18, 6, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := normalizeDecimal(tc.input, tc.precision, tc.scale)
+			if !tc.valid {
+				if err == nil {
+					t.Fatalf("expected rejection, got %q", actual)
+				}
+				return
+			}
+			mustOK(t, err)
+			if actual != tc.want {
+				t.Fatalf("normalized %q != %q", actual, tc.want)
+			}
+		})
+	}
+
+	// 原转换先把“手”舍入到八位小数，再乘 100 并舍入为整数股，不能合并成一次舍入。
+	row := []string{"2024-01-02", "10", "12", "9", "11", "0.004999999", "0"}
+	record, err := parseArchiveBar(row, "SH", "600000", "day", "fixture")
+	mustOK(t, err)
+	if record.VolumeShares != 1 {
+		t.Fatalf("two-stage volume rounding: %d", record.VolumeShares)
+	}
+	row[5] = "0.004999994"
+	record, err = parseArchiveBar(row, "SH", "600000", "day", "fixture")
+	mustOK(t, err)
+	if record.VolumeShares != 0 {
+		t.Fatalf("two-stage volume rounding below half: %d", record.VolumeShares)
+	}
+}
+
 func TestNativeWarehouseBadBatchRollsBackAllTables(t *testing.T) {
 	d := fixtureDB(t)
 	ctx := context.Background()
@@ -381,5 +485,96 @@ func TestNativeWarehouseORMGroupedPagination(t *testing.T) {
 	mustOK(t, err)
 	if first.Total != 60 || len(first.Items) != 50 || second.Total != 60 || len(second.Items) != 10 || second.Items[0].Code != "600050" || empty.Total != 60 || len(empty.Items) != 0 {
 		t.Fatalf("pagination: first=%+v second=%+v empty=%+v", first, second, empty)
+	}
+}
+
+// 模型生成的新库必须保持既有研究契约：Decimal、时间口径、整数类型、复合主键及日线视图不能漂移。
+func TestNativeWarehouseORMGeneratedSchemaContract(t *testing.T) {
+	d := fixtureDB(t)
+	ctx := context.Background()
+	db, err := d.open(ctx)
+	mustOK(t, err)
+	columns := []struct{ table, column, kind string }{
+		{"bars", "open", "DECIMAL(18,6)"}, {"bars", "amount_cny", "DECIMAL(24,4)"}, {"bars", "volume_shares", "BIGINT"},
+		{"bars", "ts", "TIMESTAMP"}, {"bars", "ingested_at", "TIMESTAMP WITH TIME ZONE"},
+		{"bar_revisions", "old_amount_cny", "DECIMAL(24,4)"}, {"bar_revisions", "replaced_at", "TIMESTAMP WITH TIME ZONE"},
+		{"provider_factors", "forward_factor", "DECIMAL(30,15)"}, {"provider_factors", "event_date", "DATE"},
+		{"adjustment_events", "event_type", "INTEGER"}, {"schema_migrations", "version", "INTEGER"},
+	}
+	for _, col := range columns {
+		var kind string
+		mustOK(t, db.Table("information_schema.columns").Select("data_type").Where("table_name=? AND column_name=?", col.table, col.column).Scan(&kind).Error)
+		if kind != col.kind {
+			t.Fatalf("%s.%s type: %s != %s", col.table, col.column, kind, col.kind)
+		}
+	}
+	keys := []struct{ table, columns string }{
+		{"bars", "[exchange, code, period, ts]"}, {"instruments", "[exchange, code]"},
+		{"ingestion_receipts", "[exchange, code, period, sha256, run_id]"},
+		{"provider_factors", "[exchange, code, event_date, source]"}, {"trading_calendar", "[exchange, date]"},
+		{"adjustment_events", "[exchange, code, event_date, event_type]"}, {"schema_migrations", "[version]"},
+	}
+	for _, key := range keys {
+		actual := scalarFixture[string](t, d, "SELECT constraint_column_names::VARCHAR FROM duckdb_constraints() WHERE table_name=? AND constraint_type='PRIMARY KEY'", key.table)
+		if actual != key.columns {
+			t.Fatalf("%s primary key: %s != %s", key.table, actual, key.columns)
+		}
+	}
+	ingestFixture(t, d, "", "schema fixture", "fixture")
+	if n := scalarFixture[int64](t, d, "SELECT count(*) FROM daily_bars WHERE trade_date='2024-01-02'"); n != 1 {
+		t.Fatalf("daily view: %d", n)
+	}
+	// 创建缺失对象不能暗中重写已存在的列；关闭重开后也必须保留外部明确扩宽的类型。
+	mustOK(t, db.Exec("ALTER TABLE bars ADD COLUMN research_note VARCHAR").Error)
+	mustOK(t, d.Close())
+	reopened := NewDuckDB(d.Path)
+	defer reopened.Close()
+	mustOK(t, reopened.Check(ctx))
+	if n := scalarFixture[int64](t, reopened, "SELECT count(*) FROM information_schema.columns WHERE table_name='bars' AND column_name='research_note'"); n != 1 {
+		t.Fatal("existing table was rebuilt")
+	}
+}
+
+// 因子边界必须以数据库实际存储验证，不能只测 Go 校验函数本身。
+func TestNativeWarehouseFactorDecimalBoundaries(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"0.00000000000000049", ""}, {"0.0000000000000005", "0.000000000000001"},
+		{"5e-16", "0.000000000000001"}, {"0.950000000000001", "0.950000000000001"},
+		{"999999999999999.9999999999999994", "999999999999999.999999999999999"},
+		{"999999999999999.9999999999999995", ""}, {"1e15", ""}, {"NaN", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			d := fixtureDB(t)
+			err := d.StoreFactors(context.Background(), domain.Security{Market: 1, Code: "600000"}, []domain.PriceFactor{{Date: "2024-01-02", Forward: tc.input, Backward: "1", Event: "1"}})
+			if tc.want == "" {
+				if err == nil {
+					t.Fatal("out-of-range factor accepted")
+				}
+				if n := summaryFixture(t, d).FactorEvents; n != 0 {
+					t.Fatalf("invalid factor stored: %d", n)
+				}
+				return
+			}
+			mustOK(t, err)
+			if actual := scalarFixture[string](t, d, "SELECT forward_factor::VARCHAR FROM provider_factors"); actual != tc.want {
+				t.Fatalf("factor stored %s != %s", actual, tc.want)
+			}
+		})
+	}
+}
+
+// 不同资料完备度的连续观察只能更新自己携带的字段，不能覆盖上一步的有效资料。
+func TestNativeWarehouseORMPartialObservations(t *testing.T) {
+	d := fixtureDB(t)
+	ctx := context.Background()
+	mustOK(t, d.Observe(ctx, []domain.Security{{Market: 1, Code: "600000", Name: "原名", ListingDate: "1999-11-10", Status: "listed", ReferenceSource: "original"}}))
+	mustOK(t, d.Observe(ctx, []domain.Security{
+		{Market: 1, Code: "600000", Name: "新名"},
+		{Market: 1, Code: "600000", DelistingDate: "2024-01-03", Status: "delisted", ReferenceSource: "curated"},
+		{Market: 1, Code: "600000"},
+	}))
+	if n := scalarFixture[int64](t, d, "SELECT count(*) FROM instruments WHERE code='600000' AND name='新名' AND listing_date='1999-11-10' AND delisting_date='2024-01-03' AND status='delisted' AND reference_source='curated'"); n != 1 {
+		t.Fatal("partial observation erased or reordered reference information")
 	}
 }

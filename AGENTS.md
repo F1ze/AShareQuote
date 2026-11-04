@@ -121,7 +121,7 @@ node scripts/go.mjs run \
 - Service 的外部端口在消费端定义，由 cmd 组装注入；禁止 Service 导入 repository/platform、直接读写文件、编码 JSON 或拼 SQL。
 - 数据库访问统一经 GORM；ORM 标签与持久化模型只放在 Repository，不污染 Domain/Service。
 - DuckDB 使用官方 Go 原生驱动，不得通过 Python 子进程操作；批量 CSV 加载、修订合并及 Parquet 导出可通过 GORM 执行专用 SQL。
-- 数据库结构使用显式版本迁移，不以 AutoMigrate 自动改写历史库的 Decimal 精度或复合主键；仓库操作须保留整批事务与 context 取消。
+- 数据库结构使用显式版本迁移，通过 GORM Migrator 根据模型创建缺失对象，不以 AutoMigrate 自动改写历史库的 Decimal 精度或复合主键；仓库操作须保留整批事务与 context 取消。
 - Repository 不决定证券采集范围或任务成败，Handler 不读取行情 CSV、不组织复权、不拼 Python 工作进程命令。
 - 按职责在现有包内分文件，禁止每增加一个用例就增加一个 internal 顶层目录。
 - 通过 RegisterSource(SourceSpec) 注册新的历史来源，避免向用例添加供应商名称分支；本地格式通过解码器注册表扩展。
@@ -189,6 +189,6 @@ QFLUX_SMOKE_DOWNLOAD=1 python scripts/smoke_preview.py
 ## 8. Git 约定
 
 - Git 仓库根目录是 `src`，不要在上级目录重复初始化仓库。
-- 不要自动 `git add`、`git commit` 或 `git push`，除非用户明确要求。
+- 不要自动 `git add`、`git commit` 或 `git push`；仅在用户当前明确要求提交时执行，不沿用先前任务的提交授权。
 - 提交前运行 `git diff --check`，并确认构建产物和下载数据未进入暂存区。
 - 用户要求“仅本次提交”时，不形成后续自动提交习惯。

@@ -30,6 +30,7 @@ PRICE_CATEGORY = 1          # 带派息/送转/配股比例，主算法类别
 SHRINK_CATEGORIES = (11, 12)  # 缩股/扩缩股：股本按比例变，价格反向
 WARRANT_CATEGORIES = (13, 14)  # 送认购/认沽权证：默认不参与除权价（报告 25 章实测）
 WARRANT_IN_PRICE = False       # 置真则按权证内在价值折价，属可选的强推断
+WARRANT_Q = 0.0                # 大于零则改用 行权价×Q 当权证价值，Q 由 41 章样本网格拟合出 0.35
 
 
 # 文件读法：常量 → 解密/加密 → 装载与因子公式 → 复权应用 → 校验 → CLI。
@@ -168,10 +169,14 @@ def ratio(event, prev_close):
         n = (event.get("warrant_ratio") or event.get("bonus") or 0.0) / 10.0
         if strike <= 0 or n <= 0:
             return None
-        intrinsic = (prev_close - strike) if cat == 13 else (strike - prev_close)
-        if intrinsic <= 0:
+        # 有 Q 就用 行权价×Q 当权证价值（挂牌价买不到时的折算，41 章拟合），否则退回内在价值。
+        if WARRANT_Q > 0:
+            value = strike * WARRANT_Q
+        else:
+            value = (prev_close - strike) if cat == 13 else (strike - prev_close)
+        if value <= 0:
             return 1.0
-        val = (prev_close - intrinsic * n) / prev_close
+        val = (prev_close - value * n) / prev_close
         return val if val > 0 else None
 
 
@@ -284,6 +289,7 @@ def main(argv=None):
     p.add_argument("--closes-csv")
     p.add_argument("--mode", default="hfq", choices=["qfq", "hfq", "none"])
     p.add_argument("--warrant", action="store_true", help="把 13/14 权证按内在价值折价（默认不计）")
+    p.add_argument("--warrant-q", type=float, default=0.0, help="按 行权价×Q 折价（41 章拟合值 0.35）")
     p = sub.add_parser("dump")
     p.add_argument("--gbbq", required=True)
     p.add_argument("--out", required=True)
@@ -296,10 +302,15 @@ def main(argv=None):
     p.add_argument("--code", required=True)
     p.add_argument("--mode", default="hfq", choices=["qfq", "hfq", "none"])
     p.add_argument("--warrant", action="store_true", help="把 13/14 权证按内在价值折价（默认不计）")
+    p.add_argument("--warrant-q", type=float, default=0.0, help="按 行权价×Q 折价（41 章拟合值 0.35）")
     p.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     if getattr(a, "warrant", False):
         global WARRANT_IN_PRICE
+        WARRANT_IN_PRICE = True
+    if getattr(a, "warrant_q", 0):
+        global WARRANT_Q
+        WARRANT_Q = a.warrant_q
         WARRANT_IN_PRICE = True
     a.gbbq = os.path.abspath(a.gbbq)
     if getattr(a, "csv", None):

@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -60,31 +62,19 @@ func (d *DuckDB) Ingest(ctx context.Context, b domain.Batch, r domain.Receipt) e
 	return err
 }
 func ingestTx(ctx context.Context, tx *gorm.DB, b domain.Batch, r domain.Receipt, path, exchange, period string) error {
-	// 1. CSV 全部按文本读取，价格直接转 DECIMAL；先转 DOUBLE 会丢失大成交额和小数末位。
-	err := tx.WithContext(ctx).Exec(`CREATE OR REPLACE TEMP TABLE incoming AS SELECT ?::VARCHAR exchange,
- ?::VARCHAR code,?::VARCHAR period,date::TIMESTAMP ts,open::DECIMAL(18,6) open,
- high::DECIMAL(18,6) high,low::DECIMAL(18,6) low,close::DECIMAL(18,6) "close",
- round(volume::DECIMAL(24,8)*100)::BIGINT volume_shares,amount::DECIMAL(24,4) amount_cny,?::VARCHAR AS source
- FROM read_csv(?,header=true,columns={'date':'VARCHAR','open':'VARCHAR','high':'VARCHAR',
- 'low':'VARCHAR','close':'VARCHAR','volume':'VARCHAR','amount':'VARCHAR'})`, exchange, b.Security.Code, period, b.Source, path).Error
+	// 1. Go 逐行解析标准归档，所有数值按十进制精确舍入，不经过 float64 或 SQL 临时表。
+	incoming, err := readArchiveBars(ctx, path, exchange, b.Security.Code, period, b.Source)
 	if err != nil {
 		return fmt.Errorf("解析归档行情：%w", err)
 	}
-	// 2. 校验整批再写正式表，回执条数/边界也必须与归档内容一致，避免保存错误断点。
-	var total, bad int64
-	var first, last string
-	err = tx.WithContext(ctx).Raw(`SELECT count(*),count(*) FILTER(WHERE ts IS NULL OR open IS NULL OR high IS NULL OR low IS NULL
- OR close IS NULL OR volume_shares IS NULL OR amount_cny IS NULL OR open<=0 OR close<=0 OR low<=0
- OR high<greatest(open,close) OR low>least(open,close) OR volume_shares<0 OR amount_cny<0),
- coalesce(strftime(min(ts),'%Y-%m-%d %H:%M'),''),coalesce(strftime(max(ts),'%Y-%m-%d %H:%M'),'') FROM incoming`).Row().Scan(&total, &bad, &first, &last)
-	if err != nil {
-		return err
+
+	// 2. 在 Go 中校验整批，回执条数/边界必须与实际归档一致，避免保存错误断点。
+	first, last, bad := archiveQuality(incoming)
+	if len(incoming) == 0 || bad > 0 {
+		return fmt.Errorf("行情未通过入库质量检查：%d 条，其中 %d 条无效", len(incoming), bad)
 	}
-	if total == 0 || bad > 0 {
-		return fmt.Errorf("行情未通过入库质量检查：%d 条，其中 %d 条无效", total, bad)
-	}
-	if total != int64(r.Rows) {
-		return fmt.Errorf("归档条数 %d 与回执 %d 不一致", total, r.Rows)
+	if len(incoming) != r.Rows {
+		return fmt.Errorf("归档条数 %d 与回执 %d 不一致", len(incoming), r.Rows)
 	}
 	normalizeTime := func(s string) string {
 		if len(s) == 10 {
@@ -95,22 +85,9 @@ func ingestTx(ctx context.Context, tx *gorm.DB, b domain.Batch, r domain.Receipt
 	if first != normalizeTime(r.From) || last != normalizeTime(r.To) {
 		return fmt.Errorf("归档时间边界与回执不一致")
 	}
-	// 3. 同主键数值发生变化才保留旧版本；重复抓取或仅切换来源不会产生虚假修订。
-	err = tx.WithContext(ctx).Exec(`INSERT INTO bar_revisions SELECT old.exchange,old.code,old.period,old.ts,
- old.open,old.high,old.low,old.close,old.volume_shares,old.amount_cny,old.source,now(),?
- FROM bars old JOIN incoming new USING(exchange,code,period,ts)
- WHERE (old.open,old.high,old.low,old.close,old.volume_shares,old.amount_cny)
- IS DISTINCT FROM (new.open,new.high,new.low,new.close,new.volume_shares,new.amount_cny)`, b.RunID).Error
-	if err != nil {
-		return err
-	}
-	err = tx.WithContext(ctx).Exec(`INSERT INTO bars BY NAME SELECT *,now() ingested_at FROM incoming
- ON CONFLICT(exchange,code,period,ts) DO UPDATE SET open=excluded.open,high=excluded.high,
- low=excluded.low,close=excluded.close,volume_shares=excluded.volume_shares,amount_cny=excluded.amount_cny,
- source=excluded.source,ingested_at=excluded.ingested_at
- WHERE (bars.open,bars.high,bars.low,bars.close,bars.volume_shares,bars.amount_cny)
- IS DISTINCT FROM (excluded.open,excluded.high,excluded.low,excluded.close,excluded.volume_shares,excluded.amount_cny)`).Error
-	if err != nil {
+
+	// 3. 通过 GORM 读取重叠主键、保存实际变化的旧值，再批量 upsert 新值。
+	if err = mergeBarsTx(ctx, tx, incoming, exchange, b.Security.Code, period, first, last, b.RunID); err != nil {
 		return err
 	}
 	// 4. 行情、回执、元数据和因子属于同一事务；因子失败时不能宣称该证券已成功入库。
@@ -127,6 +104,225 @@ func ingestTx(ctx context.Context, tx *gorm.DB, b domain.Batch, r domain.Receipt
 		return err
 	}
 	return nil
+}
+
+// readArchiveBars 只接受标准归档列；日期、价格和成交量都在进入 ORM 前完成确定性转换。
+func readArchiveBars(ctx context.Context, path, exchange, code, period, source string) ([]barRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	reader := csv.NewReader(file)
+	header, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	if len(header) > 0 {
+		header[0] = strings.TrimPrefix(header[0], "\ufeff")
+	}
+	want := []string{"date", "open", "high", "low", "close", "volume", "amount"}
+	if len(header) != len(want) {
+		return nil, fmt.Errorf("行情 CSV 需要 date,open,high,low,close,volume,amount 列")
+	}
+	for i := range want {
+		if header[i] != want[i] {
+			return nil, fmt.Errorf("CSV 第 %d 列应为 %s", i+1, want[i])
+		}
+	}
+
+	records := []barRecord{}
+	for line := 2; ; line++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("CSV 第 %d 行：%w", line, err)
+		}
+		record, err := parseArchiveBar(row, exchange, code, period, source)
+		if err != nil {
+			return nil, fmt.Errorf("CSV 第 %d 行：%w", line, err)
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func parseArchiveBar(row []string, exchange, code, period, source string) (barRecord, error) {
+	result := barRecord{Exchange: exchange, Code: code, Period: period, Source: source}
+	layout := "2006-01-02"
+	if len(row[0]) > 10 {
+		layout = "2006-01-02 15:04"
+	}
+	date, err := time.ParseInLocation(layout, row[0], domain.ExchangeTime)
+	if err != nil {
+		return result, fmt.Errorf("日期无效：%w", err)
+	}
+	result.Time = date.Format("2006-01-02 15:04")
+
+	prices := []*string{&result.Open, &result.High, &result.Low, &result.Close}
+	for i, target := range prices {
+		value, err := normalizeDecimal(row[i+1], 18, 6)
+		if err != nil {
+			return result, fmt.Errorf("%s：%w", wantArchiveColumn(i+1), err)
+		}
+		*target = value
+	}
+	lotsText, err := normalizeDecimal(row[5], 24, 8)
+	if err != nil {
+		return result, fmt.Errorf("volume：%w", err)
+	}
+	lots, _ := new(big.Rat).SetString(lotsText)
+	shares := new(big.Rat).Mul(lots, big.NewRat(100, 1))
+	sharesText, err := normalizeDecimal(shares.RatString(), 19, 0)
+	if err != nil {
+		return result, fmt.Errorf("volume 换算为股：%w", err)
+	}
+	result.VolumeShares, err = strconv.ParseInt(sharesText, 10, 64)
+	if err != nil {
+		return result, fmt.Errorf("volume 超出 BIGINT 范围：%w", err)
+	}
+	result.AmountCNY, err = normalizeDecimal(row[6], 24, 4)
+	if err != nil {
+		return result, fmt.Errorf("amount：%w", err)
+	}
+	return result, nil
+}
+
+func wantArchiveColumn(index int) string {
+	return []string{"date", "open", "high", "low", "close", "volume", "amount"}[index]
+}
+
+// normalizeDecimal 模拟 DuckDB DECIMAL 的定标、四舍五入和精度边界，正负数均采用远离零的半数舍入。
+func normalizeDecimal(text string, precision, scale int) (string, error) {
+	exact, ok := new(big.Rat).SetString(text)
+	if !ok {
+		return "", fmt.Errorf("不是有效十进制数")
+	}
+	factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	numerator := new(big.Int).Mul(exact.Num(), factor)
+	rounded, remainder := new(big.Int), new(big.Int)
+	rounded.QuoRem(numerator, exact.Denom(), remainder)
+	if new(big.Int).Lsh(new(big.Int).Abs(remainder), 1).Cmp(exact.Denom()) >= 0 {
+		if numerator.Sign() < 0 {
+			rounded.Sub(rounded, big.NewInt(1))
+		} else {
+			rounded.Add(rounded, big.NewInt(1))
+		}
+	}
+	limit := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(precision)), nil)
+	if new(big.Int).Abs(rounded).Cmp(limit) >= 0 {
+		return "", fmt.Errorf("超出 DECIMAL(%d,%d) 范围", precision, scale)
+	}
+	return formatScaledDecimal(rounded, scale), nil
+}
+
+func formatScaledDecimal(value *big.Int, scale int) string {
+	negative := value.Sign() < 0
+	digits := new(big.Int).Abs(value).String()
+	if scale > 0 {
+		if len(digits) <= scale {
+			digits = strings.Repeat("0", scale-len(digits)+1) + digits
+		}
+		split := len(digits) - scale
+		digits = digits[:split] + "." + digits[split:]
+	}
+	if negative {
+		digits = "-" + digits
+	}
+	return digits
+}
+
+// archiveQuality 使用十进制有理数检查 OHLCV，不经过 float64，也不从文件行序推断时间边界。
+func archiveQuality(records []barRecord) (first, last string, bad int64) {
+	for _, record := range records {
+		values := make([]*big.Rat, 5)
+		valid := record.Time != "" && record.VolumeShares >= 0
+		for i, text := range []string{record.Open, record.High, record.Low, record.Close, record.AmountCNY} {
+			value, ok := new(big.Rat).SetString(text)
+			if !ok {
+				valid = false
+				continue
+			}
+			values[i] = value
+		}
+		if valid {
+			open, high, low, close, amount := values[0], values[1], values[2], values[3], values[4]
+			valid = open.Sign() > 0 && close.Sign() > 0 && low.Sign() > 0 && amount.Sign() >= 0 &&
+				high.Cmp(open) >= 0 && high.Cmp(close) >= 0 && low.Cmp(open) <= 0 && low.Cmp(close) <= 0
+		}
+		if !valid {
+			bad++
+			continue
+		}
+		if first == "" || record.Time < first {
+			first = record.Time
+		}
+		if last == "" || record.Time > last {
+			last = record.Time
+		}
+	}
+	return first, last, bad
+}
+
+// mergeBarsTx 只写入新增或数值变化的记录；同值重放不会更新来源和入库时间，也不会制造修订。
+func mergeBarsTx(ctx context.Context, tx *gorm.DB, incoming []barRecord, exchange, code, period, first, last, runID string) error {
+	stored := []barRecord{}
+	columns := []string{
+		"exchange", "code", "period", "strftime(ts,'%Y-%m-%d %H:%M') AS ts",
+		"open::VARCHAR AS open", "high::VARCHAR AS high", "low::VARCHAR AS low", "close::VARCHAR AS close",
+		"volume_shares", "amount_cny::VARCHAR AS amount_cny", "source",
+	}
+	err := tx.WithContext(ctx).Model(&barRecord{}).Select(columns).
+		Where(&barRecord{Exchange: exchange, Code: code, Period: period}).
+		Where("ts >= ?::TIMESTAMP AND ts <= ?::TIMESTAMP", first, last).Find(&stored).Error
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]barRecord, len(stored))
+	for _, record := range stored {
+		existing[record.Time] = record
+	}
+
+	now := time.Now().UTC()
+	changes := make([]barRecord, 0, len(incoming))
+	revisions := []revisionRecord{}
+	for _, record := range incoming {
+		old, found := existing[record.Time]
+		if found && sameBarValues(old, record) {
+			continue
+		}
+		record.IngestedAt = now
+		changes = append(changes, record)
+		if found {
+			revisions = append(revisions, revisionRecord{Exchange: old.Exchange, Code: old.Code, Period: old.Period, Time: old.Time,
+				OldOpen: old.Open, OldHigh: old.High, OldLow: old.Low, OldClose: old.Close, OldVolumeShares: old.VolumeShares,
+				OldAmountCNY: old.AmountCNY, OldSource: old.Source, ReplacedAt: now, RunID: runID})
+		}
+	}
+	if len(revisions) > 0 {
+		if err := tx.WithContext(ctx).CreateInBatches(&revisions, 500).Error; err != nil {
+			return err
+		}
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	return tx.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: conflictColumns("exchange", "code", "period", "ts"),
+		DoUpdates: clause.AssignmentColumns([]string{
+			"open", "high", "low", "close", "volume_shares", "amount_cny", "source", "ingested_at",
+		}),
+	}).CreateInBatches(&changes, 500).Error
+}
+
+func sameBarValues(a, b barRecord) bool {
+	return a.Open == b.Open && a.High == b.High && a.Low == b.Low && a.Close == b.Close &&
+		a.VolumeShares == b.VolumeShares && a.AmountCNY == b.AmountCNY
 }
 func ingestAttachments(ctx context.Context, tx *gorm.DB, s domain.Security, path, exchange string) error {
 	prefix := filepath.Join(filepath.Dir(path), strings.ToLower(exchange)+s.Code)
@@ -227,25 +423,52 @@ func observeTx(ctx context.Context, tx *gorm.DB, securities []domain.Security, a
 	if len(records) == 0 {
 		return nil
 	}
-	conflict := clause.OnConflict{Columns: conflictColumns("exchange", "code"), DoNothing: !allowUpdates}
-	if allowUpdates {
-		conflict.DoUpdates = clause.Assignments(map[string]any{
-			"name":             gorm.Expr("CASE WHEN excluded.name<>'' THEN excluded.name ELSE instruments.name END"),
-			"listing_date":     gorm.Expr("coalesce(excluded.listing_date,instruments.listing_date)"),
-			"delisting_date":   gorm.Expr("coalesce(excluded.delisting_date,instruments.delisting_date)"),
-			"status":           gorm.Expr("CASE WHEN excluded.status<>'unknown' THEN excluded.status ELSE instruments.status END"),
-			"reference_source": gorm.Expr("CASE WHEN excluded.reference_source<>'' THEN excluded.reference_source ELSE instruments.reference_source END"),
-			"last_observed_at": now,
-		})
+	if !allowUpdates {
+		return tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&records, 500).Error
 	}
-	return tx.WithContext(ctx).Clauses(conflict).CreateInBatches(&records, 500).Error
+	// 相邻记录按可更新字段分批，保持观察顺序；未知字段根本不出现在更新列中，无需 CASE/COALESCE SQL。
+	for start := 0; start < len(records); {
+		columns := observationColumns(records[start])
+		end := start + 1
+		for end < len(records) && slices.Equal(columns, observationColumns(records[end])) {
+			end++
+		}
+		batch := records[start:end]
+		if err := tx.WithContext(ctx).Clauses(clause.OnConflict{Columns: conflictColumns("exchange", "code"), DoUpdates: clause.AssignmentColumns(columns)}).CreateInBatches(&batch, 500).Error; err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
 }
+
+// observationColumns 只列出本次确实观察到的资料；首见时间永远不参与更新。
+func observationColumns(record instrumentRecord) []string {
+	columns := []string{"last_observed_at"}
+	if record.Name != "" {
+		columns = append(columns, "name")
+	}
+	if record.ListingDate != nil {
+		columns = append(columns, "listing_date")
+	}
+	if record.DelistingDate != nil {
+		columns = append(columns, "delisting_date")
+	}
+	if record.Status != "unknown" {
+		columns = append(columns, "status")
+	}
+	if record.ReferenceSource != "" {
+		columns = append(columns, "reference_source")
+	}
+	return columns
+}
+
 func (d *DuckDB) Observe(ctx context.Context, securities []domain.Security) error {
 	_, err := transact(ctx, d, func(tx *gorm.DB) (struct{}, error) { return struct{}{}, observeTx(ctx, tx, securities, true) })
 	return err
 }
 
-// storeFactorsTx 在 Go 验证日期/有限正数，再用实际 DECIMAL 类型检查可表示性，最后批量 upsert。
+// storeFactorsTx 在 Go 验证日期和 DECIMAL(30,15) 可表示性，随后用 ORM 批量 upsert。
 // 价格因子的 ORM 字段始终为文本，ParseFloat 只负责合法性检查，不参与落库转换。
 func storeFactorsTx(ctx context.Context, tx *gorm.DB, security domain.Security, factors []domain.PriceFactor) error {
 	exchange, err := warehouseIdentity(security)
@@ -259,9 +482,8 @@ func storeFactorsTx(ctx context.Context, tx *gorm.DB, security domain.Security, 
 			return fmt.Errorf("复权日期无效：%w", err)
 		}
 		for _, text := range []string{f.Forward, f.Backward, f.Event} {
-			n, e := strconv.ParseFloat(text, 64)
-			if e != nil || n <= 0 || math.IsInf(n, 0) || math.IsNaN(n) {
-				return fmt.Errorf("复权因子必须为正的有限值")
+			if err := validateFactorDecimal(text); err != nil {
+				return err
 			}
 		}
 		records = append(records, providerFactorRecord{Exchange: exchange, Code: security.Code, EventDate: f.Date, ForwardFactor: f.Forward, BackwardFactor: f.Backward, EventFactor: f.Event, Source: "baostock", FetchedAt: now})
@@ -269,22 +491,36 @@ func storeFactorsTx(ctx context.Context, tx *gorm.DB, security domain.Security, 
 	if len(records) == 0 {
 		return nil
 	}
-	// 正数可能在 DECIMAL(30,15) 下舍入为零，必须用引擎的实际转换规则检查。
-	raw, err := json.Marshal(factors)
-	if err != nil {
-		return err
-	}
-	var roundedToZero int64
-	err = tx.WithContext(ctx).Raw(`SELECT count(*) FROM json_each(?) WHERE
- (value->>'forward')::DECIMAL(30,15)<=0 OR (value->>'backward')::DECIMAL(30,15)<=0 OR (value->>'event')::DECIMAL(30,15)<=0`, string(raw)).Row().Scan(&roundedToZero)
-	if err != nil {
-		return err
-	}
-	if roundedToZero > 0 {
-		return fmt.Errorf("复权因子小于仓库支持的最小正精度")
-	}
+
 	return tx.WithContext(ctx).Clauses(clause.OnConflict{Columns: conflictColumns("exchange", "code", "event_date", "source"), DoUpdates: clause.AssignmentColumns([]string{"forward_factor", "backward_factor", "event_factor", "fetched_at"})}).CreateInBatches(&records, 500).Error
 }
+
+// validateFactorDecimal 用有理数精确模拟 DECIMAL(30,15) 的正数四舍五入，防止浮点误差误判边界。
+// 初步有限值检查也限制异常指数，避免解析恶意超大指数时分配过多内存；落库仍绑定原始文本。
+func validateFactorDecimal(text string) error {
+	n, err := strconv.ParseFloat(text, 64)
+	if err != nil || n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
+		return fmt.Errorf("复权因子必须为正的有限值")
+	}
+	exact, ok := new(big.Rat).SetString(text)
+	if !ok || exact.Sign() <= 0 {
+		return fmt.Errorf("复权因子必须是有效十进制文本")
+	}
+	scaled := new(big.Int).Mul(exact.Num(), big.NewInt(1_000_000_000_000_000))
+	rounded, remainder := new(big.Int), new(big.Int)
+	rounded.QuoRem(scaled, exact.Denom(), remainder)
+	if remainder.Lsh(remainder, 1).Cmp(exact.Denom()) >= 0 {
+		rounded.Add(rounded, big.NewInt(1))
+	}
+	if rounded.Sign() == 0 {
+		return fmt.Errorf("复权因子小于仓库支持的最小正精度")
+	}
+	if rounded.Cmp(new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)) >= 0 {
+		return fmt.Errorf("复权因子超出 DECIMAL(30,15) 范围")
+	}
+	return nil
+}
+
 func (d *DuckDB) StoreFactors(ctx context.Context, s domain.Security, factors []domain.PriceFactor) error {
 	_, err := transact(ctx, d, func(tx *gorm.DB) (struct{}, error) { return struct{}{}, storeFactorsTx(ctx, tx, s, factors) })
 	return err

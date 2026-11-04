@@ -404,7 +404,7 @@ build_factors 的前收查找是“日期严格小于事件日、且在库中最
 1. build 会清空 factor，别在有下游的情况下并发跑。
 2. 没有 vipdoc 时空有 factor 行但全是 share，复权会偏——先有行情再建因子。
 3. 主键会吃掉完全重复记录（好事），导入条数可能比源少几条。
-4. sync 默认 8 条并发连接，中途失败只计数不中断；--jobs 1 退回串行。6000 只的整市场同步仍以十几分钟计，瓶颈在服务端每连接只答一次。
+4. sync 默认 64 条并发连接，中途失败只计数不中断，收尾按 rounds=3 自动补抓失败项（失败不写 done，所以要补）。8 并发实测 120 只要 10.5-14.4 秒，64 并发 1.2 秒，128 反而更慢且失败翻倍；整市场仍以十分钟计，瓶颈是服务端对单 IP 的接纳，不是本地线程。
 
 ## 6. tdx_bootstrap.py —— 从零造树
 
@@ -431,7 +431,7 @@ build_factors 的前收查找是“日期严格小于事件日、且在库中最
 | probe_login(root, cfg) | 探测登录链路写 login.json | (结果, 路径) |
 | regen(root, spec_path, ref) | 重造 connect.cfg 并刷新清单哈希 | 配置路径 |
 | fill(root, market, codes, days, cfg) | 抓日线写成 .day | [(code, 条数)] |
-| sync_gbbq(root, market, codes, limit, cfg, redo, jobs=8) | 抓权息写 gbbq，断点续传、按主键去重；jobs 是并发连接数 | {records, added, symbols, failed, codes, skipped} |
+| sync_gbbq(root, market, codes, limit, cfg, redo, jobs=64, rounds=3) | 抓权息写 gbbq，断点续传、按主键去重；jobs 是并发，rounds 是失败补抓轮数连接数 | {records, added, symbols, failed, codes, skipped} |
 | verify(root) | 五项校验 | (问题列表, 统计字典) |
 
 verify 检查：目录齐全、connect.cfg 可解析且有主站、gbbq 长度与条数自洽、bootstrap.json 存在、清单里的配置哈希与现文件相符。任一不过返回问题列表，CLI 退出码 1。
@@ -447,7 +447,7 @@ fill 与 sync_gbbq 都从目标树自己的 connect.cfg 取站点（--cfg 可覆
 | plan | root | 0 |
 | init | root --spec --ref | 0 |
 | fill | root --market --codes --days --cfg、--no-merge | 0 |
-| sync | root --market --codes --limit --cfg、--redo、--jobs(默认 8) | 0 |
+| sync | root --market --codes --limit --cfg、--redo、--jobs(默认 64) | 0 |
 | base | root --markets --limit --cfg | 0 |
 | login | root --cfg | 0 |
 | regen | root --spec --ref | 0 |
@@ -609,7 +609,8 @@ python tdx_local.py sitecfg-check --path $root\connect.cfg
 
 ### 11.2 双端口分流器与界面观察（30 章）
 
-单口分流器后来发现上游端口写死 7715，把 0x000D、0x0015 这些行情命令送进了交易口，全静默有一半是这个造成的。改用双端口：buildpw249.py 同时监听 17709 与 17715，前者固定转主站 7709，后者固定转主站 7715，日志落 buildoute2.log；buildpw250.py 把 HQHOST01 指 127.0.0.1:17709、UserHost 指 127.0.0.1:17715。改完重启客户端，0x0015 立刻有应答。还原仍用 buildpw227.py。
+单口分流器后来发现上游端口写死 7715，把 0x000D、0x0015 这些行情命令送进了交易口，全静默有一半是这个造成的。改用双端口：buildpw249.py 同时监听 17709 与 17715，前者固定转主站 7709，后者固定转主站 7715，日志落 build
+oute2.log；buildpw250.py 把 HQHOST01 指 127.0.0.1:17709、UserHost 指 127.0.0.1:17715。改完重启客户端，0x0015 立刻有应答。还原仍用 buildpw227.py。
 
 界面侧四条经验：
 
@@ -651,6 +652,307 @@ python build\pw295.py
 
 写到本手册这一版时两处都没命中，说明交易入口不在顶栏也不在标签带，别把重跑当成新结论。
 
+
+### 11.4 交易通道：抓包与回放（32 章）
+
+交易口不是 7715。真实入口是 cfg 里 TPSYS 与 TPSUBSYS 段的 TPHOST（端口 9914 与 9915）。要确认现场，直接按 PID 看连接：
+
+~~~
+$p = (Get-Process TdxW).Id
+Get-NetTCPConnection -OwningProcess $p -State Established | Select-Object RemoteAddress, RemotePort
+~~~
+
+抓包用系统自带的 Wireshark 命令行，明文 TCP，不涉 TLS：
+
+~~~
+& "C:\Program Files\Wireshark\tshark.exe" -D
+& "C:\Program Files\Wireshark\tshark.exe" -i 3 -f "tcp port 9914 or tcp port 9915" -w build\trade.pcap -q -a duration:50
+~~~
+
+接口号按 -D 的实际输出填（本机以太网是 3）。抓包同时起客户端，50 秒自动停。导出帧序列：
+
+~~~
+& "C:\Program Files\Wireshark\tshark.exe" -r build\trade.pcap -Y "tcp.stream==0 and tcp.srcport==57362 and tcp.len>0" -T fields -e tcp.len -e data.data > build\cframes.txt
+~~~
+
+流号与客户端端口按 -z conv,tcp 的输出替换，否则筛出空集。
+
+回放只读 cframes.txt，依次发送并打回应答：
+
+~~~
+python build\pw319.py 1.202.143.37 9914 3
+python build\pw319.py 218.205.130.77 9915 3
+~~~
+
+前 3 帧（握手启动、客户端声明、密钥交换）都能拿到正常应答；给到第 4 帧才发送 ACL.checkuser，它一定回 0 字节，因为密文绑当次会话密钥，重放旧密文对不上。这不是脚本坏了。
+
+解码帧头要看第 2、3 字节的步序 cat（递增 3、4、5、7、11、15）与 commtype（0x2600 加序号，26AC 至 26AE 握手、264B 命令、26B1 收尾），首字节 0x0B 上的 0x80 表示载荷压缩、0x40 表示带后续，别当成固定魔数。
+
+做差分定位密文段时用 build\pw318.py：它按 cframes.txt 打印每帧的首字节、cat、双长度、commtype 和载荷前 20 字节，比对着看就能判断新抓的帧是否同型。
+
+
+解 checkuser 密文用 build\pw326.py：它把第 4 帧解成载荷、切出 00 1F 5F 起的密文段（落 build\cu_seg.bin），再按三种起点 × 四种密钥派生 × 八种算法跑 openssl，打印可打印率。当前最好 0.406，说明写死串 ##DoNotTellYouOk123 不是这把钥匙（那个串只用于 %s/system.uid，见 32.8），别以为它一跑就该出 JSON。
+
+写死串的引用点只有 sub_1000BE90，加解密是 sub_1014B0E0(密钥, 3) 与 sub_1014B2D0(缓冲, 240)；顺着这两个函数的调用点才能摸到会话密钥的来路。
+
+
+### 11.5 tdxzsbase 未知列的辨别（33 章）
+
+两件前置必须先做，否则全是噪声：一是日期要跟快照同日（C:\neptune 的 tdxzsbase 是 20261103，而本地 day 文件末根是 20261016，拿 build\new 里 20261016 那版对），二是每只都要 day 文件存在且末根等于快照日。
+
+~~~
+python build\pw342.py
+~~~
+
+它逐列算 值 / 口径 的比值中位数与相对偏差中位数，口径含 2-9 日额均量均与当日值。判据是“中位近 1 且偏差小”，已知列能复现（列 3、4 比值 7-8），但列 23、24、25 各窗口偏差并列在 0.388-0.41，分不出天数——成交额自相关太强，别指望调参能分开。
+
+另记两条硬约束：本地 day 文件全是 288 字节即 9 根，窗口上限只有 9；category 9 的线上记录按 日期 u32 + 四价 varint + 量额 切，第 2 条起就错位，尾部补 4 到 9 字节都对不上（build\pw340.py 逐档试过），所以想吃 10 日以上得先修记录解析。
+
+
+### 11.6 权息同步的并发与补抓（34 章）
+
+~~~
+python build\pw349.py      # 并发 4/8/16/32/64/128 各 120 只，打印秒数、只/秒、完成只、失败、记录
+python build\pw350.py      # 同一棵树连跑三轮，看失败被补抓吃掉（78→99→99 只）
+python build\pw351.py      # 默认参数一次调用，应为 1-2 秒、完成 99 只、失败 0
+~~~
+
+判断标准：64 并发下第一轮有失败是正常的，补抓轮必须把失败收敛到 0，完成只数三轮内不再增长就是全部抓完（空结果也算完成）。若失败率超过三成，把 jobs 降到 32、rounds 提到 5。
+
+取码表（security_list）失败与并发无关，服务端会偶发直接断连，报“请求失败: 连接被关闭”时重跑即可，别去调 jobs。
+
+
+### 11.7 财务包：7711 上的 0x1F42（35 章）
+
+HTTP 别再试了，www 与 data 两个站对 tdxbase/、cw/ 一共九条候选全 404（build\pw353.py 一次跑完两个站）。
+
+真通道是资讯口 7711：12 字节帧（cat 1、ver 0、flag 0、commtype 0x1F42），body 直接写路径，例如 cw/gpcw.txt、cw/gpszsh.txt。
+
+~~~
+python build\pw365.py "cw/gpcw.txt"
+python build\pw363.py
+~~~
+
+pw365 会收完整应答、按 16 字节头拆帧、解压并落 build\fin_*；pw363 是命令扫描，用来复核 0x1F42 是唯一有实质回包的命令。
+
+应答解压后固定 59994 字节，开头是 K 加十进制偏移，三次取同一路径给的是不同偏移的块——分块坐实，续传参数还没解出来（同连接不收第二块，发 0x1F43 会被关连接）。下一步先解 0x1F44 返回的那 40 字节。
+
+
+### 11.8 0x1F42 分页读（36 章）
+
+不要找偏移参数，命令就是分页读：每调一次给下一窗口，换连接也照样推进。
+
+~~~
+python build\pw373.py    # 六次同路径，证明块内容在变
+python build\pw375.py    # 连拉到绕环为止，统计字节与去重码
+python build\pw378.py    # 路径前缀换数据集（.txt 出条目流，.dat/.zip 出键值记录）
+~~~
+
+每块固定 59994 字节，是服务端缓冲区，不是文件大小；流是环形的，读空判断不可靠，必须按条目或代码去重。tdxbase/ 与 cw/ 前缀只是不同数据集，扩展名不决定格式。
+
+
+### 11.9 0x053E 快照行情（37 章）
+
+“本服不通”已作废。形状对就有包，关键是两件事：请求体必须正好 12 字节前缀加每只 7 字节，声明长度必须等于实际长度（12+7n）。
+
+~~~
+python build\pw381.py    # 对照：同连接 0x000F 有包、0x053E 无包（证明链路正常）
+python build\pw391.py    # 声明长度与实际不等的五种写法，全超时
+python build\pw392.py    # 五种前缀形状，只有 05 00 00 00 + 四零 + 数量 + 00 00 有回包
+python build\pw393.py    # 一只 60 字节、三只 194 字节，验证列表被消费
+~~~
+
+回包用 01 开头，不是 parse_quotes 期待的 B1 CB，解析要另写。记录里的六字节当前恒为 600839，别当成请求代码的回显。
+
+
+### 11.10 13/14 权证折价（38 章）
+
+权证代码已不在现行码表，挂牌价取不到；别按内在价值硬折，认沽多半会被截成零。用拟合系数：WARRANT_Q 或 --warrant-q，默认关。
+
+~~~
+python build\pw400.py    # 列出 24 条 13/14，看清都是 2005-2006 股改
+python build\pw403.py    # 日线 start 是回退条数，不是日期
+python build\pw409.py    # 三种口径误差表 + Q 网格，最优 Q=0.35
+python build\pw124.py    # 回归：001207 两种口径都应是 0.0792
+~~~
+
+换市场要重跑网格，别把 0.35 当常数搬走。
+
+
+### 11.11 资讯通道读命令族（39 章）
+
+窗口里全是代码不是钱。对齐是 代码六 + 标志一 + 零，别按标志在前切。
+
+~~~
+python build\pw423.py    # 0x1F43 回卷后再读，能看到二十字节流头
+python build\pw424.py    # 0x1F44 按整条记录读（40 字节），0x1F45 回状态文本
+python build\pw426.py    # 解 0x1F44 那条记录：字段数九 + 日期 + GBK 表名
+python build\pw431.py    # 状态文本恒为“网络错误”，与路径无关
+~~~
+
+0x1F45 有不回包的脾气，超时给足；无路径的 0x1F42 是“接着上次位置读”，位置全局共享。
+
+### 11.12 40 章：指数与截断的坑（加列语义）
+
+这一段的脚本都在 build\pw46x.py，跑之前先读 40.1 与 40.2。
+
+~~~
+python build\pw458.py     # 指数一次只回一根：count 800 也只有 1 条
+python build\pw459.py     # 开户即断开：每请求一条连接才稳定（60/60）
+python build\pw460.py     # 市场列取值：1 是沪、0 是深、2 是北
+python build\pw464.py     # 按日位移算残差，定位列 24/25 的日期口径
+python build\pw466.py     # 列 24 对当日额、列 25 对前一日额的滞后结构
+python build\pw468.py     # 可复现回归：截断前后同一请求的日期与全部数值
+~~~
+
+三个规矩：
+
+1. security_bars 的日期闸不要动：日期不在 19900101-20301231 就跳出，尾部填充当不了记录。
+2. 取指数一律按“一根一请求”，别指望 count。
+3. 判列语义用比值加离散度，不用相关系数：靠得住的判别是“对齐后相对离散度趋近 0”，本轮的 0.0000 就是这么来的。
+
+列 24 是当日成交额、列 25 是前一交易日成交额，单位万元；比值恒 1e-4。20-23 是涨跌幅族，天数未定；列 19 仍是疑。
+
+### 11.13 tdx_realtime.py：盘口采集（41 章）
+
+只读网络，不碰安装目录。协议细节与实测数字在报告 41 章，这里只讲怎么用、怎么坏、怎么修。
+
+~~~
+python tdx_realtime.py probe-l2                     # 探 L2 逐笔，通=退出 0，不通=3
+python tdx_realtime.py rtt --codes "600000" --n 60 --concurrency 8   # 量往返分布
+python tdx_realtime.py once --codes "600000,600519"                  # 打一份五点快照
+python tdx_realtime.py run --watch watch.txt --cycle 3 --mode auto --out q.jsonl
+~~~
+
+几个约定：
+
+1. --codes 在 PowerShell 里**要加引号**，逗号不加引号会被拆成多个参数。
+2. 码表写法三种：600000、0:000001、1:600519；不写市场按首位推断，6/5/9 走沪，其余走深。
+3. run 的 --out 是 JSONL 追加写，stdout 也是 JSONL；stats 走 stderr，别把两股混在一个文件里。
+4. --mode：l1 只发快照，l2 先探逐笔，auto 探不通就静默降 L1。--l2-every N 每轮给前 N 只补逐笔。
+5. 差分只在价量变化时放行，零点空转不会刷屏；要看全量就每条都改 vol 之外的东西没有意义，直接 once。
+
+坏了先看三处：
+
+| 症状 | 处置 |
+|---|---|
+| 满屏 RtdError('连接被关闭') | 主机在关连接。health 会筛，若筛完仍报，把 keep 调小或换 connect.cfg 的 HQHOST |
+| last_error 是超时且 errors 长期不减 | 先 probe-l2 与 once 各打一次；都超时按“服务时段”处理，不是协议坏了 |
+| 记录里 code 与请求不符 | 位置放错时才会错一条，见 11.14 第 1、2 条；位置对时回包码与请求逐条对应 |
+
+三个规矩：
+
+1. 别把固定 56 当步长。价格是 varint，有值时记录会变长（实测 81），必须顺序消费。
+2. 别预读固定条数的握手应答，按 commtype 认领业务应答，否则随机吞包。
+3. 工人用完连接就 close，别做连接复用：服务端不留空闲连接。
+
+请求体末两字节 0C 01 必须放**证券表之后**，放到数量后面会让服务端按错位解析（代码只认末位、回包恒 600839、数据错开一条）。沪市与深市都能取，不需要挑票（11.14 有自检命令）。
+
+
+### 11.14 盘口快照的字段口径与自检
+
+快照（0x053E）的记录字段是 2026-11-05 凌晨用 000001 当日日线逐字段校准出来的，单位与顺序如下：
+
+| 序 | 字段 | 类型 | 单位/说明 |
+|---|---|---|---|
+| 1 | market | u8 | 市场，0 深 1 沪 |
+| 2 | code | 6s | 证券代码 |
+| 3 | active | u16 | 活跃度，与尾部 active2 同值 |
+| 4 | price | varint | 基准价，分（1/100 元） |
+| 5 | last_close | 差分 | 前收 |
+| 6-8 | open/high/low | 差分 | 开、高、低，0x40 位为负 |
+| 9 | amount_hundred | varint | 成交额，百元 |
+| 10 | skip1 | varint | 未定性，常等于负的基准价 |
+| 11 | vol | varint | 成交量，手 |
+| 12 | cur_vol | varint | 现手 |
+| 13 | amount | 浮点 | 成交额，元 |
+| 14-15 | s_vol/b_vol | varint | 外盘、内盘（顺序待再验） |
+| 16-17 | skip2/skip3 | varint | 未定性 |
+| 18-37 | 五档 | 价差分 + 量 varint | 买价、卖价、买量、卖量 乘 5 档 |
+| 38 | raw2 | 2 字节 | 定长占位 |
+| 39-42 | skip4..7 | varint | 定长占位 |
+| 43 | speed | i16 | 涨速，百分之一 |
+| 44 | active2 | u16 | 同 active |
+
+价格一律除 100（PRICE_SCALE），别用旧的除 1000。
+
+三条硬约束：
+
+1. 请求体 = 12 字节前缀 + u16 只数 + 每只 7 字节（市场 + 6 位 ASCII）+ 0C 01，声明长度必须等于 12+7n+2。尾巴的位置是关键，放错就退化成“只按末位解析”。
+2. 回包记录与请求逐条对应，回包里的代码就是解析结果，可以用来核对；位置放对之后沪市完全正常（600036 回 42.54、前收 42.69）。
+3. 记录是变长的，全零 56 字节、有值 81 字节，解析只能顺序消费，改成定长切必错位。
+
+自检命令（对当日日线比价量，应 3/3 命中）：
+
+~~~powershell
+python tdx_realtime.py once --codes "0:000002,0:000006,0:000009"
+~~~
+
+沪市自检（预期现价 42.54/1446.44、前收 42.69/1480.00，命中说明尾巴位置对）：
+
+~~~powershell
+python tdx_realtime.py once --codes "1:600036,1:600519"
+~~~
+
+跨市场批量自检（沪 12 深 12 一次发出，24 行都应带回包码且无 mismatch，价量额相互自洽）：
+
+~~~powershell
+python tdx_realtime.py run --watch build\watch_2m.txt --seconds 10 --out build\live2.jsonl
+~~~
+
+要把客户端自己的请求重录一遍（怀疑形状时才用）：先 python build\cfg_hook.py on，再起 build\hq_proxy.py serve 记包，客户端翻票后 decode 看请求体，最后 python build\cfg_hook.py off 还原。
+
+### 11.15 L2 逐笔（0x0FC5 成交 / 0x0FC2 委托）
+
+先跑 probe-l2，通才有下面这些。
+
+~~~
+python tdx_realtime.py probe-l2                                    # 通=0，不通=3
+python tdx_realtime.py run --codes "1:601881" --mode l2 --l2-every 1 --cycle 1 --out q.jsonl
+python tdx_realtime.py run --codes "1:601881" --mode l2 --l2-every 1 --l2-orders --cycle 1 --out q.jsonl
+~~~
+
+字段（JSONL，kind 为 tick 或 order）：
+
+| 字段 | 说明 |
+|---|---|
+| t | 成交时间，HH:MM:SS，分钟粒度，秒位恒 00 |
+| price | 成交价，元 |
+| vol | 成交量，手 |
+| trades | 这一跳聚合的成交笔数 |
+| side | 0 主动买、1 主动卖、2 中性、5 盘后固定价格 |
+| kind_code | 只有 order 有，委托类别码，语义未定 |
+| market / code / kind / mode / ts | 采集器补的定位与时间戳 |
+
+四条硬约束（改代码前先读）：
+
+1. **帧头是 0x0801 / 0x0300 / flag 1**，不是 0x0817 / 0x0101。旧值在本服一帧不回。
+2. **声明长度要比实际体多 2 字节**，_call 的 extra=2 就是干这个的。少这两字节服务端一直等，不回包不断连。
+3. 握手应答必须读干净再发业务帧，_call 里先读后发那两步别合成一次 sendall。
+4. 价是差分：0 等于上一条同价，0x40 位是负号。按绝对值解析会得到一堆 0 和负数。
+
+去重：逐笔没有自增序号，_tick_job 用 (t, price, vol, trades) 当签名，只放新成交，签名表按只封顶 800 条。
+
+自检：整日量对得上就是对的。601881 从 start 0 每轮 900 条翻 5 轮，4090 条合计 317414 手，对当日日线 317108 手差 0.096%。翻到 4500 返回空，说明 start 是从最新往回数的条数。
+
+~~~
+python -c "import os,sys;os.environ['TDX_CFG']='build\hosts_ok.cfg';sys.path.insert(0,'.');import tdx_realtime as R;p=R.Pool(1);w=p.workers[0];s=0;t=0;n=0
+for _ in range(6):
+    g=w.ticks(1,b'601881',s,900);w._drop();s+=900
+    if not g: break
+    n+=len(g);t+=sum(r['vol'] for r in g)
+print(n,t)"
+~~~
+
+现成脚本更省事，改过解析或换站换票都先跑它，差超过 0.5% 就报不通过（退出码 1）：
+
+~~~
+python re-tools\probes\_l2_sumcheck.py --market 1 --code 601881
+python re-tools\probes\_l2_sumcheck.py --market 1 --code 601881 --expect 300000   # 故意给错基准，应不通过
+~~~
+
+夜间 15:00 之后整段都是 side 5、价格不动，做分钟聚合时要么单列要么剔除，别当正常成交统计。
+
 ## 12. 变更须知
 
 源码里的中文注释是给 review 用的：改了帧字段、密钥表偏移、记录布局，注释要跟着改，别留过期说明。
@@ -663,97 +965,3 @@ python build\pw295.py
 6. 新增字段先加进 SCHEMA 的建表语句，再改 upsert，最后改 export，顺序反了会静默丢列。
 
 ## 13. 从零自举教程（不依赖 exe）
-
-自举指的是数据链路只靠本仓库的 Python：内置种子造配置，配置连服务端，服务端给数据，落到磁盘。TdxW.exe 只在还想开图形界面时才需要，属于可选的第 8 步。
-
-### 13.1 约定
-
-| 项 | 值 |
-|---|---|
-| 解释器 | python（3.x，需在 PATH 里；只用标准库） |
-| 演示根目录 | data\tdx（相对仓库根，先 $root='data\tdx'） |
-| 生产根目录 | 换目录即可，命令里 $root 跟着换 |
-| spec | spec.json（仓库根），由种子命令生成，可手改站点与品牌 |
-| 前提 | 目标目录为空；能出网访问 7709 |
-
-命令都在仓库根执行，路径写相对仓库根即可；--out、--path、--spec 的相对值按当前目录解析，不会落到安装目录。
-
-### 13.2 第 1 步 造 spec
-
-~~~
-$tdx='<安装目录>'
-$root='data\tdx'
-cd .   # 仓库根
-python tdx_local.py sitecfg-defaults --ref nope.cfg --out spec.json
-~~~
-
---ref 指向不存在的文件是有意的：这样纯用内置种子，不掺参照安装的品牌与站点。期望输出“已写出起始 spec”。
-
-要换成自己的主站，编辑 spec.json 的 hosts、try_hosts、ds_hosts、info_hosts、wt_hosts 数组，每项是 ip 与 port。
-
-### 13.3 第 2 步 造树
-
-~~~
-python tdx_bootstrap.py init $root --spec spec.json
-~~~
-
-期望“目录 76，站点 6，复制 0 个静态文件”。复制 0 个正是纯脚本自举的标志；带上 --ref $tdx 才会拷 exe 与 chrome。
-
-init 见到非空目录直接退出，重来先换 $root 或删掉旧树。
-
-### 13.4 第 3 步 造主表
-
-~~~
-python tdx_bootstrap.py base $root --markets 0,1
-~~~
-
-清单来自服务端 0x0450，自造 base.dbf，实测约 5 万条、一分钟内。只想要少量样本加 --limit。
-
-### 13.5 第 4 步 抓权息
-
-~~~
-python tdx_bootstrap.py sync $root --market 1
-python tdx_bootstrap.py sync $root --market 0
-~~~
-
-每只抓 0x000F 写进 gbbq，写完即落盘，进度记在 T0002\hq_cache\.xdxr_state.json。中断直接重跑，会自动跳过已完成的；要重来加 --redo。
-
-先权息后行情，因子才有前收可算。全市场十几分钟，用 --limit 可分段跑。
-
-### 13.6 第 5 步 抓行情
-
-~~~
-python tdx_bootstrap.py fill $root --market 1 --codes 600000,600519
-~~~
-
-期望“合计 2 只 / 500 根”。--days 可调，上限 800。写入按日期合并，重跑只加厚历史不覆盖。
-
-全市场用 --codes 分批，或按 base.dbf 的代码表切段循环。
-
-### 13.7 第 6 步 校验与回读
-
-~~~
-python tdx_bootstrap.py verify $root
-python tdx_local.py --root $root bars --market sh --code 600000 --kind lday
-~~~
-
-verify 期望“通过”；bars 打出首几根 K 线，证明数据真在盘上。日志里有“同步 0 只”属正常，那是有权息记录的证券数，不是请求数。
-
-### 13.8 第 7 步（可选）加图形界面
-
-~~~
-robocopy $tdx $root /E /XF connect.cfg base.dbf *.id0 *.id1 *.id2 *.nam *.til
-~~~
-
-或者 init 时直接带 --ref $tdx 一步到位。判据只看窗口标题是否出现“海王星金融终端”，别看进程存活；缺 chrome\ 会静默不建窗。
-
-### 13.9 常见错误
-
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| init 报“目标目录非空” | 目录里有东西 | 换 $root 或清空 |
-| 生成的配置字段异常 | 在别的目录下跑了相对路径 | 回到仓库根，或把 --out 与 --path 写全 |
-| verify 报 UserHost.IPAddress 为空 | 手写 spec 把该键留空且旧代码未兜底 | 现版本会补种子；老树跑 regen |
-| Start-Process 找不到 TdxW.exe | 没做第 7 步 | 补拷程序层，或确认不需要 GUI |
-| 进程在但不建窗 | 缺 chrome\ | 补拷 chrome 目录 |
-| 读配置乱码 | connect.cfg 是 GBK | 解析时指定 gbk |

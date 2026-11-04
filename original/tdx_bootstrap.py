@@ -246,12 +246,14 @@ def _save_state(root, state):
         json.dump(state, fh, ensure_ascii=False, indent=1)
 
 
-def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False, jobs=8):
+def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False, jobs=64, rounds=3):
     """从服务端逐只抓除权除息，写成合法 gbbq。
 
     断点续传：已成功的代码记在 hq_cache/.xdxr_state.json，默认跳过，
     redo 为真时清空该市场的进度重来。gbbq 每只记完即更新状态，中途断掉不丢已抓部分。
     jobs 是并发连接数：服务端一个连接只答一次业务请求，靠多条连接并行才快得起来。
+    高并发下服务端会甩掉一部分连接（实测 64 并发约两成失败），所以失败的代码不记 done，
+    收尾按 rounds 自动补抓，补到没有失败或到上限为止，绝不留下空洞。
     """
     import threading
     import tdx_adjust
@@ -320,18 +322,28 @@ def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False, jobs=8
         finally:
             conn._close()
 
-    threads = []
-    for i in range(jobs):
-        chunk = todo[i::jobs]
-        if not chunk:
-            continue
-        t = threading.Thread(target=worker, args=(chunk,), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-    with lock:
-        _save_state(root, state)
+    # 一轮抓完有失败就补抓，最多 rounds 轮；补抓按 done 反查，不会重复抓已成功的。
+    for rnd in range(max(1, rounds)):
+        left = [c for c in todo if c not in done]
+        if not left or (limit and len(done) >= limit):
+            break
+        if rnd:
+            print("  补抓第 %d 轮，剩 %d 只" % (rnd, len(left)))
+        stats["failed"] = 0
+        threads = []
+        for i in range(jobs):
+            chunk = left[i::jobs]
+            if not chunk:
+                continue
+            t = threading.Thread(target=worker, args=(chunk,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        with lock:
+            _save_state(root, state)
+        if not stats["failed"]:
+            break
     failed = stats["failed"]
     n = tdx_adjust.write_gbbq(list(events.values()), path)
     return {"records": n, "added": n - base,
@@ -414,7 +426,7 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=20, help="本轮最多同步多少只证券")
     p.add_argument("--cfg")
     p.add_argument("--redo", action="store_true", help="忽略断点，清空该市场进度重抓")
-    p.add_argument("--jobs", type=int, default=8, help="并发连接数，1 为串行")
+    p.add_argument("--jobs", type=int, default=64, help="并发连接数，1 为串行；高并发失败会按 rounds 自动补抓")
     p = sub.add_parser("regen")
     p.add_argument("root")
     p.add_argument("--spec")

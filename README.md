@@ -18,7 +18,7 @@ npm run dev
 
 `setup:native` 优先复用已有编译器；Windows x64 缺少 GCC 时下载固定版本并核验 SHA-256，安装在忽略提交的 `.tools/`。Linux 安装 `build-essential`，macOS 安装 Xcode Command Line Tools。`scripts/go.mjs` 只为当前构建启用 CGO 并选择编译器，不修改系统 PATH 或全局 Go 设置。Windows 产物静态链接 DuckDB 和 GCC 运行库，运行时无需编译器、Python DuckDB 包或额外 DuckDB DLL。
 
-驱动固定为 `github.com/duckdb/duckdb-go/v2 v2.5.4`，内嵌 DuckDB 1.4.3，与既有数据库保持一致。GORM 固定为 `v1.31.2`，负责模型映射、批量 upsert、查询构建和整批事务；SQL、迁移和 Parquet 导出全部位于 Go Repository。DuckDB 方言使用 GORM 原生回调，保留复合主键及冲突更新语义，不额外引入另一套数据库驱动。
+驱动固定为 `github.com/duckdb/duckdb-go/v2 v2.5.4`，内嵌 DuckDB 1.4.3，与既有数据库保持一致。GORM 固定为 `v1.31.2`，负责模型映射、建表、批量 upsert、查询构建和整批事务；迁移按显式版本只创建缺失表和视图，专用批处理 SQL 与 Parquet 导出集中在 Go Repository。DuckDB 方言使用 GORM 原生回调，保留复合主键及冲突更新语义，不额外引入另一套数据库驱动。
 
 建议依次建立数据：
 

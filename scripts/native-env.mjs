@@ -5,6 +5,10 @@ import { spawnSync } from "node:child_process";
 // 只修改当前构建进程环境；不执行 go env -w，也不修改系统 PATH。
 export function nativeEnvironment() {
   const env = { ...process.env, CGO_ENABLED: "1" };
+  // go.mjs 已经选定 go.exe；继承其他安装的 GOROOT/GOTOOLDIR 会混用编译器和标准库版本。
+  // 删除覆盖值后，Go 会从所选可执行文件的位置推导匹配的工具链，不修改用户系统环境。
+  delete env.GOROOT;
+  delete env.GOTOOLDIR;
   if (env.CC) return env;
   const local = resolve(".tools/mingw64/bin/gcc.exe");
   const candidates = process.platform === "win32"

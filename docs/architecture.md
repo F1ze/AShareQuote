@@ -104,11 +104,15 @@ CSV 预览：Handler 解析输入 → PreviewService 验证逻辑文件名 → P
 
 ## ORM 映射与专用 SQL
 
-`warehouse_schema.go` 定义证券资料、日历、供应商因子、回执和除权事件的持久化模型，逐字段声明实际列名及复合主键；不增加 `gorm.Model` 的隐式 ID、软删除字段，也不向领域实体添加 ORM 标签。常规查询使用 GORM 的 Table/Where/Group/Scan/Count，写入使用 Create/CreateInBatches 与 OnConflict。
+`warehouse_schema.go` 定义行情、修订、证券资料、日历、供应商因子、回执、除权事件和版本记录的持久化模型，逐字段声明实际列名及复合主键；不增加 `gorm.Model` 的隐式 ID、软删除字段，也不向领域实体添加 ORM 标签。常规查询使用 GORM 的 Table/Where/Group/Scan/Count，写入使用 Create/CreateInBatches 与 OnConflict。
 
 被动证券观察只补充非空资料；人工参考导入可显式清空名称和日期；断点重放不覆盖后来校准的资料。日期为空映射为 SQL NULL，日历的 false 使用明确的冲突更新列写入，避免默认零值省略改变业务含义。因子的 DECIMAL 字段以十进制字符串绑定，查询显式转为文本。
 
-DuckDB 方言只实现 GORM 扩展接口并注册原生 CRUD 回调，不另造 ORM。整库迁移使用已有版本 SQL，CSV 批量读取、行情修订集合合并、因子精度检查和 Parquet COPY 使用 GORM Exec/Raw 执行专用语句，与普通模型写入共用同一事务和连接，不逐条循环写入海量行情。
+DuckDB 方言只实现 GORM 扩展接口并注册原生 CRUD 回调，不另造 ORM。迁移显式控制版本，使用 GORM Migrator 根据模型创建缺失表和日线视图，不运行 AutoMigrate 修改已有列。新增模型与实际类型、默认值、复合主键由真实数据库契约测试验证。
+
+证券资料的条件更新由 Go 选择更新列，再交给 ORM OnConflict，不手写 CASE/COALESCE 更新表达式；因子以有理数检查 DECIMAL(30,15) 的舍入与范围，普通统计使用 ORM Count。
+
+仓库读写仍保留五处 Exec/Raw 专用语句：CSV 批量读取到暂存表、整批质量检查、旧值修订集合插入、行情集合 upsert、Parquet COPY。它们与模型写入共用一个事务和连接，避免逐条处理海量行情。聚合查询中的 COUNT、CAST、窗口函数和连接条件仍是 SQL 表达式，ORM 不替代数据库的分析能力。
 
 ## 仓库文件如何划分
 

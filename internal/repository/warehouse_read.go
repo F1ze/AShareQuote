@@ -18,26 +18,47 @@ import (
 
 // warehouseTotals 是聚合投影，不是新的业务实体；复杂 API 模型的切片不参与 ORM 关系推断。
 type warehouseTotals struct {
-	Rows                          int64   // 全库行情条数。
-	Symbols                       int64   // 至少有行情的证券数。
-	Earliest                      *string // 实际最早市场时间，空库为 nil。
-	Latest                        *string // 实际最晚市场时间，空库为 nil。
-	Revisions                     int64   // 历史修订条数。
-	FactorEvents                  int64   // 两种独立因子表的事件合计。
-	CalendarDays                  int64   // 已存交易日历记录数。
-	InstrumentsWithoutListingDate int64   // 尚无上市日期参考资料的证券数。
+	Rows     int64   // 全库行情条数。
+	Symbols  int64   // 至少有行情的证券数。
+	Earliest *string // 实际最早市场时间，空库为 nil。
+	Latest   *string // 实际最晚市场时间，空库为 nil。
 }
+
+type datasetKey struct {
+	Exchange string
+	Code     string
+	Period   string
+}
+
+// 两个投影只承载数据集组装所需字段，nullable 列保留数据库中的空值语义。
+type datasetInstrument struct {
+	Exchange      string
+	Code          string
+	Name          *string
+	Status        *string
+	ListingDate   *string
+	DelistingDate *string
+}
+
+type datasetReceipt struct {
+	Exchange   string
+	Code       string
+	Period     string
+	Warning    *string
+	ImportedAt time.Time
+	RunID      string
+}
+
+const datasetAggregateColumns = "b.exchange,b.code,b.period," +
+	"count(*) AS rows,min(b.ts)::VARCHAR AS earliest,max(b.ts)::VARCHAR AS latest," +
+	"max(b.ingested_at)::VARCHAR AS updated_at"
 
 // Summary 在同一 ORM 事务内聚合统计、周期和近期数据集，避免各部分来自不同时间的快照。
 func (d *DuckDB) Summary(ctx context.Context) (domain.WarehouseSummary, error) {
 	return transact(ctx, d, func(tx *gorm.DB) (domain.WarehouseSummary, error) {
 		s := domain.WarehouseSummary{Engine: "DuckDB", Ready: true, Path: d.Path, SchemaVersion: schemaVersion, VolumeUnit: "shares", PriceUnit: "CNY", Adjustment: "none", Timezone: "Asia/Shanghai", Completeness: "unverified", Periods: []domain.PeriodSummary{}, Datasets: []domain.WarehouseDataset{}}
 		var totals warehouseTotals
-		err := tx.Table("bars").Select(`count(*) AS rows,count(DISTINCT(exchange,code)) AS symbols,min(ts)::VARCHAR AS earliest,max(ts)::VARCHAR AS latest,
-  (SELECT count(*) FROM bar_revisions) AS revisions,
-  (SELECT count(*) FROM adjustment_events)+(SELECT count(*) FROM provider_factors) AS factor_events,
-  (SELECT count(*) FROM trading_calendar) AS calendar_days,
-  (SELECT count(*) FROM instruments WHERE listing_date IS NULL) AS instruments_without_listing_date`).Scan(&totals).Error
+		err := tx.Model(&barRecord{}).Select("count(*) AS rows,count(DISTINCT(exchange,code)) AS symbols,min(ts)::VARCHAR AS earliest,max(ts)::VARCHAR AS latest").Scan(&totals).Error
 		if err != nil {
 			return s, err
 		}
@@ -45,23 +66,61 @@ func (d *DuckDB) Summary(ctx context.Context) (domain.WarehouseSummary, error) {
 		s.Symbols = totals.Symbols
 		s.Earliest = totals.Earliest
 		s.Latest = totals.Latest
-		s.Revisions = totals.Revisions
-		s.FactorEvents = totals.FactorEvents
-		s.CalendarDays = totals.CalendarDays
-		s.InstrumentsWithoutListingDate = totals.InstrumentsWithoutListingDate
-		err = tx.Table("bars").Select("period,count(*) AS rows,count(DISTINCT(exchange,code)) AS symbols").Group("period").Order("period").Scan(&s.Periods).Error
+		// 常规计数交给 ORM；各次读取仍处于同一个事务快照，统计不会互相错位。
+		if err = tx.Model(&revisionRecord{}).Count(&s.Revisions).Error; err != nil {
+			return s, err
+		}
+		if err = tx.Model(&adjustmentRecord{}).Count(&s.FactorEvents).Error; err != nil {
+			return s, err
+		}
+		var providerEvents int64
+		if err = tx.Model(&providerFactorRecord{}).Count(&providerEvents).Error; err != nil {
+			return s, err
+		}
+		s.FactorEvents += providerEvents
+		if err = tx.Model(&calendarRecord{}).Count(&s.CalendarDays).Error; err != nil {
+			return s, err
+		}
+		if err = tx.Model(&instrumentRecord{}).Where(map[string]any{"listing_date": nil}).Count(&s.InstrumentsWithoutListingDate).Error; err != nil {
+			return s, err
+		}
+		err = tx.Model(&barRecord{}).Select("period,count(*) AS rows,count(DISTINCT(exchange,code)) AS symbols").Group("period").Order("period").Scan(&s.Periods).Error
 		if err != nil {
 			return s, err
 		}
-		latestReceipt := tx.Table("ingestion_receipts").Select("*,row_number() OVER (PARTITION BY exchange,code,period ORDER BY imported_at DESC,run_id DESC) AS n")
-		err = tx.Table("bars b").Select(`b.exchange,b.code,i.name,b.period,count(*) AS rows,min(b.ts)::VARCHAR AS earliest,max(b.ts)::VARCHAR AS latest,
-  max(b.ingested_at)::VARCHAR AS updated_at,coalesce(r.warning,'') AS warning,coalesce(i.status,'unknown') AS status,
-  i.listing_date::VARCHAR AS listing_date,i.delisting_date::VARCHAR AS delisting_date`).
-			Joins("LEFT JOIN instruments i ON b.exchange=i.exchange AND b.code=i.code").
-			Joins("LEFT JOIN (?) r ON b.exchange=r.exchange AND b.code=r.code AND b.period=r.period AND r.n=1", latestReceipt).
-			Group("b.exchange,b.code,i.name,b.period,r.warning,i.status,i.listing_date,i.delisting_date").
-			Order("max(b.ingested_at) DESC,b.exchange,b.code,b.period").Limit(200).Scan(&s.Datasets).Error
-		return s, err
+
+		// 聚合只负责行情；证券资料和最新回执分别用模型查询后在 Go 中组装，不再嵌套窗口函数和多表 join。
+		err = tx.Table("bars b").Select(datasetAggregateColumns).
+			Group("b.exchange,b.code,b.period").Order("max(b.ingested_at) DESC,b.exchange,b.code,b.period").
+			Limit(200).Scan(&s.Datasets).Error
+		if err != nil {
+			return s, err
+		}
+		instruments, err := loadDatasetInstruments(tx, s.Datasets)
+		if err != nil {
+			return s, err
+		}
+		receipts, err := loadLatestDatasetReceipts(tx, s.Datasets)
+		if err != nil {
+			return s, err
+		}
+		for i := range s.Datasets {
+			item := &s.Datasets[i]
+			item.Status = "unknown"
+			instrumentKey := datasetKey{Exchange: item.Exchange, Code: item.Code}
+			if instrument, ok := instruments[instrumentKey]; ok {
+				item.Name = instrument.Name
+				item.ListingDate = instrument.ListingDate
+				item.DelistingDate = instrument.DelistingDate
+				if instrument.Status != nil {
+					item.Status = *instrument.Status
+				}
+			}
+			if receipt, ok := receipts[datasetKey{Exchange: item.Exchange, Code: item.Code, Period: item.Period}]; ok && receipt.Warning != nil {
+				item.Warning = *receipt.Warning
+			}
+		}
+		return s, nil
 	})
 }
 
@@ -88,11 +147,74 @@ func (d *DuckDB) Datasets(ctx context.Context, q domain.DatasetQuery) (domain.Da
 		if err := tx.Table("(?) matched", grouped).Count(&page.Total).Error; err != nil {
 			return page, err
 		}
-		err := datasetSelection(tx, q).Select(`b.exchange,b.code,coalesce(i.name,'') AS name,b.period,count(*) AS rows,
-  min(b.ts)::VARCHAR AS earliest,max(b.ts)::VARCHAR AS latest,max(b.ingested_at)::VARCHAR AS updated_at`).
-			Group("b.exchange,b.code,i.name,b.period").Order("b.exchange,b.code,b.period").Limit(page.PageSize).Offset((q.Page - 1) * page.PageSize).Scan(&page.Items).Error
-		return page, err
+		err := datasetSelection(tx, q).Select(datasetAggregateColumns).
+			Group("b.exchange,b.code,b.period").Order("b.exchange,b.code,b.period").
+			Limit(page.PageSize).Offset((q.Page - 1) * page.PageSize).Scan(&page.Items).Error
+		if err != nil {
+			return page, err
+		}
+		instruments, err := loadDatasetInstruments(tx, page.Items)
+		if err != nil {
+			return page, err
+		}
+		for i := range page.Items {
+			item := &page.Items[i]
+			name := ""
+			if instrument, ok := instruments[datasetKey{Exchange: item.Exchange, Code: item.Code}]; ok && instrument.Name != nil {
+				name = *instrument.Name
+			}
+			item.Name = &name
+		}
+		return page, nil
 	})
+}
+
+func loadDatasetInstruments(tx *gorm.DB, datasets []domain.WarehouseDataset) (map[datasetKey]datasetInstrument, error) {
+	result := make(map[datasetKey]datasetInstrument, len(datasets))
+	if len(datasets) == 0 {
+		return result, nil
+	}
+	query := tx.Model(&instrumentRecord{})
+	for i, item := range datasets {
+		condition := &instrumentRecord{Exchange: item.Exchange, Code: item.Code}
+		if i == 0 {
+			query = query.Where(condition)
+		} else {
+			query = query.Or(condition)
+		}
+	}
+	records := []datasetInstrument{}
+	err := query.Select("exchange,code,name,status,listing_date::VARCHAR AS listing_date,delisting_date::VARCHAR AS delisting_date").Find(&records).Error
+	for _, record := range records {
+		result[datasetKey{Exchange: record.Exchange, Code: record.Code}] = record
+	}
+	return result, err
+}
+
+func loadLatestDatasetReceipts(tx *gorm.DB, datasets []domain.WarehouseDataset) (map[datasetKey]datasetReceipt, error) {
+	result := make(map[datasetKey]datasetReceipt, len(datasets))
+	if len(datasets) == 0 {
+		return result, nil
+	}
+	query := tx.Model(&receiptRecord{})
+	for i, item := range datasets {
+		condition := &receiptRecord{Exchange: item.Exchange, Code: item.Code, Period: item.Period}
+		if i == 0 {
+			query = query.Where(condition)
+		} else {
+			query = query.Or(condition)
+		}
+	}
+	records := []datasetReceipt{}
+	err := query.Select("exchange,code,period,warning,imported_at,run_id").
+		Order("imported_at DESC,run_id DESC").Find(&records).Error
+	for _, record := range records {
+		key := datasetKey{Exchange: record.Exchange, Code: record.Code, Period: record.Period}
+		if _, exists := result[key]; !exists {
+			result[key] = record
+		}
+	}
+	return result, err
 }
 func (d *DuckDB) Bars(ctx context.Context, q domain.BarQuery) ([]domain.WarehouseBar, error) {
 	q, err := q.Normalize()
@@ -102,9 +224,9 @@ func (d *DuckDB) Bars(ctx context.Context, q domain.BarQuery) ([]domain.Warehous
 	return transact(ctx, d, func(tx *gorm.DB) ([]domain.WarehouseBar, error) {
 		result := []domain.WarehouseBar{}
 		// 仅取最新的有限窗口再反转，显式 CAST 保证 ORM 扫描及 JSON 序列化都不经过 float64。
-		err := tx.Table("bars").Select(`ts::VARCHAR AS time,open::VARCHAR AS open,high::VARCHAR AS high,
-  low::VARCHAR AS low,close::VARCHAR AS close,volume_shares,amount_cny::VARCHAR AS amount_cny,source`).
-			Where("exchange=? AND code=? AND period=?", q.Exchange, q.Code, q.Period).
+		columns := "ts::VARCHAR AS time,open::VARCHAR AS open,high::VARCHAR AS high," +
+			"low::VARCHAR AS low,close::VARCHAR AS close,volume_shares,amount_cny::VARCHAR AS amount_cny,source"
+		err := tx.Model(&barRecord{}).Select(columns).Where(&barRecord{Exchange: q.Exchange, Code: q.Code, Period: q.Period}).
 			Where("ts>=?::TIMESTAMP AND ts<?::TIMESTAMP", q.From, q.Until).Order("ts DESC").Limit(q.Limit).Scan(&result).Error
 		slices.Reverse(result)
 		return result, err
