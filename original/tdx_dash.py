@@ -30,6 +30,7 @@ TICK_TTL = 0.9
 _lock = threading.Lock()
 _cache = {}
 _pool = None
+_err = {"n": 0, "refreshing": False}
 
 
 def parse_one(text):
@@ -77,6 +78,25 @@ def do_ticks(code):
     return [{k: r.get(k) for k in keep} for r in rows]
 
 
+def note_error():
+    """连着出错说明主机表里坏机器占多了，去重探一遍，别让长跑的进程抱着死表不放。"""
+    with _lock:
+        _err["n"] += 1
+        need = _err["n"] >= 5 and not _err["refreshing"]
+        if need:
+            _err["n"] = 0
+            _err["refreshing"] = True
+
+    def job():
+        try:
+            _pool.health()
+        finally:
+            with _lock:
+                _err["refreshing"] = False
+    if need:
+        threading.Thread(target=job, daemon=True).start()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -120,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, "not found", "text/plain; charset=utf-8")
         except Exception as exc:                                  # noqa: BLE001
+            note_error()
             self._send(200, json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)},
                                        ensure_ascii=False), "application/json; charset=utf-8")
 

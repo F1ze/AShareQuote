@@ -17,6 +17,7 @@
     python tdx_realtime.py run --watch watch.txt --cycle 3 --mode auto --out q.jsonl
 """
 import argparse
+import io
 import collections
 import json
 import os
@@ -137,30 +138,57 @@ def cmd_l2_replay(args):
 
 
 def cmd_l2_check(args):
-    """文件里当天的量合计对日线成交量，闸值 0.5%。"""
+    """逐笔文件的量核对。盘中文件只覆盖一段，就按同一时间窗对在线回包比；整日文件对日线比。
+
+    两侧都换算成手，闸值默认 0.5%。任一判据过就算通过：盘中段必然比整日少，
+    所以文件末笔离现在很远时，日线那条只作参考，不作判据。
+    """
     store = TickStore(args.out, args.day, args.kind)
     p = store.path(args.market, args.code.encode("ascii"))
     if not os.path.exists(p):
         print("没有文件: %s" % p, file=sys.stderr)
         return 4
-    total = 0
-    n = 0
-    with open(p, "r", encoding="utf-8") as fh:
-        for line in fh:
-            total += json.loads(line)["vol"]
-            n += 1
+    recs = [json.loads(l) for l in io.open(p, encoding="utf-8")]
+    if not recs:
+        print("文件是空的", file=sys.stderr)
+        return 4
+    recs.sort(key=_tick_order_key)
+    lo, hi = _tick_order_key(recs[0]), _tick_order_key(recs[-1])
+    file_sum = sum(r["vol"] for r in recs)
+
+    pool = Pool(workers=1, timeout=8.0)
+    try:
+        w = pool.workers[0]
+        try:
+            live = w.orders(args.market, args.code.encode("ascii"), 0, 800)
+        finally:
+            w._drop()
+    finally:
+        pool.close()
+
+    # 在线回包必须完全盖住文件的时间窗，这段才可比
+    live_lo, live_hi = _tick_order_key(min(live, key=_tick_order_key)),         _tick_order_key(max(live, key=_tick_order_key)) if live else (lo, lo)
+    live_cover = bool(live) and live_lo <= lo and live_hi >= hi
+    live_sum = sum(r["vol"] for r in live if lo <= _tick_order_key(r) <= hi)
+
     try:
         base = day_volume(args.market, args.code.encode("ascii"))
     except Exception as exc:                              # noqa: BLE001
+        base = 0.0
         print("日线取不到: %s" % exc, file=sys.stderr)
-        return 4
-    if not base:
-        print("日线成交量为 0", file=sys.stderr)
-        return 4
-    rate = abs(total - base) / base
-    ok = rate <= args.tolerance
-    print(json.dumps({"条数": n, "文件量": total, "日线量": base, "偏差": round(rate, 6),
-                      "通过": ok}, ensure_ascii=False))
+
+    out = {"条数": len(recs), "文件量": file_sum, "起": lo[0], "止": hi[0], "覆盖": live_cover}
+    ok = False
+    if live_cover and live_sum:
+        rate = abs(file_sum - live_sum) / live_sum
+        out.update({"窗内在线量": live_sum, "窗内偏差": round(rate, 6), "窗内通过": rate <= args.tolerance})
+        ok = ok or rate <= args.tolerance
+    if base:
+        rate = abs(file_sum - base) / base
+        out.update({"日线量": base, "日线偏差": round(rate, 6), "日线通过": rate <= args.tolerance})
+        ok = ok or rate <= args.tolerance
+    out["通过"] = ok
+    print(json.dumps(out, ensure_ascii=False))
     return 0 if ok else 1
 
 
@@ -191,6 +219,7 @@ BATCH_MAX = 80            # 单请求品种数上限（56 字节/只，回包约
 TICK_WINDOW = 50          # 采集器内轮询用的逐笔条数：客户端成交明细一次就要 115 条，50 够一轮不漏
 TICK_WINDOW_FRESH = 200   # 增量尾随用的窗口：活跃票一秒能出几十笔，窗口给足才不漏
 TICK_SEEN_MAX = 4000      # 每只记住的已见签名上限
+CALL_TRIES = 3            # 一次调用最多试几台主机：本服有成片"连上即关"的机器
 TICK_SEEN_MAX = 800       # 每只记多少条成交签名用于去重
 WATCH_DEFAULT = "watch.txt"
 
@@ -212,6 +241,7 @@ class Stats(object):
         self.errors = 0
         self.connects = 0
         self.dropped = 0
+        self.retries = 0      # 换机重试次数，失败主机被挪队尾后计数
         self.last_error = None
         self.started = time.time()
 
@@ -481,8 +511,29 @@ class Worker(threading.Thread):
             raw = zlib.decompress(raw)
         return ct, raw
 
-    def _call(self, ct, payload, cat, ver, flag, extra=0):
-        """一次调用 = 一次连接：连接 -> 握手三帧与业务帧同发 -> 按 commtype 认领业务应答。
+    def _call(self, ct, payload, cat, ver, flag, extra=0, tries=CALL_TRIES):
+        """一次调用 = 一次连接，失败换主机重来。
+
+        有些主机接受连接后立刻关闭（实测 41.6），撞上必报"连接被关闭"。
+        这种关闭发生在 TCP 建连成功之后，_connect 的循环发现不了，所以必须在这一层重试：
+        每次失败把当前主机挪到队尾，重试用尽才把异常抛给调用方。
+        """
+        last = None
+        for i in range(tries):
+            try:
+                return self._call_once(ct, payload, cat, ver, flag, extra)
+            except (RtdError, OSError) as exc:
+                last = exc
+                self._drop()
+                if self.host:
+                    self.pool.ban(self.host)
+                self.pool.stats.bump("retries")
+                if i + 1 < tries:
+                    time.sleep(0.15 * (i + 1))
+        raise last
+
+    def _call_once(self, ct, payload, cat, ver, flag, extra=0):
+        """单次尝试：连接 -> 握手三帧与业务帧同发 -> 按 commtype 认领业务应答。
 
         extra 是声明长度比实际体多出的字节数。逐笔族（0x0FC5）客户端声明的是体长加 2，
         少这两字节服务端就一直等，一个字节都不回，所以 extra 只给逐笔用。
@@ -590,6 +641,13 @@ class Pool(object):
         self.workers = [Worker(self, i) for i in range(workers)]
         for w in self.workers:
             w.start()
+
+    def ban(self, host, keep_last=1):
+        """把刚失败的主机挪到队尾，别让它一直占着头位。留最后一台，全不符时还能兜底。"""
+        for i, (h, _p) in enumerate(self._hosts):
+            if h == host and i < len(self._hosts) - keep_last:
+                self._hosts.append(self._hosts.pop(i))
+                return
 
     def _probe(self, host, port, timeout, out):
         """单机健康探测：能回一条日线就算活，耗时入表。"""
@@ -1005,10 +1063,16 @@ class TickTail(object):
 
 
 def day_volume(market, code):
-    """当日日线成交量（手），用于整日量核对。"""
-    with TdxClient() as cli:
-        bars = cli.security_bars(market, code, CATEGORY["day"], 0, 3)
-    return bars[0]["vol"] if bars else 0
+    """当日日线成交量（手），用于整日量核对。code 给 bytes 或 str 都行。"""
+    if isinstance(code, bytes):
+        code = code.decode("ascii")
+    cli = T.TdxConnection()                       # 参数顺序是 category、market、code
+    try:
+        bars = cli.security_bars(4, market, code, 0, 1)      # 4 是日线，只要最新一根
+    finally:
+        cli._close()
+    # 日线按日期倒序给（0 是最新），量是股，逐笔是手（11-04 的 1347238 手对死过单位）
+    return bars[0]["vol"] / 100.0 if bars else 0.0
 
 
 # ---------------------------------------------------------------- 命令
