@@ -17,6 +17,7 @@
     python tdx_realtime.py run --watch watch.txt --cycle 3 --mode auto --out q.jsonl
 """
 import argparse
+import collections
 import json
 import os
 import queue
@@ -30,11 +31,144 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tdx_client as T                                   # 复用配置、主机表与帧头结构
 
+# ---------------------------------------------------------------- L2 命令
+
+
+def _dedupe_sort(rows):
+    seen = set()
+    out = []
+    for r in rows:
+        sig = tick_sig(r)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(r)
+    out.sort(key=_tick_order_key)
+    return out
+
+
+def cmd_l2_fetch(args):
+    """往回翻历史逐笔，整段合并去重后按时间正序写文件或打屏幕。"""
+    stocks = parse_codes(args.codes)
+    pool = Pool(workers=min(4, len(stocks) or 1), timeout=8.0)
+    store = None
+    if args.out:
+        store = TickStore(args.out, args.day, args.kind)
+    total = 0
+    try:
+        for m, c in stocks:
+            rows = []
+            start = args.start
+            while len(rows) < args.count:
+                want = min(args.count - len(rows), args.window)
+                got = pool.workers[0].ticks(m, c, start, want) if args.kind == "tick" else \
+                    pool.workers[0].orders(m, c, start, want)
+                pool.workers[0]._drop()
+                if not got:
+                    break
+                rows.extend(got)
+                start += len(got)
+            rows = _dedupe_sort(rows)
+            for r in rows:
+                r.update({"market": m, "code": c.decode("ascii"), "kind": args.kind,
+                          "mode": "l2", "ts": time.time()})
+                if store:
+                    store.write(r)
+                else:
+                    print(json.dumps(r, ensure_ascii=False, sort_keys=True))
+            total += len(rows)
+            print("%d%s 取回 %d 条" % (m, c.decode("ascii"), len(rows)), file=sys.stderr)
+        return 0 if total else 4
+    finally:
+        if store:
+            store.close()
+        pool.close()
+
+
+def cmd_l2_tail(args):
+    """实时增量：只落新成交，断点续采靠文件末尾签名，进程重启不重不漏。"""
+    stocks = parse_codes(args.codes)
+    store = TickStore(args.out, args.day, args.kind)
+    n = max(1, min(args.concurrency, len(stocks)))
+    pool = Pool(workers=n, timeout=8.0)
+    tails = {}
+    for i, (m, c) in enumerate(stocks):
+        seen, order = store.seed_seen(m, c)
+        tails[(m, c)] = TickTail(pool.workers[i % n], m, c, seen, order,
+                                 args.window, args.kind)
+    t_end = time.time() + args.seconds
+    written = 0
+    try:
+        while time.time() < t_end:
+            for (m, c), tail in tails.items():
+                for r in tail.poll():
+                    r.update({"market": m, "code": c.decode("ascii"), "kind": args.kind,
+                              "mode": "l2", "ts": time.time()})
+                    store.write(r)
+                    written += 1
+            store.flush()
+            time.sleep(max(0.0, args.interval))
+        print(json.dumps({"written": written, "codes": len(stocks),
+                          "seconds": args.seconds}, ensure_ascii=False))
+        return 0
+    finally:
+        store.close()
+        pool.close()
+
+
+def cmd_l2_replay(args):
+    """把某天某只的逐笔文件按时间正序回放；--speed 0 全速，否则按 sec 原速。"""
+    store = TickStore(args.out, args.day, args.kind)
+    p = store.path(args.market, args.code.encode("ascii"))
+    if not os.path.exists(p):
+        print("没有文件: %s" % p, file=sys.stderr)
+        return 4
+    prev = None
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh:
+            rec = json.loads(line)
+            if args.speed and prev:
+                gap = _tick_order_key(rec)[1] - prev
+                if gap > 0:
+                    time.sleep(min(gap, 60) / float(args.speed))
+            prev = _tick_order_key(rec)[1]
+            print(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_l2_check(args):
+    """文件里当天的量合计对日线成交量，闸值 0.5%。"""
+    store = TickStore(args.out, args.day, args.kind)
+    p = store.path(args.market, args.code.encode("ascii"))
+    if not os.path.exists(p):
+        print("没有文件: %s" % p, file=sys.stderr)
+        return 4
+    total = 0
+    n = 0
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh:
+            total += json.loads(line)["vol"]
+            n += 1
+    try:
+        base = day_volume(args.market, args.code.encode("ascii"))
+    except Exception as exc:                              # noqa: BLE001
+        print("日线取不到: %s" % exc, file=sys.stderr)
+        return 4
+    if not base:
+        print("日线成交量为 0", file=sys.stderr)
+        return 4
+    rate = abs(total - base) / base
+    ok = rate <= args.tolerance
+    print(json.dumps({"条数": n, "文件量": total, "日线量": base, "偏差": round(rate, 6),
+                      "通过": ok}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
 # ---------------------------------------------------------------- 命令字
 
 CT_SNAPSHOT = 0x053E      # L1 快照（五档）：请求 12 字节前缀 + 7n，记录 56 字节
 CT_TICK = 0x0FC5          # L2 逐笔成交
-CT_ORDER = 0x0FC2         # L2 逐笔委托
+CT_ORDER = 0x0FC2         # L2 逐笔成交（带 3 秒时标，0FC5 是同一路的分钟版）
 CT_MINUTE = 0x051D        # 当日分时（一分钟一点）
 
 # 快照帧头：catword 0x0218 / ver 0x0093 / flag 0，被本服接受（37 章实测）。
@@ -54,7 +188,9 @@ HS2 = bytes.fromhex("0c0218940001030003000d0002")      # Setup2（有应答）
 HS3 = bytes.fromhex("0c0318990001200020000fdbd5d0c9ccd6a4a8af0000008fc22540130000d500c9ccbdf0d7ea00000002")
 
 BATCH_MAX = 80            # 单请求品种数上限（56 字节/只，回包约 4.5 KB）
-TICK_WINDOW = 50          # 每只每轮补的逐笔条数：客户端成交明细一次就要 115 条，50 够一轮不漏
+TICK_WINDOW = 50          # 采集器内轮询用的逐笔条数：客户端成交明细一次就要 115 条，50 够一轮不漏
+TICK_WINDOW_FRESH = 200   # 增量尾随用的窗口：活跃票一秒能出几十笔，窗口给足才不漏
+TICK_SEEN_MAX = 4000      # 每只记住的已见签名上限
 TICK_SEEN_MAX = 800       # 每只记多少条成交签名用于去重
 WATCH_DEFAULT = "watch.txt"
 
@@ -251,14 +387,13 @@ def parse_tick(body):
 
 
 def parse_order(body):
-    """解析 0x0FC2 逐笔委托。与逐笔成交相比，每条**末尾**多一个字节，其余同形：
+    """解析 0x0FC2。它是 0FC5 同一条成交流的细时标版：每条**末尾**多一个字节，那字节是秒。
 
-        u16 时间 / 价 varint（同上，0 与上一条相同） / 量 varint / 笔数 varint / u16 方向 / u8 类别码
+        u16 时间(分) / 价 varint（同上，0 与上一条相同） / 量 varint / 笔数 varint / u16 方向 / u8 秒
 
-    证据是条数守恒：3 条回 27 字节 = 2 + 3×8，6 条回 52 = 2 + 6×8，每条正好 8 字节，
-    多出来那一字节落在每条末尾（最后一条也在，所以是记录字段不是分隔符）。
-    它与 0FC5 的体逐条一一对应，去掉就还原成成交记录，取值 16、19、43、58 这类按 3 跳的数，
-    语义未定，按 kind_code 原样给。
+    证据是条数守恒：3 条回 27 字节 = 2 + 3×8，6 条回 52 = 2 + 6×8，多出来那一字节落在每条末尾。
+    该字节是 0 到 59、相邻恒差 3 的秒（3600 条里 0 条越界，97% 以上相邻差正好 3，跨 60 回卷），
+    即时间是 3 秒粒度：t 输出到秒，sec 另给一份原值。与 0FC5 逐条比 1200 条，价格/量/方向完全一致。
     """
     if len(body) < 2:
         return []
@@ -275,10 +410,10 @@ def parse_order(body):
         vol, pos3 = read_varint(body, pos2)
         cnt, pos4 = read_varint(body, pos3)
         side = struct.unpack_from("<H", body, pos4)[0] if pos4 + 2 <= len(body) else 2
-        code = body[pos4 + 2] if pos4 + 2 < len(body) else 0
-        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, 0),
+        sec = body[pos4 + 2] if pos4 + 2 < len(body) else 0
+        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, sec),
                     "price": px / PRICE_SCALE, "vol": vol, "trades": cnt,
-                    "side": side, "kind_code": code})
+                    "side": side, "sec": sec, "kind_code": sec})
         pos = pos4 + 3
     return out
 
@@ -397,7 +532,11 @@ class Worker(threading.Thread):
         return parse_tick(body)
 
     def orders(self, market, code, start=0, count=30):
-        """取逐笔委托（L2 十档订单流用）。请求体与逐笔成交一致，回包 commtype 是 0x0FC2。"""
+        """取带秒的逐笔成交（0FC2）。请求体与 0FC5 相同，差别只在每条多一个秒字节。
+
+        本服 0FC0-0FC9 只有 0FC2 与 0FC5 应答，没有独立的逐笔委托流；
+        量价方向与 0FC5 逐条相同，时间细到 3 秒，所以对时间敏感的场景直接用这条。
+        """
         payload = struct.pack("<H", market) + code.ljust(6, b"\x00") + struct.pack("<HH", start, count)
         body = self._call(CT_ORDER, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
         return parse_order(body)
@@ -715,6 +854,163 @@ def read_watch(path):
     return parse_codes(raw)
 
 
+# ---------------------------------------------------------------- 逐笔存储
+
+TICK_SIG = ("t", "price", "vol", "trades")
+
+
+def tick_sig(rec):
+    """逐笔去重签名：时间是 3 秒精度，加上价、量、笔数就足够唯一。"""
+    return tuple(rec.get(k) for k in TICK_SIG)
+
+
+def _tick_order_key(rec):
+    return (rec.get("t") or "", rec.get("sec") or 0, rec.get("price") or 0.0)
+
+
+class TickStore(object):
+    """按交易日、按只落盘：<根>/YYYYMMDD/<市场><代码>.jsonl。
+
+    开文件时把最后一条签名读回来当续采锚点，重启后不重不漏。
+    kind 也进文件名后缀，成交与委托两路不会互串。
+    """
+
+    def __init__(self, root, day=None, kind="order"):
+        self.root = root
+        self.day = day or time.strftime("%Y%m%d")
+        self.dir = os.path.join(root, self.day)
+        os.makedirs(self.dir, exist_ok=True)
+        self.kind = kind
+        self.fh = {}
+        self.anchor = {}
+
+    def path(self, market, code):
+        code = code.decode("ascii", "replace") if isinstance(code, bytes) else code
+        return os.path.join(self.dir, "%d%s.%s.jsonl" % (market, code, self.kind))
+
+    def open(self, market, code):
+        """取追加句柄与续采锚点；锚点来自文件最后一行，没有就 None。"""
+        key = (market, code)
+        if key in self.fh:
+            return self.fh[key], self.anchor.get(key)
+        p = self.path(market, code)
+        anchor = None
+        if os.path.exists(p) and os.path.getsize(p):
+            with open(p, "rb") as fh:
+                fh.seek(max(0, os.path.getsize(p) - 4096))
+                last = fh.read().decode("utf-8", "replace").strip().splitlines()[-1:]
+            if last:
+                try:
+                    anchor = tick_sig(json.loads(last[0]))
+                except ValueError:
+                    anchor = None
+        self.anchor[key] = anchor
+        self.fh[key] = open(p, "a", encoding="utf-8")
+        return self.fh[key], anchor
+
+    def write(self, rec):
+        key = (rec["market"], rec["code"])
+        fh, anchor = self.open(key[0], key[1].encode("ascii"))
+        fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+        self.anchor[key] = tick_sig(rec)
+        return fh
+
+    def seed_seen(self, market, code, limit=500):
+        """从文件尾部回种已见签名：进程重启后接着采，不把老成交当成新的重写一遍。"""
+        seen = set()
+        order = collections.deque()
+        p = self.path(market, code)
+        if not os.path.exists(p) or not os.path.getsize(p):
+            return seen, order
+        with open(p, "rb") as fh:
+            fh.seek(max(0, os.path.getsize(p) - limit * 96))
+            rows = fh.read().decode("utf-8", "replace").strip().splitlines()[-limit:]
+        for line in rows:
+            try:
+                sig = tick_sig(json.loads(line))
+            except ValueError:
+                continue
+            seen.add(sig)
+            order.append(sig)
+        return seen, order
+
+    def flush(self):
+        for fh in self.fh.values():
+            fh.flush()
+
+    def close(self):
+        for fh in self.fh.values():
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self.fh = {}
+
+
+class TickTail(object):
+    """增量：每次从最新处取一窗，跳过已经见过的那一段，正序返回剩下的新记录。
+
+    逐笔的签名会重复（同一秒里同价同量的两笔成交长得一样），所以不能只拿
+    一个"上一条"去比对，必须用已见签名集合从最新那头往回扫：
+    扫到集合里没有的签名就停，它之后的全是新的。整窗都见过就是没有新成交。
+    集合按只封顶 TICK_SEEN_MAX，防长跑吃内存。
+    """
+
+    def __init__(self, worker, market, code, seen=None, order=None,
+                 window=TICK_WINDOW_FRESH, kind="order"):
+        self.worker = worker
+        self.market = market
+        self.code = code
+        self.seen = seen if seen is not None else set()
+        self.order = order if order is not None else collections.deque()
+        self.window = window
+        self.kind = kind
+
+    def remember(self, sig):
+        if sig in self.seen:
+            return
+        self.seen.add(sig)
+        self.order.append(sig)
+        while len(self.order) > TICK_SEEN_MAX:
+            self.seen.discard(self.order.popleft())
+
+    def poll(self):
+        fn = self.worker.ticks if self.kind == "tick" else self.worker.orders
+        try:
+            rows = fn(self.market, self.code, 0, self.window)
+        finally:
+            self.worker._drop()
+        if not rows:
+            return []
+        keep = []
+        for r in rows:                       # 服务端从最新往回给
+            if tick_sig(r) in self.seen:
+                continue                     # 见过的整段跳过
+            keep.append(r)
+        if not keep:
+            return []
+        keep.reverse()                       # 变成时间正序
+        batch = []
+        local = set()
+        for r in keep:
+            sig = tick_sig(r)
+            if sig in local:
+                continue
+            local.add(sig)
+            batch.append(r)
+        batch.sort(key=_tick_order_key)
+        for r in batch:
+            self.remember(tick_sig(r))
+        return batch
+
+
+def day_volume(market, code):
+    """当日日线成交量（手），用于整日量核对。"""
+    with TdxClient() as cli:
+        bars = cli.security_bars(market, code, CATEGORY["day"], 0, 3)
+    return bars[0]["vol"] if bars else 0
+
+
 # ---------------------------------------------------------------- 命令
 
 def cmd_probe_l2(args):
@@ -761,6 +1057,15 @@ def cmd_once(args):
             time.sleep(0.05)
         for rec in got:
             print(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+        if args.l2_orders:                        # 逐笔只在要的时候打，默认不打
+            w = pool.workers[0]
+            w._drop()                             # 快照那条连接已用掉，逐笔要重连
+            for m, c in stocks:
+                for kind in ("tick", "order"):
+                    for rec in (w.ticks if kind == "tick" else w.orders)(m, c if isinstance(c, bytes) else c.encode(), 0, 20):
+                        rec["kind"] = kind
+                        print(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+                    w._drop()
         print(json.dumps(pool.stats.snapshot(), ensure_ascii=False), file=sys.stderr)
         return 0 if got else 4
     finally:
@@ -808,9 +1113,48 @@ def main(argv=None):
     p.add_argument("--timeout", type=float, default=20.0)
     p.set_defaults(func=cmd_rtt)
 
+    p = sub.add_parser("l2", help="逐笔取数、增量落盘、回放与核对")
+    l2sub = p.add_subparsers(dest="l2cmd", required=True)
+    q = l2sub.add_parser("fetch", help="往回翻历史逐笔，正序落盘")
+    q.add_argument("--codes", required=True)
+    q.add_argument("--count", type=int, default=300, help="要取的条数上限")
+    q.add_argument("--start", type=int, default=0, help="从最新往回数第几条开始，默认 0")
+    q.add_argument("--window", type=int, default=800, help="单次回包上限，默认 800")
+    q.add_argument("--kind", default="order", choices=("order", "tick"))
+    q.add_argument("--out", default="")
+    q.add_argument("--day", default="")
+    q.set_defaults(func=cmd_l2_fetch)
+    q = l2sub.add_parser("tail", help="实时增量落盘，断点续采")
+    q.add_argument("--codes", required=True)
+    q.add_argument("--seconds", type=float, default=60)
+    q.add_argument("--interval", type=float, default=1.0, help="两轮间隔秒，默认 1")
+    q.add_argument("--window", type=int, default=TICK_WINDOW_FRESH)
+    q.add_argument("--concurrency", type=int, default=4)
+    q.add_argument("--kind", default="order", choices=("order", "tick"))
+    q.add_argument("--day", default="")
+    q.add_argument("--out", required=True)
+    q.set_defaults(func=cmd_l2_tail)
+    q = l2sub.add_parser("replay", help="按时间正序回放某天的文件")
+    q.add_argument("--market", type=int, required=True)
+    q.add_argument("--code", required=True)
+    q.add_argument("--day", default="")
+    q.add_argument("--kind", default="order", choices=("order", "tick"))
+    q.add_argument("--speed", type=float, default=0, help="0 全速，1 按秒原速，60 则快 60 倍")
+    q.add_argument("--out", required=True)
+    q.set_defaults(func=cmd_l2_replay)
+    q = l2sub.add_parser("check", help="文件量合计对日线，闸值 0.5%%")
+    q.add_argument("--market", type=int, required=True)
+    q.add_argument("--code", required=True)
+    q.add_argument("--day", default="")
+    q.add_argument("--kind", default="order", choices=("order", "tick"))
+    q.add_argument("--tolerance", type=float, default=0.005)
+    q.add_argument("--out", required=True)
+    q.set_defaults(func=cmd_l2_check)
+
     p = sub.add_parser("once", help="打一份快照")
     p.add_argument("--codes", required=True)
     p.add_argument("--mode", default="l1", choices=("l1", "l2", "auto"))
+    p.add_argument("--l2-orders", action="store_true", help="再打一份带秒的逐笔成交（0FC2）")
     p.set_defaults(func=cmd_once)
 
     p = sub.add_parser("run", help="常驻采集")
@@ -820,7 +1164,7 @@ def main(argv=None):
     p.add_argument("--cycle", type=float, default=3.0, help="轮询周期秒，默认贴 3 秒档")
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--l2-every", type=int, default=0, help="L2 模式下每轮补逐笔的只数")
-    p.add_argument("--l2-orders", action="store_true", help="再补一路逐笔委托（订单流）")
+    p.add_argument("--l2-orders", action="store_true", help="再补一路带秒的逐笔成交（0FC2，时间到 3 秒）")
     p.add_argument("--out", default="")
     p.add_argument("--seconds", type=float, default=0)
     p.add_argument("--stats-every", type=int, default=10)

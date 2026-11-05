@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>行情实盘看板 · tdx_realtime</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --up:#ff5d5d; --dn:#3fb950; --fg:#e6edf3; --dim:#8b949e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 "Microsoft YaHei",system-ui,sans-serif; }
+  header { display:flex; gap:8px; align-items:center; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0 10px 0 0; font-weight:600; letter-spacing:.5px; }
+  input { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; width:120px; font:inherit; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit; }
+  button:hover { background:#30363d; }
+  button.on { background:#1f6feb; border-color:#1f6feb; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#555; display:inline-block; }
+  .dot.ok { background:var(--dn); box-shadow:0 0 8px var(--dn); }
+  .dot.bad { background:var(--up); }
+  .dim { color:var(--dim); }
+  main { display:grid; grid-template-columns: 1fr 320px; gap:10px; padding:10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .big { font-size:30px; font-weight:700; font-variant-numeric: tabular-nums; }
+  .chg.up { color:var(--up); } .chg.dn { color:var(--dn); }
+  .kv { display:grid; grid-template-columns:repeat(2,1fr); gap:4px 12px; font-variant-numeric: tabular-nums; }
+  .kv div { display:flex; justify-content:space-between; border-bottom:1px dotted #22282f; padding:2px 0; }
+  canvas { width:100%; height:300px; display:block; background:#0b0f14; border-radius:6px; }
+  .ladder { font-variant-numeric: tabular-nums; }
+  .ladder .row { display:grid; grid-template-columns: 46px 1fr 84px; gap:6px; align-items:center; padding:1px 0; }
+  .ladder .bar { height:14px; background:#1f2a36; border-radius:2px; overflow:hidden; }
+  .ladder .bar i { display:block; height:100%; }
+  .ladder .ask .bar i { background:#5d2b2b; }
+  .ladder .bid .bar i { background:#1f4d33; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align:left; padding:2px 6px; font-size:13px; }
+  th { color:var(--dim); font-weight:400; border-bottom:1px solid var(--line); }
+  tr.b td { color:var(--up); } tr.s td { color:var(--dn); }
+  .meta { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>行情实盘看板</h1>
+  <input id="code" value="1:600036" placeholder="市场:代码">
+  <button id="go">切换</button>
+  <button data-q="1:600036">600036</button>
+  <button data-q="1:601881">601881</button>
+  <button data-q="0:000001">000001</button>
+  <button data-q="0:300750">300750</button>
+  <span class="dot" id="dot"></span><span class="dim" id="state">待启动</span>
+  <span class="meta" id="stats"></span>
+  <span class="dim">数据来源：tdx_realtime.py 直连行情主站，1 秒一刷</span>
+</header>
+
+<main>
+  <section class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:10px">
+      <div>
+        <div class="dim" id="name">—</div>
+        <div class="big" id="price">—</div>
+        <div class="chg" id="chg">—</div>
+      </div>
+      <div class="kv" id="fields"></div>
+    </div>
+    <canvas id="chart" width="1200" height="300"></canvas>
+    <div id="tapeBox">
+      <table><thead><tr><th>时间</th><th>价</th><th>量</th><th>向</th></tr></thead>
+      <tbody id="tape"></tbody></table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div style="display:flex;justify-content:space-between"><b>五档盘口</b><span class="dim" id="srv">—</span></div>
+    <div class="ladder" id="ladder"></div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:10px 0">
+    <div class="kv" id="vols"></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+// 直接双击打开（file://）时相对路径解析不了，改成打本地服务；服务端已放 CORS
+const FILE_MODE = location.protocol === "file:";
+const API = FILE_MODE ? "http://127.0.0.1:8811" : "";
+const SIDES = {0:"买", 1:"卖", 2:"中性", 5:"盘后"};
+const seen = new Set();
+let cur = localStorage.getItem("dash.code") || "1:600036", timer = null, lastTicks = [];
+
+function fmt(n, d) { return n === undefined || n === null ? "—" : Number(n).toFixed(d === undefined ? 2 : d); }
+
+function setState(ok, text) {
+  $("#dot").className = "dot " + (ok ? "ok" : "bad");
+  $("#state").textContent = text;
+}
+
+function book(rows) {
+  const max = Math.max(1, ...rows.map((r) => r.v || 0));
+  $("#ladder").innerHTML = rows.map((r) =>
+    '<div class="row ' + r.k + '"><span class="dim">' + r.t + '</span>' +
+    '<span class="bar"><i style="width:' + (100 * (r.v || 0) / max).toFixed(1) + '%"></i></span>' +
+    '<span style="text-align:right">' + (r.v ? r.v : "—") + '</span></div>').join("");
+}
+
+function draw(ticks) {
+  const c = $("#chart"), g = c.getContext("2d");
+  const w = c.width = c.clientWidth * 2, h = c.height = 600;
+  g.clearRect(0, 0, w, h);
+  if (ticks.length < 2) return;
+  const ps = ticks.map((t) => t.price);
+  let lo = Math.min(...ps), hi = Math.max(...ps);
+  if (hi === lo) { hi += 0.01; lo -= 0.01; }
+  const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
+  const X = (i) => 10 + i * (w - 20) / Math.max(1, ticks.length - 1);
+  const Y = (p) => h - 10 - (p - lo) * (h - 20) / (hi - lo);
+  g.strokeStyle = "#22282f"; g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const y = 10 + k * (h - 20) / 4;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+    g.fillStyle = "#4b5563"; g.font = "18px monospace";
+    g.fillText(fmt(hi - k * (hi - lo) / 4), 8, y - 4);
+  }
+  g.strokeStyle = "#58a6ff"; g.lineWidth = 2.4; g.beginPath();
+  ticks.forEach((t, i) => i ? g.lineTo(X(i), Y(t.price)) : g.moveTo(X(i), Y(t.price)));
+  g.stroke();
+  ticks.forEach((t, i) => {
+    g.fillStyle = t.side === 0 ? "#ff5d5d" : t.side === 1 ? "#3fb950" : "#8b949e";
+    g.beginPath(); g.arc(X(i), Y(t.price), Math.min(6, 1.6 + Math.log1p(t.vol) * .7), 0, 7); g.fill();
+  });
+}
+
+async function tick() {
+  try {
+    const r = await fetch(API + "/api/snap?codes=" + encodeURIComponent(cur), { cache: "no-store" });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    const q = (j.quotes || [])[0];
+    if (!q) throw new Error("无回包");
+    setState(true, (j.latency_ms || 0) + " ms");
+    $("#name").textContent = q.code + (q.mismatch ? "（代码不符）" : "");
+    $("#price").textContent = fmt(q.price);
+    const chg = q.last_close ? q.price - q.last_close : 0;
+    $("#chg").className = "chg " + (chg > 0 ? "up" : chg < 0 ? "dn" : "");
+    $("#chg").textContent = (q.last_close ? (chg >= 0 ? "+" : "") + fmt(chg) + "  " + fmt(100 * chg / q.last_close) + "%" : "—");
+    $("#fields").innerHTML = [["今开", fmt(q.open)], ["最高", fmt(q.high)], ["最低", fmt(q.low)],
+      ["前收", fmt(q.last_close)], ["均价", fmt(q.amount / (q.vol || 1) / 100)], ["振幅", fmt(100 * (q.high - q.low) / (q.last_close || 1)) + "%"]]
+      .map(([k, v]) => "<div><span class='dim'>" + k + "</span><span>" + v + "</span></div>").join("");
+    $("#vols").innerHTML = [["总量", q.vol], ["现手", q.cur_vol], ["外盘", q.b_vol], ["内盘", q.s_vol]]
+      .map(([k, v]) => "<div><span class='dim'>" + k + "</span><span>" + v + "</span></div>").join("");
+    $("#srv").textContent = "买一 " + fmt(q.bid1) + " / 卖一 " + fmt(q.ask1);
+    const rows = [];
+    for (let i = 5; i >= 1; i--) rows.push({ k: "ask", t: "卖" + i, v: q["ask_vol" + i] });
+    rows.push({ k: "mid", t: "价", v: 0 });
+    rows.splice(5, 1);
+    for (let i = 1; i <= 5; i++) rows.push({ k: "bid", t: "买" + i, v: q["bid_vol" + i] });
+    book(rows);
+
+    const tr = await fetch(API + "/api/ticks?code=" + encodeURIComponent(cur), { cache: "no-store" });
+    const tj = await tr.json();
+    const fresh = [];
+    for (const t of tj.ticks || []) {
+      const sig = t.t + "|" + t.sec + "|" + t.price + "|" + t.vol + "|" + t.trades;
+      if (seen.has(sig)) continue;
+      seen.add(sig); fresh.push(t);
+    }
+    if (fresh.length) {
+      lastTicks = lastTicks.concat(fresh).slice(-400);
+      $("#stats").textContent = "逐笔 " + lastTicks.length + " 笔 / 窗口 " + (tj.l2 ? "L2 通" : "L2 断");
+      draw(lastTicks);
+      const top = fresh.slice(-30).reverse();
+      $("#tape").innerHTML = top.concat(...[[]]).map(() => "").length ? top.map((t) =>
+        "<tr class='" + (t.side === 0 ? "b" : t.side === 1 ? "s" : "") + "'><td>" + t.t + "</td><td>" + fmt(t.price) + "</td><td>" + t.vol + "</td><td>" + (SIDES[t.side] || t.side) + "</td></tr>").join("") : $("#tape").innerHTML;
+    }
+  } catch (e) {
+    const bad = String(e.message || e);
+    setState(false, /parse URL|Failed to fetch/i.test(bad) ? "连不上服务，先跑 python tdx_dash.py --port 8811" : bad);
+  }
+}
+
+function start() {
+  if (timer) clearInterval(timer);
+  timer = setInterval(tick, 1000);
+  tick();
+}
+
+function pick(q) { cur = q; localStorage.setItem("dash.code", q); $("#code").value = q; seen.clear(); lastTicks = []; $("#tape").innerHTML = ""; start(); }
+$("#go").onclick = () => pick($("#code").value.trim());
+document.querySelectorAll("button[data-q]").forEach((b) => b.onclick = () => pick(b.dataset.q));
+$("#code").value = cur;
+if (FILE_MODE) $("#stats").textContent = "file:// 模式，正在打 127.0.0.1:8811";
+start();
+</script>
+</body>
+</html>

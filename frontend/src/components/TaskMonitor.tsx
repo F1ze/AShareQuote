@@ -167,7 +167,7 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
             )}
             {active && (
               <div className="mt-5 flex items-center justify-between gap-3">
-                <span className="text-xs text-slate-400">
+                <span className="text-xs text-muted-foreground">
                   {state === "cancelling"
                     ? "正在安全结束请求，请稍候"
                     : "下载在后台继续，你可以暂时离开页面"}
@@ -234,7 +234,7 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
             <h2>下载结果</h2>
             <span className="count-pill">{task?.succeeded || 0}</span>
           </div>
-          <span className="text-xs text-slate-400">最近 10 个文件</span>
+          <span className="text-xs text-muted-foreground">最近 10 个文件</span>
         </div>
         {task?.recent?.length ? (
           <div className="results-list">
@@ -256,7 +256,7 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
                       0,
                       file.category < 4 || file.category === 7 || file.category === 8 ? 16 : 10
                     )}{" "}
-                    <span className="text-slate-300">→</span>{" "}
+                    <span className="text-muted-foreground">→</span>{" "}
                     {file.to?.slice(
                       0,
                       file.category < 4 || file.category === 7 || file.category === 8 ? 16 : 10
@@ -307,11 +307,11 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
                 <Activity className="size-4" />
               </span>
               <span className="font-semibold">运行记录</span>
-              <span className="text-xs text-slate-400">
+              <span className="text-xs text-muted-foreground">
                 {task?.logs?.length ? `${task.logs.length} 条` : "暂无记录"}
               </span>
             </span>
-            <span className="flex items-center gap-2 text-xs text-slate-400">
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
               {logsOpen ? "收起" : "查看详情"}
               <ChevronDown className="size-4" />
             </span>
@@ -329,7 +329,7 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
             aria-label="下载运行记录"
           >
             {!task?.logs?.length && (
-              <p className="py-6 text-center text-sm text-slate-400">
+              <p className="py-6 text-center text-sm text-muted-foreground">
                 任务开始后，会在这里记录下载进展。
               </p>
             )}
@@ -344,7 +344,7 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
         </details>
         {chartData.length > 1 && (
           <div className="speed-chart">
-            <div className="flex justify-between text-xs text-slate-400">
+            <div className="flex justify-between text-xs text-muted-foreground">
               <span>下载速度变化</span>
               <span>只 / 秒</span>
             </div>
@@ -353,21 +353,21 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
                 <AreaChart data={chartData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="speed-fill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#4263eb" stopOpacity={0.2} />
-                      <stop offset="100%" stopColor="#4263eb" stopOpacity={0} />
+                      <stop offset="0%" stopColor="var(--brand)" stopOpacity={0.2} />
+                      <stop offset="100%" stopColor="var(--brand)" stopOpacity={0} />
                     </linearGradient>
                   </defs>
-                  <CartesianGrid stroke="#edf0f5" vertical={false} />
+                  <CartesianGrid stroke="var(--line)" vertical={false} />
                   <YAxis hide domain={[0, "auto"]} />
                   <Tooltip
                     formatter={(value) => [`${Number(value).toFixed(1)} 只/秒`, "平均速度"]}
                     labelFormatter={() => "下载速度"}
-                    contentStyle={{ border: "1px solid #e2e8f0", borderRadius: 10, fontSize: 12 }}
+                    contentStyle={{ border: "1px solid var(--line-strong)", borderRadius: 10, background: "var(--surface-raised)", color: "var(--text)", fontSize: 12 }}
                   />
                   <Area
                     dataKey="value"
                     type="monotone"
-                    stroke="#4263eb"
+                    stroke="var(--brand)"
                     fill="url(#speed-fill)"
                     strokeWidth={2}
                     isAnimationActive={false}

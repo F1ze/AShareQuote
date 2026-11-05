@@ -88,27 +88,27 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
-        className="w-full gap-0 border-[#e5eaf2] bg-[#ffffff] p-0 sm:max-w-xl"
+        className="w-full gap-0 border-[var(--line)] bg-[var(--surface)] p-0 sm:max-w-xl"
         aria-describedby="path-browser-description"
       >
-        <SheetHeader className="border-b border-[#e5eaf2] px-6 py-5 text-left">
-          <div className="font-mono text-[11px] tracking-[0.14em] text-[#4263eb]">本地文件</div>
+        <SheetHeader className="border-b border-[var(--line)] px-6 py-5 text-left">
+          <div className="font-mono text-[11px] tracking-[0.14em] text-[var(--brand)]">本地文件</div>
           <SheetTitle className="text-xl font-semibold">
             {kind === "folder" ? "选择保存目录" : "查找复权因子 gbbq"}
           </SheetTitle>
-          <SheetDescription id="path-browser-description" className="text-sm text-[#7c8ba5]">
+          <SheetDescription id="path-browser-description" className="text-sm text-[var(--text-secondary)]">
             选择文件的保存位置，或新建一个文件夹。
           </SheetDescription>
         </SheetHeader>
 
-        <div className="border-b border-[#e5eaf2] px-6 py-4">
+        <div className="border-b border-[var(--line)] px-6 py-4">
           <div className="mb-3 flex flex-wrap gap-2">
             {result?.roots.map((root) => (
               <button
                 key={root.path}
                 type="button"
                 onClick={() => void load(root.path)}
-                className="min-h-9 cursor-pointer border border-[#e2e8f0] bg-transparent px-3 text-xs text-[#34343c] transition-colors hover:border-[#4263eb] hover:text-[#4263eb] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4263eb]"
+                className="min-h-9 cursor-pointer border border-[var(--line)] bg-transparent px-3 text-xs text-[var(--text)] transition-colors hover:border-[var(--brand)] hover:text-[var(--brand)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4263eb]"
               >
                 {root.name}
               </button>
@@ -118,13 +118,13 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
             <Input
               value={pathInput}
               onChange={(event) => setPathInput(event.target.value)}
-              className="h-11 rounded-lg border-[#dfe5ef] bg-white font-mono text-xs shadow-none"
+              className="h-11 rounded-lg border-[var(--line)] bg-card font-mono text-xs shadow-none"
               aria-label="当前路径"
             />
             <Button
               type="submit"
               variant="outline"
-              className="h-11 rounded-lg border-[#dfe5ef] bg-white shadow-none"
+              className="h-11 rounded-lg border-[var(--line)] bg-card shadow-none"
             >
               跳转
             </Button>
@@ -143,7 +143,7 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
             >
               <ArrowLeft /> 上一级
             </Button>
-            <span className="font-mono text-[11px] text-[#6a6a73]">
+            <span className="font-mono text-[11px] text-[var(--text-secondary)]">
               {result ? `${result.entries.length} 项` : "读取中"}
             </span>
           </div>
@@ -151,19 +151,19 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
           {error && (
             <div
               role="alert"
-              className="mb-3 border border-[#c94141] bg-[#fff4f2] px-3 py-2 text-sm text-[#a42323]"
+              className="mb-3 border border-[var(--danger)] bg-[var(--danger-surface)] px-3 py-2 text-sm text-[var(--danger)]"
             >
               {error}
             </div>
           )}
-          <div className="min-h-0 flex-1 overflow-y-auto border-y border-[#e5eaf2] bg-white">
+          <div className="min-h-0 flex-1 overflow-y-auto border-y border-[var(--line)] bg-card">
             {loading && (
-              <div className="flex h-32 items-center justify-center gap-2 text-sm text-[#7c8ba5]">
+              <div className="flex h-32 items-center justify-center gap-2 text-sm text-[var(--text-secondary)]">
                 <LoaderCircle className="animate-spin" /> 正在读取目录
               </div>
             )}
             {!loading && result?.entries.length === 0 && (
-              <div className="flex h-32 items-center justify-center text-sm text-[#6a6a73]">
+              <div className="flex h-32 items-center justify-center text-sm text-[var(--text-secondary)]">
                 这里没有可显示的项目
               </div>
             )}
@@ -173,15 +173,15 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
                   key={entry.path}
                   type="button"
                   onClick={() => (entry.directory ? void load(entry.path) : choose(entry.path))}
-                  className="flex min-h-11 w-full cursor-pointer items-center gap-3 border-b border-[#ededf0] px-3 text-left text-sm transition-colors last:border-b-0 hover:bg-[#efefff] focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#4263eb]"
+                  className="flex min-h-11 w-full cursor-pointer items-center gap-3 border-b border-[var(--line)] px-3 text-left text-sm transition-colors last:border-b-0 hover:bg-[var(--surface-selected)] focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#4263eb]"
                 >
                   {entry.directory ? (
-                    <Folder className="size-4 text-[#4263eb]" />
+                    <Folder className="size-4 text-[var(--brand)]" />
                   ) : (
-                    <File className="size-4 text-[#7c8ba5]" />
+                    <File className="size-4 text-[var(--text-secondary)]" />
                   )}
                   <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-                  <span className="font-mono text-[10px] text-[#94a3b8]">
+                  <span className="font-mono text-[10px] text-[var(--text-muted)]">
                     {entry.directory ? "文件夹" : "GBBQ"}
                   </span>
                 </button>
@@ -194,13 +194,13 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
                 value={newFolder}
                 onChange={(event) => setNewFolder(event.target.value)}
                 placeholder="新目录名称"
-                className="h-10 rounded-lg border-[#e2e8f0] bg-white text-sm shadow-none"
+                className="h-10 rounded-lg border-[var(--line)] bg-card text-sm shadow-none"
               />
               <Button
                 type="submit"
                 variant="outline"
                 disabled={!newFolder.trim() || creating || !result || loading || Boolean(error)}
-                className="h-10 rounded-lg border-[#dfe5ef] bg-white shadow-none"
+                className="h-10 rounded-lg border-[var(--line)] bg-card shadow-none"
               >
                 <FolderPlus /> 新建目录
               </Button>
@@ -208,18 +208,18 @@ export function PathBrowser({ kind, initialPath, onOpenChange, onSelect }: PathB
           )}
         </div>
 
-        <SheetFooter className="border-t border-[#e5eaf2] px-6 py-4">
+        <SheetFooter className="border-t border-[var(--line)] px-6 py-4">
           {kind === "folder" ? (
             <Button
               type="button"
               disabled={!result || loading || creating || Boolean(error)}
               onClick={() => result && choose(result.path)}
-              className="h-11 w-full rounded-lg bg-[#4263eb] text-white hover:bg-[#3455da]"
+              className="h-11 w-full rounded-lg bg-[var(--brand-solid)] text-white hover:bg-[#4c60cb]"
             >
               <MapPin /> 使用当前目录
             </Button>
           ) : (
-            <p className="w-full text-center text-xs text-[#7c8ba5]">
+            <p className="w-full text-center text-xs text-[var(--text-secondary)]">
               点击名为 gbbq 的文件即可完成选择
             </p>
           )}

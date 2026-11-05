@@ -353,7 +353,7 @@ export function DownloadForm(props: Props) {
               </p>
             )}
             {options.source === "baostock" && (
-              <label className="mb-4 flex items-center gap-2 text-xs text-slate-500">
+              <label className="mb-4 flex items-center gap-2 text-xs text-muted-foreground">
                 <input
                   type="checkbox"
                   className="size-4 accent-blue-600"
@@ -364,7 +364,7 @@ export function DownloadForm(props: Props) {
               </label>
             )}
             <label htmlFor="gbbq-path" className="form-label mt-4">
-              复权因子文件 <span className="text-slate-400">（可选）</span>
+              复权因子文件 <span className="text-muted-foreground">（可选）</span>
             </label>
             <div className="path-field">
               <input
@@ -418,7 +418,7 @@ export function DownloadForm(props: Props) {
                   : "开始下载"}
           {!busy && <ArrowRight className="size-4" />}
         </button>
-        <p className="mt-3 text-center text-xs text-slate-400">
+        <p className="mt-3 text-center text-xs text-muted-foreground">
           下载开始后，可关闭网页；请保持程序运行。
         </p>
       </div>

@@ -76,20 +76,20 @@ export function PricePreview({
 
   return (
     <Sheet open={Boolean(file)} onOpenChange={onOpenChange}>
-      <SheetContent className="block w-full overflow-y-auto border-[#e5eaf2] bg-[#ffffff] p-0 sm:max-w-4xl">
-        <SheetHeader className="border-b border-[#e5eaf2] px-6 py-6 text-left sm:px-8">
+      <SheetContent className="block w-full overflow-y-auto border-[var(--line)] bg-[var(--surface)] p-0 sm:max-w-4xl">
+        <SheetHeader className="border-b border-[var(--line)] px-6 py-6 text-left sm:px-8">
           <div className="metadata">行情预览</div>
           <SheetTitle className="break-all font-mono text-lg font-medium">
             {file || "行情预览"}
           </SheetTitle>
-          <SheetDescription className="text-sm text-[#7c8ba5]">
+          <SheetDescription className="text-sm text-[var(--text-secondary)]">
             {warehouseDataset
               ? "DuckDB 原始价预览 · 价格单位：元 · 成交量单位：股。复权事件独立存储，不改写原始价格。"
               : "复权结果在读取时实时计算，原始行情 CSV 始终不变。成交量单位：手。"}
           </SheetDescription>
         </SheetHeader>
 
-        <div className="border-b border-[#e5eaf2] px-6 py-5 sm:px-8">
+        <div className="border-b border-[var(--line)] px-6 py-5 sm:px-8">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div
               className="segmented w-full sm:w-80"
@@ -112,7 +112,7 @@ export function PricePreview({
                 </button>
               ))}
             </div>
-            <span className="font-mono text-[10px] text-[#94a3b8]">
+            <span className="font-mono text-[10px] text-[var(--text-muted)]">
               {warehouseDataset
                 ? "仓库预览仅显示原始价"
                 : result?.factorAvailable
@@ -125,7 +125,7 @@ export function PricePreview({
         {error && (
           <div
             role="alert"
-            className="m-6 rounded-lg border border-[#f0cccc] bg-[#fff4f2] px-4 py-3 text-sm text-[#a42323] sm:mx-8"
+            className="m-6 rounded-lg border border-[var(--danger-surface)] bg-[var(--danger-surface)] px-4 py-3 text-sm text-[var(--danger)] sm:mx-8"
           >
             {error}
             <button
@@ -142,14 +142,14 @@ export function PricePreview({
           </div>
         )}
         {loading && (
-          <div className="grid h-64 place-items-center text-sm text-[#7c8ba5]">
+          <div className="grid h-64 place-items-center text-sm text-[var(--text-secondary)]">
             正在读取并实时计算行情…
           </div>
         )}
         {!loading && result && (
           <>
-            <div className="px-6 pt-5 text-xs leading-6 text-slate-400 sm:px-8">
-              <span className="text-slate-600">
+            <div className="px-6 pt-5 text-xs leading-6 text-muted-foreground sm:px-8">
+              <span className="text-foreground">
                 文件实际覆盖：{result.from} → {result.to}
               </span>
               <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
@@ -160,7 +160,7 @@ export function PricePreview({
                   查看范围
                   <select
                     aria-label="预览记录范围"
-                    className="rounded-md border border-slate-200 bg-white p-1.5 text-xs"
+                    className="rounded-md border border-border bg-card p-1.5 text-xs"
                     value={limit}
                     onChange={(event) => {
                       setLoading(true)
@@ -182,17 +182,17 @@ export function PricePreview({
               {result.bars.length ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={result.bars} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
-                    <CartesianGrid stroke="#dedee5" strokeDasharray="3 5" vertical={false} />
+                    <CartesianGrid stroke="var(--line)" strokeDasharray="3 5" vertical={false} />
                     <XAxis
                       dataKey="date"
-                      tick={{ fill: "#94a3b8", fontSize: 10 }}
+                      tick={{ fill: "var(--text-muted)", fontSize: 10 }}
                       axisLine={false}
                       tickLine={false}
                       minTickGap={48}
                     />
                     <YAxis
                       domain={["auto", "auto"]}
-                      tick={{ fill: "#94a3b8", fontSize: 10, fontFamily: "monospace" }}
+                      tick={{ fill: "var(--text-muted)", fontSize: 10, fontFamily: "monospace" }}
                       axisLine={false}
                       tickLine={false}
                       width={58}
@@ -201,35 +201,36 @@ export function PricePreview({
                     <Tooltip
                       formatter={(value) => [formatPrice(Number(value)), "收盘价"]}
                       contentStyle={{
-                        border: "1px solid #e2e8f0",
-                        borderRadius: 0,
-                        background: "#ffffff",
+                        border: "1px solid var(--line-strong)",
+                        borderRadius: 10,
+                        background: "var(--surface-raised)",
+                        color: "var(--text)",
                         fontSize: 12
                       }}
                     />
                     <Area
                       type="monotone"
                       dataKey="close"
-                      stroke="#4263eb"
-                      fill="#4263eb"
-                      fillOpacity={0.08}
+                      stroke="var(--brand)"
+                      fill="var(--brand)"
+                      fillOpacity={0.14}
                       strokeWidth={1.5}
                       isAnimationActive={false}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
-                <div className="grid h-full place-items-center text-sm text-[#94a3b8]">
+                <div className="grid h-full place-items-center text-sm text-[var(--text-muted)]">
                   文件中没有 K 线数据
                 </div>
               )}
             </div>
             <div className="px-6 pb-8 sm:px-8">
-              <div className="mb-3 flex justify-between font-mono text-[10px] text-[#94a3b8]">
+              <div className="mb-3 flex justify-between font-mono text-[10px] text-[var(--text-muted)]">
                 <span>最近 15 根 / 共 {result.total} 根</span>
                 <span>{mode.toUpperCase()}</span>
               </div>
-              <div className="overflow-x-auto bg-white">
+              <div className="overflow-x-auto bg-card">
                 <table className="data-table">
                   <thead>
                     <tr>

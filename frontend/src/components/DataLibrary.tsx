@@ -134,7 +134,7 @@ export function DataLibrary({ outputDir, active, onTaskStarted }: Props) {
         </div>
       )}
       {loading && !status ? (
-        <div className="monitor-panel grid min-h-48 place-items-center text-sm text-slate-400">
+        <div className="monitor-panel grid min-h-48 place-items-center text-sm text-muted-foreground">
           <span className="flex items-center gap-2">
             <LoaderCircle className="size-4 animate-spin" />
             正在打开本地 DuckDB…
@@ -196,10 +196,10 @@ export function DataLibrary({ outputDir, active, onTaskStarted }: Props) {
       <section className="monitor-panel library-jobs">
         <div className="panel-topline">
           <div className="flex items-center gap-2">
-            <History className="size-4 text-slate-400" />
+            <History className="size-4 text-muted-foreground" />
             <h2>可恢复的任务记录</h2>
           </div>
-          <span className="text-xs text-slate-400">最近 50 次</span>
+          <span className="text-xs text-muted-foreground">最近 50 次</span>
         </div>
         {!jobs.length ? (
           <p className="library-empty">还没有任务。首次采集后会自动记录持久断点。</p>
@@ -350,8 +350,8 @@ function DatasetBrowser({ revision }: { revision: number }) {
               result?.items.map((item) => (
                 <tr key={`${item.exchange}${item.code}-${item.period}`}>
                   <td>
-                    <strong className="text-slate-600">{item.name || item.code}</strong>
-                    <span className="ml-2 text-[10px] text-slate-400">
+                    <strong className="text-foreground">{item.name || item.code}</strong>
+                    <span className="ml-2 text-[10px] text-muted-foreground">
                       {item.exchange} {item.code}
                     </span>
                   </td>
@@ -587,7 +587,7 @@ function ReferenceData({ disabled, onComplete }: { disabled: boolean; onComplete
           </button>
         </div>
         {message && (
-          <p role="status" className="mt-3 break-words text-xs text-slate-500">
+          <p role="status" className="mt-3 break-words text-xs text-muted-foreground">
             {message}
           </p>
         )}

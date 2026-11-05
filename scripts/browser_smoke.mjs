@@ -149,7 +149,7 @@ try {
     "状态连接"
   )
   await waitFor(
-    `getComputedStyle(document.querySelector('.connection-status')).color === 'rgb(49, 129, 105)'`,
+    `document.querySelector('.connection-status')?.dataset.connected === 'true'`,
     "服务在线状态颜色"
   )
   const appearance = await evaluate(`({
@@ -159,8 +159,31 @@ try {
   })`)
   if (appearance.selectedMarkets.filter((item) => item.selected).length !== 3)
     throw new Error(`默认市场未正确选中：${JSON.stringify(appearance)}`)
-  if (appearance.selectedMarkets.filter((item) => item.color === "rgb(243, 246, 255)").length !== 3)
+  const theme = await evaluate(`(() => {
+    const token = (name) => {
+      const probe = document.createElement('span')
+      probe.style.color = 'var(' + name + ')'
+      document.body.append(probe)
+      const value = getComputedStyle(probe).color
+      probe.remove()
+      return value
+    }
+    const dark = (value) => {
+      const rgb = value.match(/[0-9.]+/g)?.slice(0,3).map(Number) || []
+      return rgb.length === 3 && Math.max(...rgb) < 80
+    }
+    return {
+      dark: document.documentElement.classList.contains('dark') && getComputedStyle(document.documentElement).colorScheme === 'dark',
+      canvas: dark(getComputedStyle(document.querySelector('.app-shell')).backgroundColor),
+      panel: dark(getComputedStyle(document.querySelector('.setup-panel')).backgroundColor),
+      selected: token('--surface-selected'),
+      online: token('--positive')
+    }
+  })()`)
+  if (!theme.dark || !theme.canvas || !theme.panel) throw new Error('页面未完整应用暗色主题：' + JSON.stringify(theme))
+  if (appearance.selectedMarkets.some((item) => item.color !== theme.selected))
     throw new Error(`选中市场缺少视觉反馈：${JSON.stringify(appearance)}`)
+  if (appearance.serviceColor !== theme.online) throw new Error('服务状态缺少清晰颜色反馈')
   console.log(JSON.stringify({ appearance }))
   await screenshot("desktop.png")
   const controls =
@@ -438,6 +461,7 @@ try {
 
   const summary = {
     reactRender: true,
+    darkTheme: true,
     pathBrowser: true,
     scopeSwitch: true,
     formValidation: true,
