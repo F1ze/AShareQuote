@@ -68,7 +68,7 @@ type FactorRepository interface {
 	SaveProviderFactors(context.Context, string, domain.Security, []domain.PriceFactor) error
 }
 
-// LineProvider 提供通过业务验证的线路；服务不依赖内置配置或 TCP 探测实现。
+// LineProvider 提供通过 TCP 连通性检测的线路；服务不依赖内置配置或 TCP 探测实现。
 type LineProvider interface {
 	Available(context.Context, time.Duration) ([]domain.Host, domain.LineReport, error)
 }

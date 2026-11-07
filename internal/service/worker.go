@@ -9,7 +9,8 @@ import (
 	"quotes/internal/domain"
 )
 
-// worker 独占一个协议客户端，串行处理分配给自己的证券；不同 worker 才并发。
+// worker 是有界协程池中的一个执行者；整个任务同时运行最多 options.Workers 个 worker。
+// 每个 worker 独占客户端并串行处理自己的证券，多个 worker 并行拉取不同证券。
 // 当前客户端按顺序收发报文，未实现并发应答分发；共享同一 TCP 连接会混淆请求与应答。
 func (t *jobRun) worker(offset int, jobs <-chan Security) {
 	// worker 生命周期只创建一个独占客户端，逐证券流程如下：

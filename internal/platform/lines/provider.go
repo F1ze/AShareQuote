@@ -1,9 +1,10 @@
-// Package lines 从内置站点配置生成并验证可用行情线路，端口可连接不等于业务可用。
+// Package lines 从内置配置生成候选线路，仅检查 TCP 连通性，不发送行情协议数据。
 package lines
 
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +14,7 @@ import (
 	"quotes/internal/platform/sitecfg"
 )
 
-// Provider 返回通过业务验证、按耗时排序的线路，任务层无需了解配置来源与探测实现。
+// Provider 返回 TCP 建连成功、按耗时排序的线路，任务层无需了解配置来源与探测实现。
 type Provider interface {
 	Available(ctx context.Context, timeout time.Duration) ([]domain.Host, Report, error)
 }
@@ -27,34 +28,32 @@ func (f ProviderFunc) Available(ctx context.Context, timeout time.Duration) ([]d
 type HostStatus = domain.HostStatus
 type Report = domain.LineReport
 
-// SmokeClient 是线路自检所需的最小协议接口，不包含完整的行情下载能力。
-type SmokeClient interface {
-	Close()
-	SecurityCount(market uint8) (int, error)
-	TransactionData(market uint8, code string, start, count int) ([]domain.Transaction, error)
-}
+// DialFunc 注入应用统一拨号器；探测只调用 Dial/Close，不执行读写或行情握手。
+type DialFunc func(context.Context, string, string) (net.Conn, error)
 
-type SmokeFactory func(host domain.Host, timeout time.Duration) SmokeClient
+// RequestGate 可选地等待共享连接预算；等待阶段不占用 TCP 建连超时。
+type RequestGate func(context.Context, domain.Host) error
 
 type BuiltinProvider struct {
-	spec    func() sitecfg.Spec // 每次探测生成新的配置输入，避免在多次自检间共享可变配置。
-	factory SmokeFactory        // 为每条待探测线路构造独占客户端，完成后由探测协程关闭。
+	spec func() sitecfg.Spec // 每次探测生成新的配置输入，避免在多次自检间共享可变配置。
+	dial DialFunc            // 统一直连/代理拨号器，不构造通达信协议客户端。
+	gate RequestGate         // 与下载共享的连接频率预算，测试可为空。
 }
 
-func NewBuiltin(factory SmokeFactory) *BuiltinProvider {
-	return NewBuiltinWithSpec(sitecfg.SeedSpec, factory)
+func NewBuiltin(dial DialFunc, gate RequestGate) *BuiltinProvider {
+	return NewBuiltinWithSpec(sitecfg.SeedSpec, dial, gate)
 }
 
-func NewBuiltinWithSpec(spec func() sitecfg.Spec, factory SmokeFactory) *BuiltinProvider {
-	return &BuiltinProvider{spec: spec, factory: factory}
+func NewBuiltinWithSpec(spec func() sitecfg.Spec, dial DialFunc, gate RequestGate) *BuiltinProvider {
+	return &BuiltinProvider{spec: spec, dial: dial, gate: gate}
 }
 
-// Available 依次完成默认配置生成、回读校验和真实业务探测；connect.cfg 仅在内存中流转。
-// 只有同时取到上海码表和样本逐笔记录才算可用，不能仅以 TCP 建连成功为依据。
+// Available 依次完成默认配置生成、回读校验和 TCP 连通性探测；connect.cfg 仅在内存中流转。
+// TCP 建连成功且上下文未取消即算通过；行情握手和业务验证留给真正下载阶段。
 func (p *BuiltinProvider) Available(ctx context.Context, timeout time.Duration) ([]domain.Host, Report, error) {
 	// 第 1 步：构建并回读配置，提取 HQHOST/TRYHQHOST 去重线路，最多安排前 24 条自检。
-	report := Report{Source: "builtin"}
-	if p == nil || p.spec == nil || p.factory == nil {
+	report := Report{Probe: "tcp", Source: "builtin", CheckedAt: time.Now().UTC()}
+	if p == nil || p.spec == nil || p.dial == nil {
 		return nil, report, fmt.Errorf("内置线路提供器未正确初始化")
 	}
 	raw, config, err := sitecfg.Build(p.spec())
@@ -73,13 +72,13 @@ func (p *BuiltinProvider) Available(ctx context.Context, timeout time.Duration) 
 		hosts = hosts[:24]
 	}
 	report.Tested = len(hosts)
-	// 第 2 步：有界并发执行业务探测，probe 等待全部结果并按可用性、总耗时排序。
-	report.Results = probe(ctx, hosts, timeout, p.factory)
+	// 第 2 步：有界并发执行 TCP 探测，probe 等待全部结果并按可用性、总耗时排序。
+	report.Results = probe(ctx, hosts, timeout, p.dial, p.gate)
 	byAddress := make(map[string]domain.Host, len(hosts))
 	for _, host := range hosts {
 		byAddress[host.Address()] = host
 	}
-	// 第 3 步：只将通过业务校验的 Host 返回给任务；全部失败时给出有限个诊断，不能继续盲下。
+	// 第 3 步：只将 TCP 连通的 Host 返回给任务；全部失败时给出有限个诊断，不能继续盲下。
 	ordered := make([]domain.Host, 0, len(hosts))
 	for _, status := range report.Results {
 		if status.OK {
@@ -97,7 +96,7 @@ func (p *BuiltinProvider) Available(ctx context.Context, timeout time.Duration) 
 				break
 			}
 		}
-		return nil, report, fmt.Errorf("全部内置线路业务自检失败（码表 + 600000 逐笔）：%s", strings.Join(details, "；"))
+		return nil, report, fmt.Errorf("全部内置线路 TCP 连接失败：%s", strings.Join(details, "；"))
 	}
 	return ordered, report, nil
 }
@@ -110,7 +109,7 @@ func quoteHosts(config sitecfg.Result) []domain.Host {
 			if host.Section != section || host.IP == "" || host.Port < 1 || host.Port > 65535 {
 				continue
 			}
-			item := domain.Host{IP: host.IP, Port: host.Port, Weight: host.Weight}
+			item := domain.Host{Name: host.Name, IP: host.IP, Port: host.Port, Weight: host.Weight}
 			if !seen[item.Address()] {
 				seen[item.Address()] = true
 				hosts = append(hosts, item)
@@ -120,55 +119,59 @@ func quoteHosts(config sitecfg.Result) []domain.Host {
 	return hosts
 }
 
-func probe(ctx context.Context, hosts []domain.Host, timeout time.Duration, factory SmokeFactory) []HostStatus {
-	// 每条线路的处理流程：等并发名额 → 独占客户端 → 上海码表 → 样本逐笔 → 关闭连接 → 发布结果。
+func probe(ctx context.Context, hosts []domain.Host, timeout time.Duration, dial DialFunc, gate RequestGate) []HostStatus {
+	// 每个地址只拨号一次，不重试、不握手、不读写；限流等待在建立连接之前完成。
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
 	results := make([]HostStatus, len(hosts))
-	// 最多同时探测 8 条线路；各协程只写自己的结果槽位，全部结束后才统一排序。
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for i, host := range hosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			status := HostStatus{Name: host.Name, Address: host.Address()}
+			defer func() { results[i] = status }()
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[i] = HostStatus{Address: host.Address(), Error: "检测已取消"}
+				status.Error = ctx.Err().Error()
 				return
 			}
-			started := time.Now()
-			status := HostStatus{Address: host.Address()}
-			client := factory(host, timeout)
-			if client == nil {
-				status.Error = "行情客户端未初始化"
-			} else {
-				if contextual, ok := client.(interface{ SetContext(context.Context) }); ok {
-					contextual.SetContext(ctx)
-				}
-				count, err := client.SecurityCount(1)
-				if err == nil && count < 1 {
-					err = fmt.Errorf("上海码表数量为空")
-				}
-				status.Securities = count
-				var ticks []domain.Transaction
-				if err == nil {
-					ticks, err = client.TransactionData(1, "600000", 0, 5)
-				}
-				if err == nil && len(ticks) == 0 {
-					err = fmt.Errorf("600000 逐笔数据为空")
-				}
-				status.Ticks = len(ticks)
-				status.OK = err == nil && ctx.Err() == nil
-				if err != nil {
+			if gate != nil {
+				if err := gate(ctx, host); err != nil {
 					status.Error = err.Error()
+					return
 				}
-				client.Close()
 			}
+			if err := ctx.Err(); err != nil {
+				status.Error = err.Error()
+				return
+			}
+			// 计时只覆盖实际 TCP/代理隧道建立过程，不包含排队和限流等待。
+			dialCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			started := time.Now()
+			conn, err := dial(dialCtx, "tcp", host.Address())
 			status.Latency = time.Since(started).Milliseconds()
-			results[i] = status
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err == nil && conn == nil {
+				err = fmt.Errorf("TCP 拨号未返回连接")
+			}
+			if err == nil {
+				err = dialCtx.Err()
+			}
+			status.OK = err == nil
+			if err != nil {
+				status.Error = err.Error()
+			}
 		}()
 	}
+
 	wg.Wait()
 	sort.SliceStable(results, func(i, j int) bool {
 		if results[i].OK != results[j].OK {

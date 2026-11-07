@@ -79,6 +79,8 @@ try:
 
     defaults = read_json("/api/defaults")
     assert defaults["workers"] == 12
+    assert defaults["requestRate"] == 40
+    assert defaults["hostRequestRate"] == 8
     assert defaults["count"] == 800
     assert defaults["markets"] == [0, 1, 2]
     assert read_json("/api/task") is None

@@ -229,7 +229,10 @@ class TdxConnection:
 
     def connect(self):
         last = None
-        for host, port in self.load_hosts():
+        import random, copy
+        hosts = copy.deepcopy(self.load_hosts())
+        random.shuffle(hosts)
+        for host, port in hosts:
             try:
                 s = socket.create_connection((host, port), timeout=self.timeout)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -237,6 +240,7 @@ class TdxConnection:
                 if getattr(self, "handshake", True):
                     self._handshake()
                 self.host, self.port = host, port
+                print(f'Use host-{self.host}:{self.port}')
                 return host, port
             except Exception as exc:                        # noqa: BLE001
                 last = exc
@@ -246,6 +250,7 @@ class TdxConnection:
                 except Exception:                           # noqa: BLE001
                     pass
                 self.sock = None
+                print(f'Skip host-{host}:{port}')
         raise TdxError("全部主机连接失败: %r" % (last,))
 
     def _close(self):

@@ -24,6 +24,7 @@ func (m *JobService) Restore() error {
 			s.EndedAt = &now
 		}
 		m.current = &jobRun{id: s.ID, state: s.State, total: s.Total, done: s.Done, success: s.Succeeded, failed: s.Failed, bars: s.Bars, pages: s.Pages, warnings: s.Warnings, skipped: s.Skipped, message: s.Message, output: s.OutputDir, options: s.Options, started: s.StartedAt, ended: s.EndedAt, recent: s.Recent, logs: s.Logs}
+		m.current.lineReport = s.LineReport
 	}
 	return nil
 }

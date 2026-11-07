@@ -56,6 +56,9 @@ func run() error {
 	fullSync := flag.Bool("full", false, "批处理重新扫描整个请求区间，用于历史修订和补洞")
 	syncSource := flag.String("source", "tdx", "批处理数据源：tdx 或 baostock（仅沪深，含源提供的退市证券）")
 	collectFactors := flag.Bool("factors", true, "BaoStock 采集时同步独立复权因子表")
+	workers := flag.Int("workers", 12, "通达信最大并发证券数，1–64")
+	requestRate := flag.Int("request-rate", domain.DefaultRequestRate, "通达信全局请求启动频率，次/秒，1–200")
+	hostRequestRate := flag.Int("host-request-rate", domain.DefaultHostRequestRate, "通达信单站请求启动频率，次/秒，不超过全局频率")
 	proxyURL := flag.String("proxy", "", "出站代理（socks5/socks5h/http/https 地址）；留空使用已保存设置或环境变量")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -112,14 +115,12 @@ func run() error {
 	}
 
 	// 第 3 步：组装通达信线路/客户端、原始归档、DuckDB 和可扩展来源，恢复已有任务日志。
-	// 线路探测客户端仅验证一个端点；任务客户端接收可用线路列表，失败时可自行轮换。
-	provider := lines.NewBuiltin(func(host domain.Host, timeout time.Duration) lines.SmokeClient {
-		client := tdx.NewClient([]domain.Host{host}, timeout, 0)
-		client.SetDialer(dialer.DialContext)
-		return client
-	})
+	// 线路探测仅建立并关闭 TCP 连接，不发送行情数据；任务客户端接收可用线路列表，失败时可自行轮换。
+	traffic := tdx.NewTrafficController(domain.DefaultRequestRate, domain.DefaultHostRequestRate)
+	provider := lines.NewBuiltin(dialer.DialContext, traffic.Wait)
 	factory := func(hosts []domain.Host, timeout time.Duration, offset int) service.Client {
 		client := tdx.NewClient(hosts, timeout, offset)
+		client.SetTrafficController(traffic)
 		client.SetDialer(dialer.DialContext)
 		return client
 	}
@@ -139,7 +140,8 @@ func run() error {
 		return err
 	}
 	manager, err := service.NewJobService(service.JobDependencies{
-		DefaultOutput: absoluteOr(*outputDir, "downloads"), Lines: provider, NewClient: factory,
+		ConfigureTraffic: traffic.Configure,
+		DefaultOutput:    absoluteOr(*outputDir, "downloads"), Lines: provider, NewClient: factory,
 		Archives: func(output string) service.Archive { return &repository.CSVArchive{Directory: output} },
 		Factors:  repository.FileFactors{}, Jobs: jobs, Warehouse: warehouse, Local: historyfile.New(),
 	})
@@ -175,7 +177,7 @@ func run() error {
 		if *syncSource == "baostock" {
 			markets = []int{0, 1}
 		}
-		return runSync(ctx, manager, domain.DownloadOptions{Markets: markets, Codes: *syncCodes, Category: *syncCategory, StartDate: *syncFrom, EndDate: *syncTo, ASharesOnly: true, Incremental: !*fullSync, Storage: "duckdb", Source: *syncSource, CollectFactors: *collectFactors && *syncSource == "baostock", OutputDir: manager.DefaultOutput()}, *resumeID)
+		return runSync(ctx, manager, domain.DownloadOptions{Workers: *workers, RequestRate: *requestRate, HostRequestRate: *hostRequestRate, Markets: markets, Codes: *syncCodes, Category: *syncCategory, StartDate: *syncFrom, EndDate: *syncTo, ASharesOnly: true, Incremental: !*fullSync, Storage: "duckdb", Source: *syncSource, CollectFactors: *collectFactors && *syncSource == "baostock", OutputDir: manager.DefaultOutput()}, *resumeID)
 	}
 	// 第 4 步：网页模式先实际绑定 API 端口，再启动前端，避免端口冲突时留下无用 Vite 进程。
 	frontendURL := localURL(*host, *port)
@@ -226,7 +228,7 @@ func run() error {
 
 	fmt.Printf("QFLUX 前端：%s\n", frontendURL)
 	fmt.Printf("Echo API：%s/api\n", apiURL)
-	fmt.Printf("线路配置：内置模板，自动回读与业务自检\n")
+	fmt.Printf("线路配置：内置模板，自动回读与 TCP 连通性检测\n")
 	if current := proxySettings.Current().URL; current != "" {
 		fmt.Printf("出站代理：%s\n", current)
 	} else {

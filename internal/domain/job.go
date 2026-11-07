@@ -5,24 +5,26 @@ import "time"
 // DownloadOptions 是任务的固定配置。日期模式优先于旧版 Start/Count 偏移模式。
 // Markets 使用 []int，避免 []uint8 被 JSON 编码成 Base64 字符串而破坏前后端约定。
 type DownloadOptions struct {
-	Markets        []int  `json:"markets"`        // 批量市场：0=深圳、1=上海、2=北京；手填 Codes 时以代码清单为准。
-	Codes          string `json:"codes"`          // 可选证券清单，如 sh600000,sz000001；非空时不再下载整张市场码表。
-	Category       int    `json:"category"`       // 协议周期编号，如 9=日线、7=1分钟、0=5分钟；完整映射见 domain.categoryNames。
-	Start          int    `json:"start"`          // 旧版偏移模式：跳过最近多少根 K 线，0 为最新；日期模式会重置为 0。
-	Count          int    `json:"count"`          // 旧版偏移模式的任务总条数，默认 800；日期模式不以它限制总条数。
-	StartDate      string `json:"startDate"`      // 日期模式起点，YYYY-MM-DD，北京时间，包含当天；增量模式也必须提供。
-	EndDate        string `json:"endDate"`        // 日期模式终点，YYYY-MM-DD，包含当天全部分钟；不得晚于北京时间今天。
-	Workers        int    `json:"workers"`        // 通达信并发 worker 数，0 使用默认 12，允许 1–64；SDK 来源不按此值并发。
-	Timeout        int    `json:"timeout"`        // 通达信拨号/读写超时秒数，0 使用默认 8，允许 2–60；不是整项任务总时限。
-	OutputDir      string `json:"outputDir"`      // 原始 CSV 和因子附件的目录；空值用 JobService 默认目录，启动时转绝对路径。
-	GBBQPath       string `json:"gbbqPath"`       // 可选通达信 gbbq 文件路径；显式指定却无法读取时任务失败。
-	ASharesOnly    bool   `json:"aSharesOnly"`    // 通达信批量筛选 A 股；手填清单中的非 A 股会被拒绝，历史源/本地导入本身也筛 A 股。
-	Incremental    bool   `json:"incremental"`    // 从已有归档最新日回看 7 个自然日重取，合并时保留更早历史；不自动补齐远期空洞。
-	Storage        string `json:"storage"`        // duckdb=归档后入库；csv 或空值=仅归档，数据库是 CSV 之外的附加存储。
-	ImportDir      string `json:"importDir"`      // 非空时走本地历史导入流程；空值时从网络来源采集。
-	CSVVolumeUnit  string `json:"csvVolumeUnit"`  // 外部 CSV 的成交量单位：shares=股、lots=手；本地导入必须显式选择，不猜单位。
-	Source         string `json:"source"`         // 网络来源注册键，空值为 tdx；例如 baostock，其支持范围由 SourceSpec 声明。
-	CollectFactors bool   `json:"collectFactors"` // 历史源采集时同步独立比例因子；要求来源实现 Factors，可选仓库实现 StoreFactors。
+	Markets         []int  `json:"markets"`         // 批量市场：0=深圳、1=上海、2=北京；手填 Codes 时以代码清单为准。
+	Codes           string `json:"codes"`           // 可选证券清单，如 sh600000,sz000001；非空时不再下载整张市场码表。
+	Category        int    `json:"category"`        // 协议周期编号，如 9=日线、7=1分钟、0=5分钟；完整映射见 domain.categoryNames。
+	Start           int    `json:"start"`           // 旧版偏移模式：跳过最近多少根 K 线，0 为最新；日期模式会重置为 0。
+	Count           int    `json:"count"`           // 旧版偏移模式的任务总条数，默认 800；日期模式不以它限制总条数。
+	StartDate       string `json:"startDate"`       // 日期模式起点，YYYY-MM-DD，北京时间，包含当天；增量模式也必须提供。
+	EndDate         string `json:"endDate"`         // 日期模式终点，YYYY-MM-DD，包含当天全部分钟；不得晚于北京时间今天。
+	Workers         int    `json:"workers"`         // 通达信并发 worker 数，0 使用默认 12，允许 1–64；SDK 来源不按此值并发。
+	RequestRate     int    `json:"requestRate"`     // 所有通达信连接共享的每秒请求启动上限，0 默认 40，允许 1–200。
+	HostRequestRate int    `json:"hostRequestRate"` // 同站点连接共享的每秒请求启动上限，0 默认 8，不得超过全局上限。
+	Timeout         int    `json:"timeout"`         // 通达信拨号/读写超时秒数，0 使用默认 8，允许 2–60；不是整项任务总时限。
+	OutputDir       string `json:"outputDir"`       // 原始 CSV 和因子附件的目录；空值用 JobService 默认目录，启动时转绝对路径。
+	GBBQPath        string `json:"gbbqPath"`        // 可选通达信 gbbq 文件路径；显式指定却无法读取时任务失败。
+	ASharesOnly     bool   `json:"aSharesOnly"`     // 通达信批量筛选 A 股；手填清单中的非 A 股会被拒绝，历史源/本地导入本身也筛 A 股。
+	Incremental     bool   `json:"incremental"`     // 从已有归档最新日回看 7 个自然日重取，合并时保留更早历史；不自动补齐远期空洞。
+	Storage         string `json:"storage"`         // duckdb=归档后入库；csv 或空值=仅归档，数据库是 CSV 之外的附加存储。
+	ImportDir       string `json:"importDir"`       // 非空时走本地历史导入流程；空值时从网络来源采集。
+	CSVVolumeUnit   string `json:"csvVolumeUnit"`   // 外部 CSV 的成交量单位：shares=股、lots=手；本地导入必须显式选择，不猜单位。
+	Source          string `json:"source"`          // 网络来源注册键，空值为 tdx；例如 baostock，其支持范围由 SourceSpec 声明。
+	CollectFactors  bool   `json:"collectFactors"`  // 历史源采集时同步独立比例因子；要求来源实现 Factors，可选仓库实现 StoreFactors。
 }
 
 type LogEntry struct {
@@ -49,26 +51,27 @@ type FileResult struct {
 // TaskSnapshot 是供 HTTP、SSE 和日志使用的状态副本。
 // Done 包含成功与失败，Bars 统计本次成功处理的读取量，Skipped 统计复用的有效断点。
 type TaskSnapshot struct {
-	ID        string          `json:"id"`                // 本次执行编号 YYYYMMDD-HHMMSS.纳秒；恢复会新建编号，不覆盖原任务日志。
-	State     string          `json:"state"`             // 状态及合法迁移见领域任务状态及 service/job_run.go 的说明；interrupted 表示进程重启后的中断任务。
-	Total     int             `json:"total"`             // 计划处理项数：网络任务按证券计，本地任务按输入文件计，准备阶段可能为 0。
-	Done      int             `json:"done"`              // 已记录结果的项数=Succeeded+Failed；取消中的未完成项不计入。
-	Succeeded int             `json:"succeeded"`         // 处理成功项数，包含复用有效断点的项；不是新增证券数。
-	Failed    int             `json:"failed"`            // 读取、归档、入库或断点记录失败的项数。
-	Bars      int64           `json:"bars"`              // 成功项本次读取并保留的行情量；恢复复用计 0，重叠刷新也计入，不等于新增入库行数。
-	Pages     int64           `json:"pages"`             // 通达信成功请求页数（含空页）；历史源按逐证券处理尝试计数（含失败），并非 SDK 实际页数；本地不增加。
-	Warnings  int             `json:"warnings"`          // 带非空 Warning 的成功项数，不是提示文本条数，提示不代表该项保存失败。
-	Skipped   int             `json:"skipped"`           // 校验通过且成功复用断点的项数，已包含在 Succeeded 中。
-	Percent   float64         `json:"percent"`           // Done/Total*100，单位百分比；100 仅代表处理结束，不代表历史完整。
-	Speed     float64         `json:"speed"`             // Done/Elapsed，单位项/秒；按证券或文件计，不是网络下载字节速度。
-	Elapsed   float64         `json:"elapsed"`           // 自任务创建起的秒数，含准备阶段；有 EndedAt 后停止增长。
-	Message   string          `json:"message"`           // 当前阶段或最终结果的中文说明。
-	OutputDir string          `json:"outputDir"`         // 当前任务原始归档目录的绝对路径，与数据库所在 data-dir 不同。
-	StartedAt time.Time       `json:"startedAt"`         // 任务创建时刻，JSON 携带时区；不是第一根行情日期。
-	EndedAt   *time.Time      `json:"endedAt,omitempty"` // 终态时间；运行时为 nil，重启识别的中断任务可能显示恢复观察时刻。
-	Options   DownloadOptions `json:"options"`           // 默认值已补齐的固定选项，作为日志和后续恢复的输入。
-	Recent    []FileResult    `json:"recent"`            // 最近至多 10 个成功文件，新结果在前；不是任务的完整文件清单。
-	Logs      []LogEntry      `json:"logs"`              // 最近至多 120 条内存业务日志，按写入顺序排列；不是持久断点事件流。
+	LineReport *LineReport     `json:"lineReport,omitempty"` // 本任务实际执行的线路自检报告；离线/其他来源及旧日志可为空。
+	ID         string          `json:"id"`                   // 本次执行编号 YYYYMMDD-HHMMSS.纳秒；恢复会新建编号，不覆盖原任务日志。
+	State      string          `json:"state"`                // 状态及合法迁移见领域任务状态及 service/job_run.go 的说明；interrupted 表示进程重启后的中断任务。
+	Total      int             `json:"total"`                // 计划处理项数：网络任务按证券计，本地任务按输入文件计，准备阶段可能为 0。
+	Done       int             `json:"done"`                 // 已记录结果的项数=Succeeded+Failed；取消中的未完成项不计入。
+	Succeeded  int             `json:"succeeded"`            // 处理成功项数，包含复用有效断点的项；不是新增证券数。
+	Failed     int             `json:"failed"`               // 读取、归档、入库或断点记录失败的项数。
+	Bars       int64           `json:"bars"`                 // 成功项本次读取并保留的行情量；恢复复用计 0，重叠刷新也计入，不等于新增入库行数。
+	Pages      int64           `json:"pages"`                // 通达信成功请求页数（含空页）；历史源按逐证券处理尝试计数（含失败），并非 SDK 实际页数；本地不增加。
+	Warnings   int             `json:"warnings"`             // 带非空 Warning 的成功项数，不是提示文本条数，提示不代表该项保存失败。
+	Skipped    int             `json:"skipped"`              // 校验通过且成功复用断点的项数，已包含在 Succeeded 中。
+	Percent    float64         `json:"percent"`              // Done/Total*100，单位百分比；100 仅代表处理结束，不代表历史完整。
+	Speed      float64         `json:"speed"`                // Done/Elapsed，单位项/秒；按证券或文件计，不是网络下载字节速度。
+	Elapsed    float64         `json:"elapsed"`              // 自任务创建起的秒数，含准备阶段；有 EndedAt 后停止增长。
+	Message    string          `json:"message"`              // 当前阶段或最终结果的中文说明。
+	OutputDir  string          `json:"outputDir"`            // 当前任务原始归档目录的绝对路径，与数据库所在 data-dir 不同。
+	StartedAt  time.Time       `json:"startedAt"`            // 任务创建时刻，JSON 携带时区；不是第一根行情日期。
+	EndedAt    *time.Time      `json:"endedAt,omitempty"`    // 终态时间；运行时为 nil，重启识别的中断任务可能显示恢复观察时刻。
+	Options    DownloadOptions `json:"options"`              // 默认值已补齐的固定选项，作为日志和后续恢复的输入。
+	Recent     []FileResult    `json:"recent"`               // 最近至多 10 个成功文件，新结果在前；不是任务的完整文件清单。
+	Logs       []LogEntry      `json:"logs"`                 // 最近至多 120 条内存业务日志，按写入顺序排列；不是持久断点事件流。
 }
 
 // Checkpoint 记录一组已经保存成功的资源；恢复资格取决于内容哈希，不只看文件是否存在。

@@ -226,8 +226,13 @@ func (d *DuckDB) Bars(ctx context.Context, q domain.BarQuery) ([]domain.Warehous
 		// 仅取最新的有限窗口再反转，显式 CAST 保证 ORM 扫描及 JSON 序列化都不经过 float64。
 		columns := "ts::VARCHAR AS time,open::VARCHAR AS open,high::VARCHAR AS high," +
 			"low::VARCHAR AS low,close::VARCHAR AS close,volume_shares,amount_cny::VARCHAR AS amount_cny,source"
-		err := tx.Model(&barRecord{}).Select(columns).Where(&barRecord{Exchange: q.Exchange, Code: q.Code, Period: q.Period}).
-			Where("ts>=?::TIMESTAMP AND ts<?::TIMESTAMP", q.From, q.Until).Order("ts DESC").Limit(q.Limit).Scan(&result).Error
+		// 使用排他时间游标向历史分页，避免深 OFFSET 扫描及分页边界重复。
+		query := tx.Model(&barRecord{}).Select(columns).Where(&barRecord{Exchange: q.Exchange, Code: q.Code, Period: q.Period}).
+			Where("ts>=?::TIMESTAMP AND ts<?::TIMESTAMP", q.From, q.Until)
+		if q.Before != "" {
+			query = query.Where("ts<?::TIMESTAMP", q.Before)
+		}
+		err := query.Order("ts DESC").Limit(q.Limit).Scan(&result).Error
 		slices.Reverse(result)
 		return result, err
 	})

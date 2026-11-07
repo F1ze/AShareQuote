@@ -14,7 +14,7 @@ func (a *CSVArchive) ReadBars(ctx context.Context, name string) ([]domain.Bar, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	bars, err := ReadBarsCSV(filepath.Join(a.Directory, name))
+	bars, err := ReadBarsCSVContext(ctx, filepath.Join(a.Directory, name))
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("%w：读取行情预览：%v", domain.ErrNotFound, err)
 	}

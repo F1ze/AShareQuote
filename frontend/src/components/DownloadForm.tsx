@@ -350,6 +350,23 @@ export function DownloadForm(props: Props) {
                   max={60}
                   onChange={(value) => update("timeout", value)}
                 />
+                <NumberField
+                  id="request-rate"
+                  label="全局请求频率（次/秒）"
+                  value={options.requestRate ?? 40}
+                  min={1}
+                  max={200}
+                  onChange={(value) => props.onOptionsChange({ ...options, requestRate: value, hostRequestRate: Math.min(options.hostRequestRate ?? 8, value) })}
+                />
+                <NumberField
+                  id="host-request-rate"
+                  label="单站请求频率（次/秒）"
+                  value={options.hostRequestRate ?? 8}
+                  min={1}
+                  max={options.requestRate ?? 40}
+                  onChange={(value) => update("hostRequestRate", value)}
+                />
+                <p className="help-text col-span-full m-0">同时下载数量控制并行证券数；所有连接共享全局与单站频率，连接、握手和重试也计入，避免并发增加后请求量成倍放大。</p>
               </div>
             ) : (
               <p className="help-text mb-3">

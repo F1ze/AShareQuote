@@ -31,6 +31,11 @@ func DownloadDateRange(options DownloadOptions, now time.Time) (time.Time, time.
 // MaxHistoricOffset 是当前通达信协议可表达的最大历史位置，不允许转 uint16 时回绕。
 const MaxHistoricOffset = 65535
 
+const (
+	DefaultRequestRate     = 40 // 应用内通达信连接/握手/业务请求的默认全局启动频率，次/秒。
+	DefaultHostRequestRate = 8  // 同一 IP/端口的默认启动频率，次/秒；不是服务商承诺的额度。
+)
+
 // NormalizeDownloadOptions 只处理业务默认值与输入约束，不探测服务、目录或数据库。
 // 来源是否注册、入库能力是否可用由服务根据注入依赖判断。
 func NormalizeDownloadOptions(o DownloadOptions, defaultOutput string, now time.Time) (DownloadOptions, error) {
@@ -49,6 +54,15 @@ func NormalizeDownloadOptions(o DownloadOptions, defaultOutput string, now time.
 	}
 	if o.Timeout == 0 {
 		o.Timeout = 8
+	}
+	if o.RequestRate == 0 {
+		o.RequestRate = DefaultRequestRate
+	}
+	if o.HostRequestRate == 0 {
+		o.HostRequestRate = min(DefaultHostRequestRate, o.RequestRate)
+	}
+	if o.RequestRate < 1 || o.RequestRate > 200 || o.HostRequestRate < 1 || o.HostRequestRate > o.RequestRate {
+		return o, errors.New("全局请求频率须为 1–200，单站频率须为 1–全局频率，单位次/秒")
 	}
 	if o.Source == "" {
 		o.Source = "tdx"

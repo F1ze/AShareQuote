@@ -52,3 +52,23 @@ func TestPreviewUsesWholeSeriesAndRejectsTraversalBeforeRead(t *testing.T) {
 		t.Fatal("预览改写了原始行情")
 	}
 }
+
+// 全量入口必须越过原 800 条窗口，同时保持后复权的同一基准及兼容旧限量请求。
+func TestPreviewAllHistory(t *testing.T) {
+	f := &previewFixture{}
+	for i := 0; i < 1601; i++ {
+		f.bars = append(f.bars, domain.Bar{Date: time.Date(2020, 1, 1, 0, 0, 0, 0, domain.ExchangeTime).AddDate(0, 0, i), Open: 10, High: 10, Low: 10, Close: 10})
+	}
+	s := NewPreviewService(func() string { return "unused" }, func(string) PreviewRepository { return f })
+	full, err := s.Preview(context.Background(), domain.PreviewQuery{File: "sh600000_day.csv", Mode: "hfq", All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := s.Preview(context.Background(), domain.PreviewQuery{File: "sh600000_day.csv", Mode: "hfq", Limit: 800})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full.Bars) != 1601 || len(tail.Bars) != 800 || full.From != tail.From || full.Bars[1600] != tail.Bars[799] {
+		t.Fatalf("完整历史或复权基准丢失：full=%d tail=%d", len(full.Bars), len(tail.Bars))
+	}
+}

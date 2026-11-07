@@ -26,6 +26,36 @@ func fixtureDB(t *testing.T) *DuckDB {
 	})
 	return d
 }
+
+// 用真实 DuckDB 检查分钟级游标：跨越 1000 条页边界无重复、无遗漏，结束日包含整天。
+func TestWarehouseHistoryCursor(t *testing.T) {
+	d := fixtureDB(t)
+	var body strings.Builder
+	start := time.Date(2024, 1, 2, 0, 0, 0, 0, domain.ExchangeTime)
+	for i := 0; i < 1501; i++ {
+		fmt.Fprintf(&body, "%s,10,12,9,11,1,1100\n", start.Add(time.Duration(i)*time.Minute).Format("2006-01-02 15:04"))
+	}
+	b, receipt := fixtureArchive(t, d, body.String(), "cursor", "fixture")
+	b.Category = 7
+	mustOK(t, d.Ingest(context.Background(), b, receipt))
+	q := domain.BarQuery{Exchange: "SH", Code: "600000", Period: "1m", From: "2024-01-02", To: "2024-01-03", Limit: 1000}
+	latest, err := d.Bars(context.Background(), q)
+	mustOK(t, err)
+	if len(latest) != 1000 {
+		t.Fatalf("首分页数量 %d", len(latest))
+	}
+	q.Before = latest[0].Time
+	older, err := d.Bars(context.Background(), q)
+	mustOK(t, err)
+	if len(older) != 501 || older[0].Time != "2024-01-02 00:00:00" || older[len(older)-1].Time >= latest[0].Time {
+		t.Fatalf("历史分页遗漏或重叠：%d", len(older))
+	}
+	q.Before = "bad cursor"
+	_, err = d.Bars(context.Background(), q)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("非法游标未拒绝：%v", err)
+	}
+}
 func mustOK(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {

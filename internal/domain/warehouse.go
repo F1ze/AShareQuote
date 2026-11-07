@@ -34,6 +34,7 @@ func (q DatasetQuery) Normalize() (DatasetQuery, error) {
 
 // BarQuery 使用用户可理解的包含首尾日期；Normalize 生成仓库使用的次日排他上界。
 type BarQuery struct {
+	Before   string // 可选排他时间游标，向历史分页；不改变 From/To 日期边界。
 	Exchange string // SH/SZ/BJ，不使用数字市场值。
 	Code     string // 六位证券代码，保留前导零。
 	Period   string // day/1m/5m 等标准周期键。
@@ -69,6 +70,11 @@ func (q BarQuery) Normalize() (BarQuery, error) {
 	}
 	if q.Limit < 1 || q.Limit > 1000 {
 		return q, fmt.Errorf("%w：预览数量须为 1–1000", ErrInvalidInput)
+	}
+	if q.Before != "" {
+		if _, err := time.ParseInLocation("2006-01-02 15:04:05", q.Before, ExchangeTime); err != nil {
+			return q, fmt.Errorf("%w：分页时间游标无效", ErrInvalidInput)
+		}
 	}
 	q.Until = to.AddDate(0, 0, 1).Format("2006-01-02")
 	return q, nil

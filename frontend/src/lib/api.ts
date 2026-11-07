@@ -4,6 +4,8 @@ import type {
   DownloadOptions,
   HostReport,
   PreviewResult,
+  PreviewBar,
+  WarehouseBar,
   ProxySettings,
   TaskSnapshot,
   WarehouseStatus,
@@ -52,38 +54,34 @@ export const api = {
   gaps: () =>
     request<{ exchange: string; code: string; name: string; date: string }[]>("/warehouse/gaps"),
   templateURL: (kind: "bars" | "calendar" | "instruments") => `${API_BASE}/templates/${kind}`,
-  warehousePreview: async (dataset: WarehouseDataset, limit: number): Promise<PreviewResult> => {
-    const rows = await request<
-      {
-        ts: string
-        open: string
-        high: string
-        low: string
-        close: string
-        volume_shares: number
-        amount_cny: string
-      }[]
-    >(
-      `/warehouse/bars?${new URLSearchParams({ exchange: dataset.exchange, code: dataset.code, period: dataset.period, from: dataset.earliest.slice(0, 10), to: dataset.latest.slice(0, 10), limit: String(limit) })}`
-    )
-    return {
-      file: `${dataset.exchange}${dataset.code}`,
-      mode: "raw",
-      from: dataset.earliest,
-      to: dataset.latest,
-      total: dataset.rows,
-      factorAvailable: false,
-      factorEvents: 0,
-      bars: rows.map((row) => ({
-        date: row.ts,
-        open: Number(row.open),
-        high: Number(row.high),
-        low: Number(row.low),
-        close: Number(row.close),
-        volume: row.volume_shares,
-        amount: Number(row.amount_cny)
-      }))
+  previewAll: (file: string, mode: "raw" | "qfq" | "hfq", signal: AbortSignal) =>
+    request<PreviewResult>(`/preview?${new URLSearchParams({ file, mode, all: "true" })}`, { signal }),
+  warehousePreviewAll: async (dataset: WarehouseDataset, signal: AbortSignal, progress: (count: number) => void): Promise<PreviewResult> => {
+    const pages: PreviewBar[][] = []
+    let before = ""
+    let count = 0
+    if (dataset.earliest && dataset.latest) {
+      for (;;) {
+        signal.throwIfAborted()
+        const rows = await request<WarehouseBar[]>(`/warehouse/bars?${new URLSearchParams({ exchange: dataset.exchange, code: dataset.code, period: dataset.period, from: dataset.earliest.slice(0, 10), to: dataset.latest.slice(0, 10), limit: "1000", before })}`, { signal })
+        if (!rows.length) break
+        const cursor = rows[0].ts
+        if (before && cursor >= before) throw new Error("历史分页未前进，请重新读取")
+        // 每页立即转换，避免全量数字记录之外再保留一份价格字符串。
+        pages.push(rows.map((row) => ({
+          date: row.ts, open: Number(row.open), high: Number(row.high),
+          low: Number(row.low), close: Number(row.close),
+          volume: row.volume_shares, amount: Number(row.amount_cny)
+        })))
+        count += rows.length
+        progress(count)
+        if (rows.length < 1000) break
+        before = cursor
+      }
     }
+    signal.throwIfAborted()
+    const bars = pages.reverse().flat()
+    return { file: `${dataset.exchange}${dataset.code}`, mode: "raw", from: bars[0]?.date || "", to: bars.at(-1)?.date || "", total: bars.length, factorAvailable: false, factorEvents: 0, bars }
   },
   startTask: (options: DownloadOptions) =>
     request<TaskSnapshot>("/task", { method: "POST", body: JSON.stringify(options) }),
@@ -96,7 +94,5 @@ export const api = {
     request<{ path: string }>("/fs/directories", {
       method: "POST",
       body: JSON.stringify({ path, name })
-    }),
-  preview: (file: string, mode: "raw" | "qfq" | "hfq", limit = 200) =>
-    request<PreviewResult>(`/preview?${new URLSearchParams({ file, mode, limit: String(limit) })}`)
+    })
 }

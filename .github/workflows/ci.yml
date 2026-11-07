@@ -25,6 +25,7 @@ jobs:
       - run: npm run frontend:install
       - run: npm run setup:data
       - run: npm test
+      - run: npm run test:preview
       - run: node scripts/go.mjs vet ./...
       - run: npm run test:data
       - run: npm run frontend:lint

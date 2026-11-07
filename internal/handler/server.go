@@ -117,6 +117,8 @@ func (s *Server) handleDefaults(c echo.Context) error {
 		"category":         9,
 		"count":            800,
 		"workers":          12,
+		"requestRate":      domain.DefaultRequestRate,
+		"hostRequestRate":  domain.DefaultHostRequestRate,
 		"timeout":          8,
 		"markets":          []int{0, 1, 2},
 		"warehouseEnabled": s.warehouse.Enabled(),

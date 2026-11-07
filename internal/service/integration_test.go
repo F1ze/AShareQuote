@@ -77,7 +77,7 @@ func TestManagerConcurrentDownload(t *testing.T) {
 	host := startDownloadTestServer(t)
 	output := t.TempDir()
 	provider := lines.ProviderFunc(func(context.Context, time.Duration) ([]domain.Host, lines.Report, error) {
-		return []domain.Host{host}, lines.Report{ConfigChecked: true, Tested: 1, Available: 1}, nil
+		return []domain.Host{host}, lines.Report{ConfigChecked: true, Tested: 1, Available: 1, Results: []domain.HostStatus{{Name: "本地测试站", Address: host.Address(), OK: true}}}, nil
 	})
 	factory := func(hosts []domain.Host, timeout time.Duration, offset int) Client {
 		return tdx.NewClient(hosts, timeout, offset)
@@ -94,6 +94,14 @@ func TestManagerConcurrentDownload(t *testing.T) {
 	for time.Now().Before(deadline) {
 		snapshot := manager.Snapshot()
 		if snapshot != nil && snapshot.State == "completed_with_errors" {
+			if snapshot.LineReport == nil || len(snapshot.LineReport.Results) != 1 || snapshot.LineReport.Results[0].Name != "本地测试站" {
+				t.Fatalf("任务未发布自动检测报告：%+v", snapshot.LineReport)
+			}
+			// 调用者修改响应切片，不能改变下一次 SSE 快照的数据。
+			snapshot.LineReport.Results[0].Name = "调用者改名"
+			if manager.Snapshot().LineReport.Results[0].Name != "本地测试站" {
+				t.Fatal("快照共享内部线路切片")
+			}
 			if snapshot.Succeeded != 2 || snapshot.Failed != 0 || snapshot.Bars != 2 {
 				t.Fatalf("任务统计错误：%+v", snapshot)
 			}

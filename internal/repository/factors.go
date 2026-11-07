@@ -1,9 +1,11 @@
 package repository
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -147,25 +149,29 @@ func ReadAdjustmentCSV(path string) ([]domain.AdjustmentEvent, error) {
 }
 
 func ReadBarsCSV(path string) ([]domain.Bar, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() > 64<<20 {
-		return nil, fmt.Errorf("预览文件超过 64 MB，请缩小下载范围")
-	}
+	return ReadBarsCSVContext(context.Background(), path)
+}
+
+// ReadBarsCSVContext 逐行转换，避免同时保存全部 CSV 字符串；取消请求后及时释放文件。
+func ReadBarsCSVContext(ctx context.Context, path string) ([]domain.Bar, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	bars := make([]domain.Bar, 0, len(records))
-	for i, record := range records {
+	bars := make([]domain.Bar, 0)
+	for i := 0; ; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
 		if i == 0 || len(record) < 7 {
 			continue
 		}

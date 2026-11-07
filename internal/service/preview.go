@@ -54,10 +54,13 @@ func (s *PreviewService) Preview(ctx context.Context, q domain.PreviewQuery) (do
 		result.From = adjusted[0].Date.Format("2006-01-02 15:04")
 		result.To = adjusted[len(adjusted)-1].Date.Format("2006-01-02 15:04")
 	}
-	if len(adjusted) > q.Limit {
+	if !q.All && len(adjusted) > q.Limit {
 		adjusted = adjusted[len(adjusted)-q.Limit:]
 	}
 	for _, bar := range adjusted {
+		if err := ctx.Err(); err != nil {
+			return domain.PreviewResponse{}, err
+		}
 		layout := "2006-01-02"
 		if bar.Date.Hour() != 0 || bar.Date.Minute() != 0 {
 			layout = "2006-01-02 15:04"

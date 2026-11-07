@@ -8,7 +8,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
+	"slices"
 	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -47,13 +49,14 @@ type Transaction = domain.Transaction
 
 // Client 由单个 worker 独占，不支持并发请求；失败后关闭连接再按线路轮换重连。
 type Client struct {
-	hosts   []Host          // 已通过业务自检的线路列表，connect 按 offset 开始逐条尝试。
-	timeout time.Duration   // 每次拨号/握手/请求读写的期限，不是整次历史下载的总时限。
-	conn    net.Conn        // 当前独占 TCP 连接，nil 时下次请求重连；失败必须关闭并清空。
-	offset  int             // 下一次重连优先尝试的线路偏移，通过取模允许跨列表末端轮换。
-	host    Host            // 最近一次成功拨号所用端点；不代表列表中所有端点均可用。
-	ctx     context.Context // 任务取消上下文；拨号直接继承，阻塞读写由取消回调关闭连接打断。
-	dial    DialFunc        // 可注入的统一出站拨号函数；nil 使用系统直连，见 SetDialer。
+	hosts   []Host             // 本客户端独立复制并随机打乱的候选列表，不改写提供器或其他客户端的列表。
+	traffic *TrafficController // 应用共享的全局/单站请求预算；由组装根注入。
+	timeout time.Duration      // 每次拨号/握手/请求读写的期限，不是整次历史下载的总时限。
+	conn    net.Conn           // 当前独占 TCP 连接，nil 时下次请求重连；失败必须关闭并清空。
+	offset  int                // 下一次重连优先尝试的线路偏移，通过取模允许跨列表末端轮换。
+	host    Host               // 最近一次成功拨号所用端点；不代表列表中所有端点均可用。
+	ctx     context.Context    // 任务取消上下文；拨号直接继承，阻塞读写由取消回调关闭连接打断。
+	dial    DialFunc           // 可注入的统一出站拨号函数；nil 使用系统直连，见 SetDialer。
 }
 
 // DialFunc 与 net.Dialer.DialContext 同签名；组装根注入统一代理拨号器时使用。
@@ -63,7 +66,22 @@ func NewClient(hosts []Host, timeout time.Duration, offset int) *Client {
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	return &Client{hosts: hosts, timeout: timeout, offset: offset, ctx: context.Background()}
+	shuffled := slices.Clone(hosts)
+	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+	if len(shuffled) > 0 {
+		offset = (offset%len(shuffled) + len(shuffled)) % len(shuffled)
+	}
+	return &Client{hosts: shuffled, timeout: timeout, offset: offset, ctx: context.Background()}
+}
+
+// SetTrafficController 必须在客户端使用前注入；所有 worker 和线路探测共享同一个调度器。
+func (c *Client) SetTrafficController(traffic *TrafficController) { c.traffic = traffic }
+
+func (c *Client) waitTraffic(host Host) error {
+	if c.traffic == nil {
+		return c.ctx.Err()
+	}
+	return c.traffic.Wait(c.ctx, host)
 }
 
 // SetContext 将任务取消传播到拨号、握手和正在进行的请求；首次使用前设置。
@@ -81,7 +99,7 @@ func (c *Client) Close() {
 }
 
 func (c *Client) connect() error {
-	// 流程：检查候选线路 → 从 offset 轮换拨号 → 设置期限/取消回调 → 完成握手。
+	// 流程：检查独立乱序候选 → 从 offset 轮换拨号 → 设置期限/取消回调 → 完成握手。
 	// 失败关闭本条连接并尝试下一条；只有握手成功才移动下一次重连的优先偏移。
 	if len(c.hosts) == 0 {
 		return fmt.Errorf("没有可用行情线路")
@@ -94,6 +112,10 @@ func (c *Client) connect() error {
 		// 各 worker 从不同偏移开始；成功后移动偏移，让下次重连优先尝试下一条线路。
 		idx := (c.offset + i) % len(c.hosts)
 		host := c.hosts[idx]
+		// 连接失败同样消耗共享预算，防止不可达线路被多个 worker 无间隔重试。
+		if err := c.waitTraffic(host); err != nil {
+			return err
+		}
 		// 拨号期限与原 net.Dialer 超时语义一致：注入统一拨号器时也按 timeout 约束。
 		dialCtx, cancel := context.WithTimeout(c.ctx, c.timeout)
 		var conn net.Conn
@@ -134,6 +156,10 @@ func (c *Client) connect() error {
 // 后续请求按业务命令号匹配应答，允许有限跳过服务器夹带的其他报文。
 func (c *Client) handshake() error {
 	for _, packet := range [][]byte{setup1, setup2} {
+		if err := c.waitTraffic(c.host); err != nil {
+			return err
+		}
+		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 		if err := writeAll(c.conn, packet); err != nil {
 			return fmt.Errorf("握手写入失败：%w", err)
 		}
@@ -141,6 +167,10 @@ func (c *Client) handshake() error {
 			return fmt.Errorf("握手应答失败：%w", err)
 		}
 	}
+	if err := c.waitTraffic(c.host); err != nil {
+		return err
+	}
+	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 	if err := writeAll(c.conn, setup3); err != nil {
 		return fmt.Errorf("初始化写入失败：%w", err)
 	}
@@ -185,6 +215,17 @@ func (c *Client) request(spec requestSpec) ([]byte, error) {
 	// 第 2 步：最多尝试 3 次；无连接时先轮换线路并握手，已有连接则继续串行使用。
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		// 重试使用指数退避和随机抖动，避免多个失败连接同时重连同一站点。
+		if attempt > 0 {
+			timer := time.NewTimer((100 * time.Millisecond << (attempt - 1)) + time.Duration(rand.IntN(100))*time.Millisecond)
+			select {
+			case <-c.ctx.Done():
+				timer.Stop()
+				c.Close()
+				return nil, c.ctx.Err()
+			case <-timer.C:
+			}
+		}
 		if err := c.ctx.Err(); err != nil {
 			c.Close()
 			return nil, err
@@ -195,7 +236,11 @@ func (c *Client) request(spec requestSpec) ([]byte, error) {
 				continue
 			}
 		}
-		// 第 3 步：刷新当前业务请求的读写期限，注册取消回调，再完整发送报文。
+		// 第 3 步：每次重试也重新等待预算；限流等待不占用协议读写超时。
+		if err := c.waitTraffic(c.host); err != nil {
+			c.Close()
+			return nil, err
+		}
 		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 		conn := c.conn
 		stopCancel := context.AfterFunc(c.ctx, func() { _ = conn.Close() })

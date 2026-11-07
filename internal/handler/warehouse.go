@@ -67,7 +67,7 @@ func (s *Server) handleWarehouseBars(c echo.Context) error {
 			return writeError(c, 400, domain.ErrInvalidInput)
 		}
 	}
-	v, err := s.warehouse.Bars(c.Request().Context(), domain.BarQuery{Exchange: c.QueryParam("exchange"), Code: c.QueryParam("code"), Period: c.QueryParam("period"), From: c.QueryParam("from"), To: c.QueryParam("to"), Limit: limit})
+	v, err := s.warehouse.Bars(c.Request().Context(), domain.BarQuery{Before: c.QueryParam("before"), Exchange: c.QueryParam("exchange"), Code: c.QueryParam("code"), Period: c.QueryParam("period"), From: c.QueryParam("from"), To: c.QueryParam("to"), Limit: limit})
 	return respond(c, v, err, 503)
 }
 func (s *Server) handleTemplate(c echo.Context) error {

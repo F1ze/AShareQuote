@@ -8,9 +8,42 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestSharedTrafficIncludesConnectionsHandshakeAndRequests(t *testing.T) {
+	host := startTestServerN(t, 2, func(conn net.Conn) error {
+		if err := serveTestHandshake(conn); err != nil {
+			return err
+		}
+		if _, _, err := readTestFrame(conn); err != nil {
+			return err
+		}
+		return writeTestMessage(conn, 0x044E, []byte{1, 0}, false)
+	})
+	traffic := NewTrafficController(1000, 50)
+	started := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := NewClient([]Host{host}, time.Second, 0)
+			defer client.Close()
+			client.SetTrafficController(traffic)
+			if count, err := client.SecurityCount(1); err != nil || count != 1 {
+				t.Errorf("业务请求失败：%d %v", count, err)
+			}
+		}()
+	}
+	wg.Wait()
+	// 两连接各消耗连接、三次握手、一次业务请求，共十个单站许可。
+	if time.Since(started) < 175*time.Millisecond {
+		t.Fatal("连接/握手或跨客户端共享限速被绕过")
+	}
+}
 
 func TestSecurityBarsRejectsOffsetWrap(t *testing.T) {
 	client := NewClient(nil, time.Second, 0)
@@ -114,18 +147,27 @@ func readTestFrame(r io.Reader) ([]byte, []byte, error) {
 
 func startTestServer(t *testing.T, handler func(net.Conn) error) Host {
 	t.Helper()
+	return startTestServerN(t, 1, handler)
+}
+
+func startTestServerN(t *testing.T, count int, handler func(net.Conn) error) Host {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
+		for range count {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = handler(conn)
+			}()
 		}
-		defer conn.Close()
-		_ = handler(conn)
 	}()
 	host, err := parseHost(listener.Addr().String())
 	if err != nil {

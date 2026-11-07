@@ -164,10 +164,23 @@
   .connection-status[data-connected="true"] {
     color: var(--positive);
   }
-  .connection-status button {
+  .connection-status > button:not(.connection-indicator) {
     padding: 6px;
     border-radius: 6px;
     background: var(--surface-selected);
+  }
+  .connection-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 0;
+    border-radius: 6px;
+    color: inherit;
+    white-space: nowrap;
+  }
+  .connection-indicator:hover {
+    text-decoration: underline;
+    text-underline-offset: 4px;
   }
   .workspace {
     max-width: 1480px;

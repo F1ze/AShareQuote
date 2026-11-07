@@ -3,6 +3,8 @@ import {
   Activity,
   ArrowUpRight,
   CircleCheck,
+  CircleAlert,
+  ChevronDown,
   LoaderCircle,
   RefreshCw,
   ShieldCheck
@@ -13,10 +15,11 @@ import { PathBrowser } from "@/components/PathBrowser"
 import { PricePreview } from "@/components/PricePreview"
 import { DataLibrary } from "@/components/DataLibrary"
 import { TaskMonitor } from "@/components/TaskMonitor"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { isTaskActive, useTask } from "@/hooks/useTask"
 import { api } from "@/lib/api"
 import { today, yesterday } from "@/lib/dates"
-import type { DownloadOptions, TaskSnapshot } from "@/types"
+import type { DownloadOptions, HostReport, TaskSnapshot } from "@/types"
 
 const initialOptions: DownloadOptions = {
   markets: [0, 1, 2],
@@ -32,6 +35,8 @@ const initialOptions: DownloadOptions = {
   startDate: "1990-12-19",
   endDate: yesterday(),
   workers: 12,
+  requestRate: 40,
+  hostRequestRate: 8,
   timeout: 8,
   outputDir: "",
   gbbqPath: ""
@@ -46,6 +51,8 @@ export default function App() {
   const [ready, setReady] = useState(false)
   const [starting, setStarting] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [hostReport, setHostReport] = useState<HostReport | null>(null)
+  const [hostError, setHostError] = useState("")
   const [browser, setBrowser] = useState<"folder" | "gbbq" | null>(null)
   const [previewFile, setPreviewFile] = useState<string | null>(null)
   const [proxy, setProxy] = useState<ProxyState>({ value: "", active: "", saving: false })
@@ -53,6 +60,22 @@ export default function App() {
   const speedTask = useRef("")
   const lastSpeedAt = useRef(0)
   const active = isTaskActive(task)
+
+  // 连接状态同时承载线路详情；悬停只展示已有结果，不触发网络探测。
+  const [open, setOpen] = useState(false)
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const content = useRef<HTMLDivElement>(null)
+  const pinned = useRef(false)
+  const clearClose = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+  }
+  useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current) }, [])
+  const scheduleClose = () => {
+    clearClose()
+    closeTimer.current = setTimeout(() => {
+      if (!pinned.current && !content.current?.contains(document.activeElement)) setOpen(false)
+    }, 200)
+  }
 
   const loadDefaults = useCallback(() => {
     setMessage({ type: "info", text: "正在连接行情服务…" })
@@ -69,6 +92,8 @@ export default function App() {
           timeout: defaults.timeout,
           markets: defaults.markets,
           ...restored,
+          requestRate: restored?.requestRate || defaults.requestRate || 40,
+          hostRequestRate: restored?.hostRequestRate || defaults.hostRequestRate || 8,
           importDir: undefined,
           source: restored?.source === "baostock" ? "baostock" : "tdx",
           storage: restored?.storage === "csv" ? "csv" : "duckdb",
@@ -120,6 +145,12 @@ export default function App() {
       return "同时下载数量须为 1–64 的整数，请在高级设置中修改"
     if (!Number.isInteger(options.timeout) || options.timeout < 2 || options.timeout > 60)
       return "等待超时须为 2–60 秒的整数，请在高级设置中修改"
+    const requestRate = options.requestRate ?? 40
+    const hostRequestRate = options.hostRequestRate ?? 8
+    if (!Number.isInteger(requestRate) || requestRate < 1 || requestRate > 200)
+      return "全局请求频率须为 1–200 的整数，请在高级设置中修改"
+    if (!Number.isInteger(hostRequestRate) || hostRequestRate < 1 || hostRequestRate > requestRate)
+      return "单站请求频率须为 1–全局请求频率的整数，请在高级设置中修改"
     return ""
   }
   const start = async () => {
@@ -130,6 +161,7 @@ export default function App() {
       return
     }
     setStarting(true)
+    setHostError("")
     setPreviewFile(null)
     setMessage({ type: "info", text: "正在准备下载…" })
     try {
@@ -153,19 +185,23 @@ export default function App() {
     }
   }
   const testHosts = async () => {
+    if (testing || active || starting || !ready) return
     if (!Number.isInteger(options.timeout) || options.timeout < 2 || options.timeout > 60) {
       setMessage({ type: "error", text: "等待超时须为 2–60 秒的整数" })
       return
     }
     setTesting(true)
+    setHostError("")
     setMessage({ type: "info", text: "正在检测行情线路，请稍候…" })
     try {
       const report = await api.testHosts(options.timeout)
+      setHostReport(report)
       setMessage({
         type: report.available ? "success" : "error",
         text: `可用行情线路 ${report.available} / ${report.tested} 条${report.available ? "，可以开始下载" : "，请检查网络后重试"}。`
       })
     } catch (reason) {
+      setHostError(reason instanceof Error ? reason.message : "线路检测失败")
       setMessage({ type: "error", text: reason instanceof Error ? reason.message : "线路检测失败" })
     } finally {
       setTesting(false)
@@ -193,6 +229,7 @@ export default function App() {
     }
   }
   const acceptTask = (snapshot: TaskSnapshot) => {
+    setHostError("")
     setTask(snapshot)
     setOptions((current) =>
       snapshot.options.importDir
@@ -211,6 +248,13 @@ export default function App() {
       toast.error(reason instanceof Error ? reason.message : "恢复失败")
     }
   }
+  const taskReport = task?.lineReport
+  const latestHostReport = hostReport && (!taskReport || (Date.parse(hostReport.checkedAt || "") || 0) >= (Date.parse(taskReport.checkedAt || "") || 0))
+    ? hostReport : taskReport || null
+  const available = latestHostReport?.results?.filter((host) => host.ok) || []
+  const failed = latestHostReport?.results?.filter((host) => !host.ok) || []
+  const checkedAt = latestHostReport?.checkedAt ? new Date(latestHostReport.checkedAt) : null
+  const canTest = ready && !active && !starting && !testing
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -240,22 +284,58 @@ export default function App() {
             </button>
           </nav>
           <div className="connection-status" data-connected={connected}>
-            {connected ? (
-              <CircleCheck className="size-3.5" />
-            ) : (
-              <LoaderCircle className="size-3.5 animate-spin" />
-            )}
-            <span>{connected ? "服务已连接" : "正在连接"}</span>
-            {!ready && (
-              <button
-                type="button"
-                onClick={loadDefaults}
-                aria-label="重新连接服务"
-                title="重新连接服务"
-              >
-                <RefreshCw className="size-3.5" />
-              </button>
-            )}
+            <Popover open={open} onOpenChange={(next) => { setOpen(next); if (!next) pinned.current = false }}>
+              <PopoverTrigger asChild>
+                <button type="button" className="connection-indicator" aria-label="服务连接与可用行情站点" data-testid="available-hosts-trigger"
+                  onPointerEnter={(event) => { if (event.pointerType === "mouse") { clearClose(); setOpen(true) } }}
+                  onPointerLeave={(event) => { if (event.pointerType === "mouse") scheduleClose() }}
+                  onClick={(event) => { if (open && !pinned.current) event.preventDefault(); pinned.current = true }}>
+                  {connected ? <CircleCheck className="size-3.5" /> : <LoaderCircle className="size-3.5 animate-spin" />}
+                  <span>{connected ? "服务已连接" : "正在连接"}</span>
+                  {testing ? <LoaderCircle className="size-3 animate-spin" aria-label="线路检测中" /> : latestHostReport && <span className="hidden text-[10px] sm:inline">· 可用 {available.length}/{latestHostReport.tested}</span>}
+                  <ChevronDown className="size-3" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent ref={content} align="end" aria-label="可用行情站点" className="w-[min(50rem,calc(100vw-2rem))] border-[var(--line-strong)] bg-[var(--surface-raised)] p-3 text-[var(--text)] shadow-xl"
+                onPointerEnter={clearClose} onPointerLeave={(event) => { if (event.pointerType === "mouse") scheduleClose() }}
+                onOpenAutoFocus={(event) => { if (!pinned.current) event.preventDefault() }}>
+                <div className="flex items-center justify-between gap-3">
+                  <h2 className="text-sm font-medium">通达信行情站点</h2>
+                  <button type="button" className="text-button text-xs" disabled={!canTest} onClick={() => { pinned.current = true; clearClose(); void testHosts() }}>
+                    <RefreshCw className={`size-3.5 ${testing ? "animate-spin" : ""}`} />{testing ? "检测中…" : "重新检测"}
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] leading-4 text-[var(--text-muted)]">
+                  {checkedAt && Number.isFinite(checkedAt.getTime()) ? `最近检测：${checkedAt.toLocaleString("zh-CN", { hour12: false })}` : "下载前自动检测，也可手动检测"}
+                </p>
+                {testing && <p role="status" className="mt-3 text-xs text-[var(--text-secondary)]">正在检测 TCP 连通性，请稍候…</p>}
+                {hostError && <p role="alert" className="mt-3 break-words text-xs text-[var(--danger)]">{hostError}</p>}
+                {!latestHostReport && !testing && !hostError && <p className="py-5 text-center text-xs text-[var(--text-muted)]">尚无检测结果</p>}
+                {latestHostReport && <>
+                  <div className="mt-2 text-[11px] leading-4 text-[var(--text-secondary)]">可用 {available.length} · 未通过 {failed.length} · 已检测 {latestHostReport.tested} · {latestHostReport.probe === "tcp" ? "仅 TCP 连通性" : "历史检测结果"}</div>
+                  {!available.length && <p className="py-4 text-xs text-[var(--danger)]">本次没有可用行情站点，请检查网络或代理后重试。</p>}
+                  <div className="mt-2 max-h-[min(32rem,calc(100dvh-12rem))] overflow-auto" tabIndex={0} role="region" aria-label="全部站点检测结果，可横向滚动">
+                    <table className="w-full min-w-[42rem] whitespace-nowrap text-left text-[11px] leading-4" aria-label="全部行情站点">
+                      <thead className="sticky top-0 bg-[var(--surface-raised)] text-[var(--text-muted)]">
+                        <tr><th className="py-1.5 pr-3 font-normal">状态</th><th className="px-2 py-1.5 font-normal">站点</th><th className="px-2 py-1.5 font-normal">IP / 端口</th><th className="py-1.5 pl-3 text-right font-normal">{latestHostReport.probe === "tcp" ? "TCP 耗时" : "检测耗时"}</th></tr>
+                      </thead>
+                      <tbody className="divide-y divide-[var(--line)]">
+                        {(latestHostReport.results || []).map((host) => <tr key={host.address} title={host.ok ? host.name : `${host.name || "未命名站点"}：${host.error || "连接检测未通过"}`}>
+                          <td className="py-1.5 pr-3"><span className={`inline-flex items-center gap-1 ${host.ok ? "text-[var(--positive)]" : "text-[var(--danger)]"}`}>
+                            {host.ok ? <CircleCheck className="size-3" /> : <CircleAlert className="size-3" />}{host.ok ? "可用" : "失败"}
+                            {!host.ok && <span className="sr-only">：{host.error || "连接检测未通过"}</span>}
+                          </span></td>
+                          <td className="px-2 py-1.5">{host.name || "未命名站点"}</td>
+                          <td className="select-text px-2 py-1.5 font-mono text-[var(--text-secondary)]">{host.address}</td>
+                          <td className="py-1.5 pl-3 text-right font-mono text-[var(--text-muted)]">{host.latencyMs} ms</td>
+                        </tr>)}
+                      </tbody>
+                    </table>
+                  </div>
+                </>}
+              </PopoverContent>
+            </Popover>
+            {!ready && <button type="button" onClick={loadDefaults} aria-label="重新连接服务" title="重新连接服务"><RefreshCw className="size-3.5" /></button>}
           </div>
         </div>
       </header>

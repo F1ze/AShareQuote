@@ -9,6 +9,29 @@ import (
 	"testing"
 )
 
+func TestDiscoverIncludesExpandedASharesAndExcludesDepositaryReceipts(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"sz302132_day.csv", "sz004001_day.csv", "sz001001_day.csv", "sz309800_day.csv", "sh689009_day.csv", "bj889001_day.csv"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("date,open,high,low,close,volume,amount\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inputs, err := New().Discover(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputs) != 2 {
+		t.Fatalf("本地扫描漏股或混入非股票：%+v", inputs)
+	}
+	seen := map[string]bool{}
+	for _, input := range inputs {
+		seen[input.Security.Code] = true
+	}
+	if !seen["302132"] || !seen["004001"] {
+		t.Fatalf("本地扫描遗漏股票号段：%+v", inputs)
+	}
+}
+
 func TestNativeDayAndMinuteUnits(t *testing.T) {
 	for _, ext := range []string{"day", "lc1", "lc5"} {
 		t.Run(ext, func(t *testing.T) {

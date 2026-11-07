@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"quotes/internal/domain"
 )
 
 // jobRun 的进度、日志和终态受 mu 保护；配置、计划及依赖在启动前确定。
@@ -13,6 +15,8 @@ import (
 // 取消由 preparing/running → cancelling → cancelled；准备失败也可直接进入 failed。
 // 重启从日志观察到未终结任务时标成 interrupted，用户恢复会创建独立的新任务。
 type jobRun struct {
+	configureTraffic func(int, int)               // 进入通达信流程前更新共享预算；本地/历史源和完整离线恢复不调用。
+	lineReport       *domain.LineReport           // 受 mu 保护的本任务探测快照，成功与失败线路均保留供 SSE 展示。
 	mu               sync.RWMutex                 // 保护可变进度、状态和展示切片；不覆盖网络或磁盘 I/O，避免锁长期占用。
 	id               string                       // 本次执行编号，与对应的 <id>.jsonl 日志文件名一致。
 	state            string                       // 当前状态；由调度流程决定终态，Cancel 只先标记 cancelling。
@@ -27,7 +31,7 @@ type jobRun struct {
 	message          string                       // 阶段或结果说明，由快照传给界面。
 	output           string                       // 当前任务的原始归档绝对目录，启动后不变。
 	options          DownloadOptions              // 当前执行的固定选项；worker 要调整增量范围时使用副本。
-	hosts            []Host                       // 线路业务自检通过后的端点列表，启动 worker 前一次性设置。
+	hosts            []Host                       // TCP 连通性检测通过后的端点列表，启动 worker 前一次性设置。
 	started          time.Time                    // 任务创建时刻，用于计算总耗时和平均处理速度。
 	ended            *time.Time                   // 结束时刻，活动任务为 nil；finish 设置后快照耗时固定。
 	recent           []FileResult                 // 最近 10 个成功结果，头部插入；读取快照时复制。
@@ -77,6 +81,12 @@ func (t *jobRun) snapshot() TaskSnapshot {
 		Failed: t.failed, Bars: t.bars, Pages: t.pages, Warnings: t.warnings, Skipped: t.skipped, Percent: percent, Speed: speed, Elapsed: elapsed,
 		Message: t.message, OutputDir: t.output, StartedAt: t.started, EndedAt: t.ended,
 		Options: t.options, Recent: append([]FileResult(nil), t.recent...), Logs: append([]LogEntry(nil), t.logs...),
+	}
+	// 快照拥有独立结果切片，避免浏览器序列化或调用者改动触及内部状态。
+	if t.lineReport != nil {
+		report := *t.lineReport
+		report.Results = append([]domain.HostStatus(nil), report.Results...)
+		s.LineReport = &report
 	}
 	return s
 }

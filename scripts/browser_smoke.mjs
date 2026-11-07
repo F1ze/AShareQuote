@@ -247,6 +247,21 @@ try {
   await waitFor(`document.body.innerText.includes('请填写至少一个证券代码')`, "空代码表单校验")
   await clickText("按市场下载")
 
+  await evaluate(`document.querySelector('.advanced-settings').open = true`)
+  const setTrafficField = async (id, value) => evaluate(`(() => {
+    const element = document.getElementById(${JSON.stringify(id)})
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(element, ${JSON.stringify(String(value))})
+    element.dispatchEvent(new Event('input',{bubbles:true})); element.dispatchEvent(new Event('change',{bubbles:true}))
+  })()`)
+  await setTrafficField("request-rate", 0)
+  await clickText("开始下载")
+  await waitFor(`document.body.innerText.includes('全局请求频率须为')`, "全局频率范围校验")
+  await setTrafficField("request-rate", 40)
+  await setTrafficField("host-request-rate", 41)
+  await clickText("开始下载")
+  await waitFor(`document.body.innerText.includes('单站请求频率须为')`, "单站频率不能超过全局")
+  await setTrafficField("host-request-rate", 8)
+
   await send("Page.navigate", { url: `${base}/` })
   await waitFor(`document.body.innerText.includes('已就绪，下载前')`, "重新载入页面")
   await send("Emulation.setDeviceMetricsOverride", {
@@ -261,6 +276,123 @@ try {
   await screenshot("mobile.png")
 
   let realDownload = false
+  // 悬停只显示已有结果，不自行探测；模拟返回用于稳定检查名称、IPv6、键盘和手机交互。
+  await send("Emulation.setDeviceMetricsOverride", {width:1440,height:1000,deviceScaleFactor:1,mobile:false})
+  await evaluate(`window.scrollTo(0,0); window.hostSmokeFetch = window.fetch; window.hostSmokeCalls = 0;
+    window.fetch = async (input, init) => {
+      if (new URL(String(input),location.href).pathname !== '/api/hosts/test') return window.hostSmokeFetch(input,init)
+      window.hostSmokeCalls++
+      await new Promise(resolve => setTimeout(resolve,500))
+      return new Response(JSON.stringify({checkedAt:new Date().toISOString(),probe:"tcp",tested:13,available:12,results:[
+        {name:'银河证券上证云上海二',address:'114.141.177.40:7709',ok:true,latencyMs:82},
+        {name:'银河证券IPV6行情',address:'[2408:4003:1f20::1e6]:7709',ok:true,latencyMs:128},
+        {name:'失败测试站',address:'127.0.0.2:7709',ok:false,latencyMs:1000,error:'TCP 连接失败'},
+        ...Array.from({length:10},(_,i)=>({name:'行情测试站 '+(i+1),address:'192.0.2.'+(i+1)+':7709',ok:true,latencyMs:150+i}))
+      ]}), {headers:{'Content-Type':'application/json'}})
+    }`)
+  const hostButton = await evaluate(`document.querySelector('[data-testid="available-hosts-trigger"]').getBoundingClientRect().toJSON()`)
+  await send("Input.dispatchMouseEvent", {type:"mouseMoved",x:hostButton.x+10,y:hostButton.y+10})
+  await waitFor(`document.body.innerText.includes('尚无检测结果')`, "悬停线路空状态")
+  if (await evaluate(`window.hostSmokeCalls !== 0`)) throw new Error("悬停不应发起网络探测")
+  await clickText("重新检测")
+  await waitFor(`Boolean(document.querySelector('[data-testid="available-hosts-trigger"] [aria-label="线路检测中"]'))`, "线路加载状态")
+  await waitFor(`document.querySelector('[data-testid="available-hosts-trigger"]')?.innerText.includes('可用 12/13')`, "可用线路统计")
+  await waitFor(`document.querySelector('table[aria-label="全部行情站点"]')?.innerText.includes('[2408:4003:1f20::1e6]:7709')`, "站点名称与 IPv6 地址")
+  await waitFor(`document.body.innerText.includes("仅 TCP 连通性") && document.querySelector('table[aria-label="全部行情站点"] thead')?.innerText.includes("TCP 耗时")`, "TCP 探测口径说明")
+  if (await evaluate(`document.querySelectorAll('table[aria-label="全部行情站点"] tbody tr').length !== 13 || !document.querySelector('table[aria-label="全部行情站点"]').innerText.includes('失败测试站')`)) throw new Error("站点状态未完整展示")
+  await screenshot("available-hosts-desktop.png")
+  await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await send("Input.dispatchKeyEvent", {type:"keyUp",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await waitFor(`!document.querySelector('[data-slot="popover-content"]')`, "关闭固定站点面板")
+  await send("Input.dispatchMouseEvent", {type:"mouseMoved",x:5,y:5})
+  const hostButtonAfter = await evaluate(`document.querySelector('[data-testid="available-hosts-trigger"]').getBoundingClientRect().toJSON()`)
+  await send("Input.dispatchMouseEvent", {type:"mouseMoved",x:hostButtonAfter.x+10,y:hostButtonAfter.y+10})
+  await waitFor(`Boolean(document.querySelector('[data-slot="popover-content"]'))`, "再次悬停站点列表")
+  await send("Input.dispatchMouseEvent", {type:"mouseMoved",x:5,y:5})
+  await evaluate(`document.activeElement?.blur()`)
+  await waitFor(`!document.querySelector('[data-slot="popover-content"]')`, "移出悬浮面板关闭")
+  await evaluate(`document.querySelector('[data-testid="available-hosts-trigger"]').focus()`)
+  await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Enter",code:"Enter",text:"\r",windowsVirtualKeyCode:13})
+  await send("Input.dispatchKeyEvent", {type:"keyUp",key:"Enter",code:"Enter",windowsVirtualKeyCode:13})
+  await waitFor(`Boolean(document.querySelector('[data-slot="popover-content"]'))`, "键盘打开站点列表")
+  await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await send("Input.dispatchKeyEvent", {type:"keyUp",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await waitFor(`!document.querySelector('[data-slot="popover-content"]')`, "Escape 关闭站点列表")
+  await send("Emulation.setDeviceMetricsOverride", {width:390,height:844,deviceScaleFactor:1,mobile:true})
+  await evaluate(`window.scrollTo(0,0);document.querySelector('[data-testid="available-hosts-trigger"]').click()`)
+  await waitFor(`Boolean(document.querySelector('[data-slot="popover-content"]'))`, "手机点击站点列表")
+  if (await evaluate(`document.querySelector('[data-slot="popover-content"]').getBoundingClientRect().right > innerWidth || document.documentElement.scrollWidth > innerWidth`)) throw new Error("手机线路浮层横向溢出")
+  await screenshot("available-hosts-mobile.png")
+  await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await send("Input.dispatchKeyEvent", {type:"keyUp",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
+  await evaluate(`window.fetch = window.hostSmokeFetch`)
+  // 离线构造超过两个分页的分钟历史，回归完整读取、日期边界和真实指针框选。
+  // 仅替换当前浏览器的 fetch，服务端、用户仓库和下载文件均不改动。
+  await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false })
+  await evaluate(`(async () => {
+    window.previewOriginalFetch = window.fetch
+    const status = await fetch('/api/warehouse').then(r => r.json())
+    const rows = Array.from({length: 2301}, (_, i) => ({ts: new Date(Date.UTC(2024,0,2,9,30+i)).toISOString().replace('T',' ').slice(0,19), open:'10', high:'12', low:'9', close:String(10 + Math.sin(i/20)), volume_shares:95, amount_cny:'1000'}))
+    const dataset = {exchange:'SH', code:'600000', name:'预览测试', period:'1m', rows:rows.length, earliest:rows[0].ts, latest:rows.at(-1).ts, updatedAt:rows.at(-1).ts}
+    window.previewPageCalls = 0
+    window.fetch = async (input, init) => {
+      const url = new URL(String(input), location.href)
+      let body
+      if (url.pathname === '/api/warehouse') body = {...status, ready:true, rows:2301, symbols:1, earliest:dataset.earliest, latest:dataset.latest}
+      if (url.pathname === '/api/warehouse/datasets') body = {items:[dataset], total:1, page:1, pageSize:50}
+      if (url.pathname === '/api/warehouse/bars') {
+        window.previewPageCalls++
+        const before = url.searchParams.get('before')
+        body = rows.filter(row => !before || row.ts < before).slice(-Number(url.searchParams.get('limit')))
+      }
+      return body === undefined ? window.previewOriginalFetch(input, init) : new Response(JSON.stringify(body), {headers:{'Content-Type':'application/json'}})
+    }
+  })()`)
+  await clickText("数据仓库")
+  await waitFor(`document.querySelector('.dataset-browser tbody')?.innerText.includes('预览测试')`, "离线历史数据集")
+  await clickText("查看")
+  await waitFor(`document.querySelector('[data-testid="preview-coverage"]')?.innerText.includes('2,301')`, "加载超过 1000 条完整历史")
+  if (await evaluate(`window.previewPageCalls < 3 || window.previewPageCalls > 6`)) throw new Error(`仓库分页异常：${await evaluate('window.previewPageCalls')}`)
+  await clickText("最早")
+  await waitFor(`document.querySelector('[data-slot="sheet-content"] tbody')?.innerText.includes('2024-01-02 09:30:00')`, "明细最早记录")
+  const setPreviewDate = async (label, value) => evaluate(`(() => {
+    const input = document.querySelector('[data-slot="sheet-content"] input[aria-label="${label}"]')
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input, '${value}')
+    input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true}))
+  })()`)
+  await setPreviewDate("开始日期", "2024-01-03")
+  await setPreviewDate("结束日期", "2024-01-03")
+  await clickText("应用日期")
+  await waitFor(`document.querySelector('[data-testid="preview-selection"]')?.innerText.includes('1,431')`, "结束日包含全部分钟记录")
+  await setPreviewDate("开始日期", "2025-01-01")
+  await setPreviewDate("结束日期", "2025-01-02")
+  await clickText("应用日期")
+  await waitFor(`document.querySelector('[data-slot="sheet-content"] [role="alert"]')?.innerText.includes('没有行情')`, "日期空范围反馈")
+  await clickText("查看全部")
+  await evaluate(`document.querySelector('[data-testid="preview-chart"]').scrollIntoView({block:'center'})`)
+  const chart = await evaluate(`document.querySelector('[data-testid="preview-chart"] .recharts-wrapper').getBoundingClientRect().toJSON()`)
+  const y = chart.y + chart.height / 2
+  await send("Input.dispatchMouseEvent", {type:"mouseMoved", x:chart.x+chart.width*.3, y})
+  await send("Input.dispatchMouseEvent", {type:"mousePressed", button:"left", clickCount:1, x:chart.x+chart.width*.3, y})
+  for (let i=3; i<=7; i++) { await send("Input.dispatchMouseEvent", {type:"mouseMoved", buttons:1, x:chart.x+chart.width*i/10, y}); await sleep(50) }
+  await send("Input.dispatchMouseEvent", {type:"mouseReleased", button:"left", clickCount:1, x:chart.x+chart.width*.7, y})
+  await waitFor(`!document.querySelector('[data-testid="preview-selection"]')?.innerText.includes('2,301')`, "指针框选缩放")
+  await screenshot("preview-selection.png")
+  await clickText("查看全部")
+  await waitFor(`document.querySelector('[data-testid="preview-selection"]')?.innerText.includes('2,301')`, "重置完整范围")
+  await evaluate(`document.querySelector('.recharts-brush-traveller').focus()`)
+  await send("Input.dispatchKeyEvent", {type:"keyDown", key:"ArrowRight", code:"ArrowRight", windowsVirtualKeyCode:39})
+  await send("Input.dispatchKeyEvent", {type:"keyUp", key:"ArrowRight", code:"ArrowRight", windowsVirtualKeyCode:39})
+  await waitFor(`!document.querySelector('[data-testid="preview-selection"]')?.innerText.includes('2,301')`, "键盘调整历史范围")
+  await clickText("查看全部")
+  await send("Emulation.setDeviceMetricsOverride", {width:390,height:844,deviceScaleFactor:1,mobile:true})
+  await evaluate(`document.querySelector('[data-slot="sheet-content"]').scrollTo(0,0)`)
+  await sleep(250)
+  if (await evaluate(`document.querySelector('[data-slot="sheet-content"]').scrollWidth > innerWidth`)) throw new Error("手机行情预览横向溢出")
+  await screenshot("preview-mobile-full.png")
+  await evaluate(`document.querySelector('[data-slot="sheet-content"] button[aria-label="关闭"]').click(); window.fetch = window.previewOriginalFetch`)
+  await sleep(200)
+  await clickText("数据采集")
   let pricePreview = false
   let minutePagination = false
   let warehouseVerified = false
@@ -465,6 +597,13 @@ try {
     pathBrowser: true,
     scopeSwitch: true,
     formValidation: true,
+    trafficLimitValidation: true,
+    availableHostNames: true,
+    hostsHoverKeyboardAndMobile: true,
+    fullHistoryPreview: true,
+    previewDateRange: true,
+    previewBoxZoom: true,
+    previewTablePagination: true,
     realDownload,
     pricePreview,
     minutePagination,

@@ -11,9 +11,10 @@ import (
 
 // Host 表示一条通达信行情线路；选线时以 IP/域名和端口共同去重。
 type Host struct {
-	IP     string `json:"ip"`   // 服务器 IP 或域名；名称沿用 IP，但也允许 DNS 名称。
-	Port   int    `json:"port"` // TCP 端口，默认行情端口为 7709。
-	Weight int    `json:"-"`    // 内置配置携带的线路权重，不对外序列化；实际可用线路按业务探测耗时排序。
+	Name   string `json:"name,omitempty"` // 站点展示名称，不参与 IP/端口去重；手填地址时可为空。
+	IP     string `json:"ip"`             // 服务器 IPv4、IPv6 或 DNS 地址；与展示名称 Name 独立。
+	Port   int    `json:"port"`           // TCP 端口，默认行情端口为 7709。
+	Weight int    `json:"-"`              // 内置配置携带的线路权重，不对外序列化；实际可用线路按 TCP 探测耗时排序。
 }
 
 func (h Host) Address() string { return net.JoinHostPort(h.IP, strconv.Itoa(h.Port)) }
@@ -89,7 +90,7 @@ type MinutePoint struct {
 	Volume int64   `json:"volume"` // 分时接口返回的成交量原值；不参与标准 Bar 归档的单位转换。
 }
 
-// Transaction 保留通达信逐笔接口字段，当前用于线路业务自检，不作为历史 K 线入库。
+// Transaction 保留通达信逐笔接口字段，不作为历史 K 线入库；TCP 线路探测不调用逐笔接口。
 type Transaction struct {
 	Time      string  `json:"time"`      // 当日成交时分 HH:MM；接口未在此模型中携带自然日。
 	Price     float64 `json:"price"`     // 成交价格，人民币元。

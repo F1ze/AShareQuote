@@ -28,6 +28,7 @@ type ClientFactory func(hosts []domain.Host, timeout time.Duration, offset int) 
 // JobService 管理单个活动任务；互斥检查与发布任务必须连续完成，防止两个请求同时启动。
 // 这也避免多个任务同时合并同一 CSV，数据库的跨进程单写者约束则由入口的文件锁保障。
 type JobService struct {
+	configureTraffic func(int, int)        // 应用共享限流器的策略更新端口，由组装根注入，不执行协议细节。
 	mu               sync.RWMutex          // 保护当前任务指针及“检查无活动任务→发布新任务”的临界区。
 	current          *jobRun               // 最近一次任务，结束后仍保留供界面查看；nil 表示尚无任务。
 	defaultOut       string                // 未指定 OutputDir 时使用的归档目录，不是 DuckDB 文件路径。
@@ -43,14 +44,15 @@ type JobService struct {
 
 // JobDependencies 是任务服务的组装输入；实现均从入口注入，服务不导入任何存储或协议实现。
 type JobDependencies struct {
-	DefaultOutput string               // 缺省原始归档目录，与数据库目录分开。
-	Lines         LineProvider         // 通达信线路服务，纯本地/历史源测试可为 nil。
-	NewClient     ClientFactory        // 每个 worker 独占的协议客户端工厂。
-	Archives      func(string) Archive // 按输出目录建立归档仓库，必填。
-	Factors       FactorRepository     // 独立因子附件读写端口，仅所选来源/选项需要时使用。
-	Jobs          JobRepository        // 持久任务记录；nil 时禁用历史恢复。
-	Warehouse     Warehouse            // 可选幂等入库端口。
-	Local         LocalSource          // 可选本地解码来源。
+	ConfigureTraffic func(int, int)       // 可选通达信全局/单站频率配置端口，任务探测前调用。
+	DefaultOutput    string               // 缺省原始归档目录，与数据库目录分开。
+	Lines            LineProvider         // 通达信线路服务，纯本地/历史源测试可为 nil。
+	NewClient        ClientFactory        // 每个 worker 独占的协议客户端工厂。
+	Archives         func(string) Archive // 按输出目录建立归档仓库，必填。
+	Factors          FactorRepository     // 独立因子附件读写端口，仅所选来源/选项需要时使用。
+	Jobs             JobRepository        // 持久任务记录；nil 时禁用历史恢复。
+	Warehouse        Warehouse            // 可选幂等入库端口。
+	Local            LocalSource          // 可选本地解码来源。
 }
 
 // NewJobService 仅保存依赖，不读写文件；Restore 显式加载已有任务状态。
@@ -58,7 +60,7 @@ func NewJobService(d JobDependencies) (*JobService, error) {
 	if d.Archives == nil {
 		return nil, fmt.Errorf("未配置原始归档仓库")
 	}
-	return &JobService{defaultOut: d.DefaultOutput, provider: d.Lines, newClient: d.NewClient, archiveFactory: d.Archives,
+	return &JobService{configureTraffic: d.ConfigureTraffic, defaultOut: d.DefaultOutput, provider: d.Lines, newClient: d.NewClient, archiveFactory: d.Archives,
 		factorRepository: d.Factors, journal: d.Jobs, warehouse: d.Warehouse, localSource: d.Local}, nil
 }
 
@@ -155,7 +157,8 @@ func (m *JobService) start(options DownloadOptions, resume *savedRun) (TaskSnaps
 	// 生命周期由显式取消和应用 Shutdown 控制，网络请求再继承这个任务上下文。
 	ctx, cancel := context.WithCancel(context.Background())
 	task := &jobRun{
-		id: time.Now().Format("20060102-150405.000000000"), state: "preparing", message: "正在检测可用行情线路",
+		configureTraffic: m.configureTraffic,
+		id:               time.Now().Format("20060102-150405.000000000"), state: "preparing", message: "正在检测可用行情线路",
 		output: output, options: options, provider: m.provider, newClient: m.newClient,
 		started: time.Now(), ctx: ctx, cancel: cancel,
 		journal: m.journal, localSource: m.localSource, historySource: spec.Adapter, factorRepository: m.factorRepository,

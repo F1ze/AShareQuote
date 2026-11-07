@@ -22,6 +22,14 @@ func (s *Server) handlePreview(c echo.Context) error {
 			return writeError(c, 400, domain.ErrInvalidInput)
 		}
 	}
-	result, err := s.preview.Preview(c.Request().Context(), domain.PreviewQuery{File: c.QueryParam("file"), Mode: c.QueryParam("mode"), Limit: limit})
+	all := false
+	if value := c.QueryParam("all"); value != "" {
+		var err error
+		all, err = strconv.ParseBool(value)
+		if err != nil {
+			return writeError(c, 400, domain.ErrInvalidInput)
+		}
+	}
+	result, err := s.preview.Preview(c.Request().Context(), domain.PreviewQuery{File: c.QueryParam("file"), Mode: c.QueryParam("mode"), Limit: limit, All: all})
 	return respond(c, result, err, http.StatusInternalServerError)
 }

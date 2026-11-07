@@ -15,7 +15,7 @@ type FileBrowser interface {
 }
 type WorkspaceService struct {
 	files FileBrowser  // 本机路径适配器，未配置时明确返回能力不可用。
-	lines LineProvider // 线路业务探测端口，不将 TCP 细节暴露给 Handler。
+	lines LineProvider // 线路 TCP 探测端口，不将 TCP 细节暴露给 Handler。
 }
 
 func NewWorkspaceService(files FileBrowser, lines LineProvider) *WorkspaceService {

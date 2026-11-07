@@ -35,12 +35,19 @@ func (t *jobRun) run() {
 		t.runHistorySource()
 		return
 	}
+	if t.configureTraffic != nil {
+		t.configureTraffic(t.options.RequestRate, t.options.HostRequestRate)
+	}
 	if t.provider == nil || t.newClient == nil {
 		t.finish("failed", "下载服务未正确初始化")
 		return
 	}
-	// 第 4 步：生成并回读内置配置，探测真实业务线路，再载入可选 gbbq 事件。
+	// 第 4 步：生成并回读内置配置，探测 TCP 连通线路，再载入可选 gbbq 事件。
 	hosts, report, err := t.provider.Available(t.ctx, time.Duration(t.options.Timeout)*time.Second)
+	// 无论探测成败，都向任务快照发布本次报告；不额外发起一轮探测来填充界面。
+	t.mu.Lock()
+	t.lineReport = &report
+	t.mu.Unlock()
 	if err != nil {
 		if t.ctx.Err() != nil {
 			t.finish("cancelled", "任务已取消")
@@ -59,8 +66,8 @@ func (t *jobRun) run() {
 		t.finish("failed", "没有可用行情线路，请检查网络后重试")
 		return
 	}
-	t.setState("preparing", "线路业务自检通过，正在准备证券清单")
-	t.log("info", "内置配置已生成并回读校验（%d 字节），业务自检通过 %d/%d 条线路", report.ConfigBytes, report.Available, report.Tested)
+	t.setState("preparing", "线路 TCP 连通性检测通过，正在准备证券清单")
+	t.log("info", "内置配置已生成并回读校验（%d 字节），TCP 检测通过 %d/%d 条线路", report.ConfigBytes, report.Available, report.Tested)
 	if t.options.GBBQPath != "" {
 		if t.factorRepository == nil {
 			t.finish("failed", "未配置因子仓库")
@@ -149,9 +156,11 @@ func (t *jobRun) run() {
 
 	// 第 7 步：启动 worker、按需投递证券、关队列并等待收尾。
 	// 有界队列提供背压，避免一次塞入全部任务；每个 worker 从不同线路偏移开始连接。
-	jobs := make(chan Security, t.options.Workers*2)
+	workerCount := min(t.options.Workers, len(securities))
+	t.log("info", "并发上限 %d，出站启动频率全局 %d 次/秒、单站 %d 次/秒（连接、握手、重试均计入）", workerCount, t.options.RequestRate, t.options.HostRequestRate)
+	jobs := make(chan Security, workerCount*2)
 	var wg sync.WaitGroup
-	for i := 0; i < t.options.Workers; i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func(offset int) {
 			defer wg.Done()

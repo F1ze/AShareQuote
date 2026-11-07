@@ -25,6 +25,8 @@ export interface DownloadOptions {
   startDate: string
   endDate: string
   workers: number
+  requestRate?: number
+  hostRequestRate?: number
   timeout: number
   outputDir: string
   gbbqPath: string
@@ -51,6 +53,7 @@ export interface LogEntry {
 }
 
 export interface TaskSnapshot {
+  lineReport?: HostReport
   id: string
   state: TaskState
   total: number
@@ -74,6 +77,8 @@ export interface TaskSnapshot {
 }
 
 export interface Defaults {
+  requestRate: number
+  hostRequestRate: number
   warehouseEnabled: boolean
   outputDir: string
   gbbqPath: string
@@ -125,18 +130,19 @@ export interface DatasetPage {
 }
 
 export interface HostStatus {
+  name?: string
   address: string
   latencyMs: number
   ok: boolean
-  securities?: number
-  ticks?: number
   error?: string
 }
 
 export interface HostReport {
+  probe?: "tcp" // 旧任务报告没有此字段，不能将其耗时解释为 TCP 建连耗时。
+  checkedAt?: string
   tested: number
   available: number
-  results: HostStatus[]
+  results: HostStatus[] | null
 }
 
 export interface BrowseEntry {
@@ -160,6 +166,17 @@ export interface PreviewBar {
   close: number
   volume: number
   amount: number
+}
+
+// 仓库保留十进制价格文本；只有图表展示层转换为浮点数，不用于交易计算。
+export interface WarehouseBar {
+  ts: string
+  open: string
+  high: string
+  low: string
+  close: string
+  volume_shares: number
+  amount_cny: string
 }
 
 export interface PreviewResult {

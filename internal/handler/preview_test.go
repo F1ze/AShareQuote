@@ -2,15 +2,54 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"quotes/internal/domain"
 	"quotes/internal/repository"
 )
+
+func TestPreviewAllHTTP(t *testing.T) {
+	dir := t.TempDir()
+	var csv strings.Builder
+	csv.WriteString("date,open,high,low,close,volume,amount\n")
+	for i := 0; i < 1501; i++ {
+		fmt.Fprintf(&csv, "%s,10,11,9,10,0.95,950\n", time.Date(2020, 1, 1, 0, 0, 0, 0, domain.ExchangeTime).AddDate(0, 0, i).Format("2006-01-02"))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sh600000_day.csv"), []byte(csv.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(t, dir)
+	for _, tc := range []struct {
+		query         string
+		status, count int
+	}{
+		{"all=true", 200, 1501}, {"limit=800", 200, 800}, {"all=invalid", 400, 0}, {"all=true&limit=0", 400, 0},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/api/preview?file=sh600000_day.csv&"+tc.query, nil))
+			if response.Code != tc.status {
+				t.Fatalf("状态 %d：%s", response.Code, response.Body.String())
+			}
+			if tc.status == 200 {
+				var result domain.PreviewResponse
+				if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				if len(result.Bars) != tc.count || result.Total != 1501 {
+					t.Fatalf("条数不符：%d/%d", len(result.Bars), result.Total)
+				}
+			}
+		})
+	}
+}
 
 func TestPreviewComputesQFQWithoutChangingRawCSV(t *testing.T) {
 	dir := t.TempDir()

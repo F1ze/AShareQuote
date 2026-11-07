@@ -100,6 +100,7 @@ func TestTruncatedJournalAndInterruptedRecovery(t *testing.T) {
 	}
 	id := "20260101-000000.000000001"
 	s := TaskSnapshot{ID: id, State: "running", Total: 2, StartedAt: time.Now(), Options: DownloadOptions{Category: 9}}
+	s.LineReport = &domain.LineReport{CheckedAt: time.Now().UTC(), Tested: 1, Available: 1, Results: []domain.HostStatus{{Name: "恢复测试站", Address: "127.0.0.1:7709", OK: true}}}
 	if err := j.Append(id, runEvent{Kind: "start", Snapshot: &s}); err != nil {
 		t.Fatal(err)
 	}
@@ -119,5 +120,8 @@ func TestTruncatedJournalAndInterruptedRecovery(t *testing.T) {
 	got := m.Snapshot()
 	if got.State != "interrupted" || got.Done != 1 || got.Bars != 7 || got.EndedAt == nil {
 		t.Fatalf("bad recovery: %+v", got)
+	}
+	if got.LineReport == nil || len(got.LineReport.Results) != 1 || got.LineReport.Results[0].Name != "恢复测试站" {
+		t.Fatalf("重启后丢失历史检测报告：%+v", got.LineReport)
 	}
 }

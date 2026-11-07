@@ -14,6 +14,7 @@
     "frontend:build": "npm --prefix frontend run build",
     "frontend:lint": "npm --prefix frontend run lint",
     "test": "node scripts/go.mjs test ./...",
+    "test:preview": "node --test scripts/preview.test.mjs",
     "lint": "npm run frontend:lint",
     "setup:native": "node scripts/setup-native.mjs"
   }
