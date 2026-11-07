@@ -40,6 +40,13 @@ func ParseHost(value string) (Host, error) {
 	return Host{IP: value, Port: 7709}, nil
 }
 
+// 通达信市场编号。保持 uint8，与现有 Security.Market 和协议字段直接兼容。
+const (
+	MarketSZ uint8 = iota
+	MarketSH
+	MarketBJ
+)
+
 // Security 以市场和六位代码共同标识证券：0=深圳，1=上海，2=北京。
 // 上市/退市日期缺失时保持空值，不能从已有行情最早/最晚日期反推这些参考资料。
 type Security struct {

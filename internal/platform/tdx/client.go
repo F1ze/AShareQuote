@@ -49,14 +49,14 @@ type Transaction = domain.Transaction
 
 // Client 由单个 worker 独占，不支持并发请求；失败后关闭连接再按线路轮换重连。
 type Client struct {
-	hosts   []Host             // 本客户端独立复制并随机打乱的候选列表，不改写提供器或其他客户端的列表。
-	traffic *TrafficController // 应用共享的全局/单站请求预算；由组装根注入。
-	timeout time.Duration      // 每次拨号/握手/请求读写的期限，不是整次历史下载的总时限。
-	conn    net.Conn           // 当前独占 TCP 连接，nil 时下次请求重连；失败必须关闭并清空。
-	offset  int                // 下一次重连优先尝试的线路偏移，通过取模允许跨列表末端轮换。
-	host    Host               // 最近一次成功拨号所用端点；不代表列表中所有端点均可用。
-	ctx     context.Context    // 任务取消上下文；拨号直接继承，阻塞读写由取消回调关闭连接打断。
-	dial    DialFunc           // 可注入的统一出站拨号函数；nil 使用系统直连，见 SetDialer。
+	hosts   []Host                      // 本客户端独立复制且保持优先级的候选列表，不改写提供器或其他客户端的列表。
+	wait    func(context.Context) error // 可选的全局等待函数；仅在拨号前和复用连接发请求前调用。
+	timeout time.Duration               // 每次拨号/握手/请求读写的期限，不是整次历史下载的总时限。
+	conn    net.Conn                    // 当前独占 TCP 连接，nil 时下次请求重连；失败必须关闭并清空。
+	offset  int                         // 下一次重连优先尝试的线路偏移，通过取模允许跨列表末端轮换。
+	host    Host                        // 最近一次成功拨号所用端点；不代表列表中所有端点均可用。
+	ctx     context.Context             // 任务取消上下文；拨号直接继承，阻塞读写由取消回调关闭连接打断。
+	dial    DialFunc                    // 可注入的统一出站拨号函数；nil 使用系统直连，见 SetDialer。
 }
 
 // DialFunc 与 net.Dialer.DialContext 同签名；组装根注入统一代理拨号器时使用。
@@ -66,22 +66,22 @@ func NewClient(hosts []Host, timeout time.Duration, offset int) *Client {
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	shuffled := slices.Clone(hosts)
-	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-	if len(shuffled) > 0 {
-		offset = (offset%len(shuffled) + len(shuffled)) % len(shuffled)
+	// 保留提供器的优先级；worker 只选择初始偏移，故障时仍按完整列表轮换。
+	ordered := slices.Clone(hosts)
+	if len(ordered) > 0 {
+		offset = (offset%len(ordered) + len(ordered)) % len(ordered)
 	}
-	return &Client{hosts: shuffled, timeout: timeout, offset: offset, ctx: context.Background()}
+	return &Client{hosts: ordered, timeout: timeout, offset: offset, ctx: context.Background()}
 }
 
-// SetTrafficController 必须在客户端使用前注入；所有 worker 和线路探测共享同一个调度器。
-func (c *Client) SetTrafficController(traffic *TrafficController) { c.traffic = traffic }
+// SetWaitFunc 注入应用共享的全局限速等待；握手及新连接首包内部不得调用它。
+func (c *Client) SetWaitFunc(wait func(context.Context) error) { c.wait = wait }
 
-func (c *Client) waitTraffic(host Host) error {
-	if c.traffic == nil {
+func (c *Client) waitTraffic() error {
+	if c.wait == nil {
 		return c.ctx.Err()
 	}
-	return c.traffic.Wait(c.ctx, host)
+	return c.wait(c.ctx)
 }
 
 // SetContext 将任务取消传播到拨号、握手和正在进行的请求；首次使用前设置。
@@ -112,8 +112,8 @@ func (c *Client) connect() error {
 		// 各 worker 从不同偏移开始；成功后移动偏移，让下次重连优先尝试下一条线路。
 		idx := (c.offset + i) % len(c.hosts)
 		host := c.hosts[idx]
-		// 连接失败同样消耗共享预算，防止不可达线路被多个 worker 无间隔重试。
-		if err := c.waitTraffic(host); err != nil {
+		// 全局等待只放在拨号前；连接失败后的换线重试也受同一频率约束。
+		if err := c.waitTraffic(); err != nil {
 			return err
 		}
 		// 拨号期限与原 net.Dialer 超时语义一致：注入统一拨号器时也按 timeout 约束。
@@ -156,9 +156,6 @@ func (c *Client) connect() error {
 // 后续请求按业务命令号匹配应答，允许有限跳过服务器夹带的其他报文。
 func (c *Client) handshake() error {
 	for _, packet := range [][]byte{setup1, setup2} {
-		if err := c.waitTraffic(c.host); err != nil {
-			return err
-		}
 		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 		if err := writeAll(c.conn, packet); err != nil {
 			return fmt.Errorf("握手写入失败：%w", err)
@@ -166,9 +163,6 @@ func (c *Client) handshake() error {
 		if _, _, err := readMessage(c.conn); err != nil {
 			return fmt.Errorf("握手应答失败：%w", err)
 		}
-	}
-	if err := c.waitTraffic(c.host); err != nil {
-		return err
 	}
 	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 	if err := writeAll(c.conn, setup3); err != nil {
@@ -230,16 +224,19 @@ func (c *Client) request(spec requestSpec) ([]byte, error) {
 			c.Close()
 			return nil, err
 		}
-		if c.conn == nil {
+		freshConnection := c.conn == nil
+		if freshConnection {
 			if err := c.connect(); err != nil {
 				lastErr = err
 				continue
 			}
 		}
-		// 第 3 步：每次重试也重新等待预算；限流等待不占用协议读写超时。
-		if err := c.waitTraffic(c.host); err != nil {
-			c.Close()
-			return nil, err
+		// 第 3 步：只在复用连接发请求前等待；新连接已在拨号前等待，握手与首包连续完成。
+		if !freshConnection {
+			if err := c.waitTraffic(); err != nil {
+				c.Close()
+				return nil, err
+			}
 		}
 		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 		conn := c.conn

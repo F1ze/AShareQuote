@@ -8,40 +8,53 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-func TestSharedTrafficIncludesConnectionsHandshakeAndRequests(t *testing.T) {
-	host := startTestServerN(t, 2, func(conn net.Conn) error {
+func TestClientPreservesHostPriority(t *testing.T) {
+	hosts := []Host{{IP: "192.0.2.1", Port: 7709}, {IP: "192.0.2.2", Port: 7709}}
+	client := NewClient(hosts, time.Second, 1)
+	if client.offset != 1 || len(client.hosts) != 2 || client.hosts[0].IP != hosts[0].IP || client.hosts[1].IP != hosts[1].IP {
+		t.Fatalf("线路优先级被改变：%+v，偏移 %d", client.hosts, client.offset)
+	}
+	client.hosts[0].IP = "192.0.2.3"
+	if hosts[0].IP != "192.0.2.1" {
+		t.Fatal("客户端修改了调用方线路列表")
+	}
+}
+
+func TestWaitFuncOnlyRunsBeforeDialAndReusedRequest(t *testing.T) {
+	host := startTestServer(t, func(conn net.Conn) error {
 		if err := serveTestHandshake(conn); err != nil {
 			return err
 		}
-		if _, _, err := readTestFrame(conn); err != nil {
-			return err
-		}
-		return writeTestMessage(conn, 0x044E, []byte{1, 0}, false)
-	})
-	traffic := NewTrafficController(1000, 50)
-	started := time.Now()
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			client := NewClient([]Host{host}, time.Second, 0)
-			defer client.Close()
-			client.SetTrafficController(traffic)
-			if count, err := client.SecurityCount(1); err != nil || count != 1 {
-				t.Errorf("业务请求失败：%d %v", count, err)
+		for range 2 {
+			if _, _, err := readTestFrame(conn); err != nil {
+				return err
 			}
-		}()
+			if err := writeTestMessage(conn, 0x044E, []byte{1, 0}, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := NewClient([]Host{host}, time.Second, 0)
+	defer client.Close()
+	waits := 0
+	client.SetWaitFunc(func(ctx context.Context) error {
+		waits++
+		return ctx.Err()
+	})
+	for range 2 {
+		count, err := client.SecurityCount(1)
+		if err != nil || count != 1 {
+			t.Fatalf("业务请求失败：%d %v", count, err)
+		}
 	}
-	wg.Wait()
-	// 两连接各消耗连接、三次握手、一次业务请求，共十个单站许可。
-	if time.Since(started) < 175*time.Millisecond {
-		t.Fatal("连接/握手或跨客户端共享限速被绕过")
+	// 首次拨号前一次，第二次复用连接请求前一次；握手和新连接首包不得等待。
+	if waits != 2 {
+		t.Fatalf("等待函数调用次数应为 2，实际为 %d", waits)
 	}
 }
 

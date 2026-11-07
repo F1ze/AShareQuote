@@ -37,6 +37,8 @@ export const api = {
   jobs: () => request<TaskSnapshot[]>("/jobs"),
   resume: (id: string) =>
     request<TaskSnapshot>(`/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
+  deleteJob: (id: string) =>
+    request<void>(`/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   warehouse: () => request<WarehouseStatus>("/warehouse"),
   datasets: (q: string, period: string, page: number) =>
     request<DatasetPage>(

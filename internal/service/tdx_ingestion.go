@@ -36,7 +36,7 @@ func (t *jobRun) run() {
 		return
 	}
 	if t.configureTraffic != nil {
-		t.configureTraffic(t.options.RequestRate, t.options.HostRequestRate)
+		t.configureTraffic(t.options.RequestRate)
 	}
 	if t.provider == nil || t.newClient == nil {
 		t.finish("failed", "下载服务未正确初始化")
@@ -93,16 +93,26 @@ func (t *jobRun) run() {
 		securities, _ = domain.ParseCodes(t.options.Codes)
 		t.log("info", "使用手动证券清单，共 %d 只", len(securities))
 	} else {
-		for _, marketValue := range t.options.Markets {
-			market := uint8(marketValue)
-			if t.ctx.Err() != nil {
-				t.finish("cancelled", "任务已取消")
-				return
-			}
-			t.log("info", "正在读取 %s 市场码表", strings.ToUpper(marketPrefix(market)))
-			list, err := t.discoverMarket(market)
-			if err != nil {
-				t.log("error", "%s 市场码表读取失败：%v", strings.ToUpper(marketPrefix(market)), err)
+		lists := make([][]Security, len(t.options.Markets))
+		errs := make([]error, len(t.options.Markets))
+		var marketWG sync.WaitGroup
+		for i, marketValue := range t.options.Markets {
+			marketWG.Add(1)
+			go func() {
+				defer marketWG.Done()
+				market := uint8(marketValue)
+				t.log("info", "正在读取 %s 市场码表", strings.ToUpper(marketPrefix(market)))
+				lists[i], errs[i] = t.discoverMarket(market)
+				if errs[i] == nil {
+					t.log("info", "%s 市场载入 %d 只证券", strings.ToUpper(marketPrefix(market)), len(lists[i]))
+				}
+			}()
+		}
+		marketWG.Wait()
+		for i, marketValue := range t.options.Markets {
+			if errs[i] != nil {
+				market := uint8(marketValue)
+				t.log("error", "%s 市场码表读取失败：%v", strings.ToUpper(marketPrefix(market)), errs[i])
 				if t.ctx.Err() != nil {
 					t.finish("cancelled", "任务已取消")
 				} else {
@@ -110,8 +120,11 @@ func (t *jobRun) run() {
 				}
 				return
 			}
-			t.log("info", "%s 市场载入 %d 只证券", strings.ToUpper(marketPrefix(market)), len(list))
-			securities = append(securities, list...)
+			securities = append(securities, lists[i]...)
+		}
+		if t.ctx.Err() != nil {
+			t.finish("cancelled", "任务已取消")
+			return
 		}
 	}
 	if t.options.ASharesOnly {
@@ -155,17 +168,21 @@ func (t *jobRun) run() {
 	}
 
 	// 第 7 步：启动 worker、按需投递证券、关队列并等待收尾。
-	// 有界队列提供背压，避免一次塞入全部任务；每个 worker 从不同线路偏移开始连接。
+	// 初始均分到八条优先线路，分散单线波动并避开慢线路；完整列表仍保留用于故障切换。
 	workerCount := min(t.options.Workers, len(securities))
-	t.log("info", "并发上限 %d，出站启动频率全局 %d 次/秒、单站 %d 次/秒（连接、握手、重试均计入）", workerCount, t.options.RequestRate, t.options.HostRequestRate)
+	t.log("info", "并发上限 %d，全局出站启动频率 %d 次/秒（拨号与复用连接请求计入）", workerCount, t.options.RequestRate)
 	jobs := make(chan Security, workerCount*2)
 	var wg sync.WaitGroup
+	initialLines := min(8, len(t.hosts))
+	if len(securities) >= 8 {
+		initialLines = t.rankHosts(securities[0])
+	}
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func(offset int) {
 			defer wg.Done()
 			t.worker(offset, jobs)
-		}(i % len(t.hosts))
+		}(i % initialLines)
 	}
 produce:
 	for _, security := range securities {
@@ -202,6 +219,18 @@ func (t *jobRun) discoverMarket(market uint8) ([]Security, error) {
 		contextual.SetContext(t.ctx)
 	}
 	defer client.Close()
+	if market == domain.MarketBJ {
+		if catalog, ok := client.(interface{ BeijingSecurities() ([]Security, error) }); ok {
+			securities, err := catalog.BeijingSecurities()
+			if err != nil {
+				return nil, err
+			}
+			if len(securities) == 0 {
+				return nil, errors.New("北交所专用码表为空")
+			}
+			return securities, nil
+		}
+	}
 	count, err := client.SecurityCount(market)
 	if err != nil {
 		return nil, err

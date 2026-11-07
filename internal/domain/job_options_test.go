@@ -41,18 +41,18 @@ func TestAShareOnlyOptionsUseFullStockRanges(t *testing.T) {
 
 func TestTrafficLimitOptions(t *testing.T) {
 	for _, tc := range []struct {
-		global, host, workers int
-		valid                 bool
+		rate, workers int
+		valid         bool
 	}{
-		{0, 0, 0, true}, {40, 8, 64, true}, {1, 1, 1, true}, {4, 0, 12, true},
-		{-1, 1, 1, false}, {201, 8, 1, false}, {40, -1, 1, false}, {8, 9, 1, false}, {40, 8, 65, false},
+		{0, 0, true}, {40, 64, true}, {1, 1, true}, {4, 12, true},
+		{-1, 1, false}, {201, 1, false}, {40, 65, false},
 	} {
-		t.Run(fmt.Sprintf("%d_%d_%d", tc.global, tc.host, tc.workers), func(t *testing.T) {
-			o, err := NormalizeDownloadOptions(DownloadOptions{Codes: "600000", RequestRate: tc.global, HostRequestRate: tc.host, Workers: tc.workers}, "unused", time.Now())
+		t.Run(fmt.Sprintf("%d_%d", tc.rate, tc.workers), func(t *testing.T) {
+			o, err := NormalizeDownloadOptions(DownloadOptions{Codes: "600000", RequestRate: tc.rate, Workers: tc.workers}, "unused", time.Now())
 			if (err == nil) != tc.valid {
 				t.Fatalf("限流参数校验错误：%+v %v", o, err)
 			}
-			if tc.global == 0 && tc.valid && (o.RequestRate != 40 || o.HostRequestRate != 8 || o.Workers != 12) {
+			if tc.rate == 0 && tc.valid && (o.RequestRate != 40 || o.Workers != 32) {
 				t.Fatalf("旧请求未继承默认保护：%+v", o)
 			}
 		})

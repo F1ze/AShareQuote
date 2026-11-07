@@ -47,6 +47,12 @@ func (s *Server) handleResume(c echo.Context) error {
 	}
 	return c.JSON(202, v)
 }
+func (s *Server) handleDeleteJob(c echo.Context) error {
+	if err := s.manager.Delete(c.Param("id")); err != nil {
+		return respond(c, nil, err, 409)
+	}
+	return c.NoContent(204)
+}
 func (s *Server) handleReference(c echo.Context) error {
 	var request domain.ReferenceImport
 	if err := decodeJSON(c, &request); err != nil {

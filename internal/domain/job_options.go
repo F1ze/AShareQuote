@@ -32,8 +32,8 @@ func DownloadDateRange(options DownloadOptions, now time.Time) (time.Time, time.
 const MaxHistoricOffset = 65535
 
 const (
-	DefaultRequestRate     = 40 // 应用内通达信连接/握手/业务请求的默认全局启动频率，次/秒。
-	DefaultHostRequestRate = 8  // 同一 IP/端口的默认启动频率，次/秒；不是服务商承诺的额度。
+	DefaultWorkers     = 32 // 网络等待型下载的默认并发数；实测与 40 相当，且比更高并发更节省连接资源。
+	DefaultRequestRate = 40 // 应用内通达信连接与业务请求的默认全局启动频率，次/秒。
 )
 
 // NormalizeDownloadOptions 只处理业务默认值与输入约束，不探测服务、目录或数据库。
@@ -50,7 +50,7 @@ func NormalizeDownloadOptions(o DownloadOptions, defaultOutput string, now time.
 		o.Count = 800
 	}
 	if o.Workers == 0 {
-		o.Workers = 12
+		o.Workers = DefaultWorkers
 	}
 	if o.Timeout == 0 {
 		o.Timeout = 8
@@ -58,11 +58,8 @@ func NormalizeDownloadOptions(o DownloadOptions, defaultOutput string, now time.
 	if o.RequestRate == 0 {
 		o.RequestRate = DefaultRequestRate
 	}
-	if o.HostRequestRate == 0 {
-		o.HostRequestRate = min(DefaultHostRequestRate, o.RequestRate)
-	}
-	if o.RequestRate < 1 || o.RequestRate > 200 || o.HostRequestRate < 1 || o.HostRequestRate > o.RequestRate {
-		return o, errors.New("全局请求频率须为 1–200，单站频率须为 1–全局频率，单位次/秒")
+	if o.RequestRate < 1 || o.RequestRate > 200 {
+		return o, errors.New("全局请求频率须为 1–200 次/秒")
 	}
 	if o.Source == "" {
 		o.Source = "tdx"

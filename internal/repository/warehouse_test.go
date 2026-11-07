@@ -152,8 +152,8 @@ func TestNativeWarehouseIdempotenceUnitsRevisionsAndSearch(t *testing.T) {
 	}
 }
 
-// 行情模型也按 500 行分批写入；完整归档重放不能新增行或修订。
-func TestNativeWarehouseORMLargeBarBatches(t *testing.T) {
+// 大归档使用原生集合写入；完整归档重放不能新增行或修订。
+func TestNativeWarehouseLargeBarIngest(t *testing.T) {
 	d := fixtureDB(t)
 	var body strings.Builder
 	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)

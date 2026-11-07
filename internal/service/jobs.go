@@ -28,7 +28,7 @@ type ClientFactory func(hosts []domain.Host, timeout time.Duration, offset int) 
 // JobService 管理单个活动任务；互斥检查与发布任务必须连续完成，防止两个请求同时启动。
 // 这也避免多个任务同时合并同一 CSV，数据库的跨进程单写者约束则由入口的文件锁保障。
 type JobService struct {
-	configureTraffic func(int, int)        // 应用共享限流器的策略更新端口，由组装根注入，不执行协议细节。
+	configureTraffic func(int)             // 应用共享全局限流器的策略更新端口，由组装根注入，不执行协议细节。
 	mu               sync.RWMutex          // 保护当前任务指针及“检查无活动任务→发布新任务”的临界区。
 	current          *jobRun               // 最近一次任务，结束后仍保留供界面查看；nil 表示尚无任务。
 	defaultOut       string                // 未指定 OutputDir 时使用的归档目录，不是 DuckDB 文件路径。
@@ -44,7 +44,7 @@ type JobService struct {
 
 // JobDependencies 是任务服务的组装输入；实现均从入口注入，服务不导入任何存储或协议实现。
 type JobDependencies struct {
-	ConfigureTraffic func(int, int)       // 可选通达信全局/单站频率配置端口，任务探测前调用。
+	ConfigureTraffic func(int)            // 可选通达信全局频率配置端口，任务探测前调用。
 	DefaultOutput    string               // 缺省原始归档目录，与数据库目录分开。
 	Lines            LineProvider         // 通达信线路服务，纯本地/历史源测试可为 nil。
 	NewClient        ClientFactory        // 每个 worker 独占的协议客户端工厂。

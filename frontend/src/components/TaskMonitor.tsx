@@ -150,8 +150,13 @@ export function TaskMonitor({ task, speedHistory, onCancel, onPreview, onResume 
               </span>
             </div>
             {!active && onResume && (
-              <button type="button" className="secondary-button mt-4" onClick={onResume}>
-                从已验证断点继续
+              <button
+                type="button"
+                className="secondary-button mt-4"
+                onClick={onResume}
+                title="校验并复用成功断点，未成功项会重新处理"
+              >
+                {task.failed > 0 ? `重试 ${task.failed} 只失败` : "从已验证断点继续"}
                 <ArrowRight className="size-3" />
               </button>
             )}

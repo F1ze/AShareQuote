@@ -26,7 +26,6 @@ export interface DownloadOptions {
   endDate: string
   workers: number
   requestRate?: number
-  hostRequestRate?: number
   timeout: number
   outputDir: string
   gbbqPath: string
@@ -78,7 +77,6 @@ export interface TaskSnapshot {
 
 export interface Defaults {
   requestRate: number
-  hostRequestRate: number
   warehouseEnabled: boolean
   outputDir: string
   gbbqPath: string
@@ -138,7 +136,7 @@ export interface HostStatus {
 }
 
 export interface HostReport {
-  probe?: "tcp" // 旧任务报告没有此字段，不能将其耗时解释为 TCP 建连耗时。
+  probe?: "tcp" | "quote" // quote 为完整行情往返；旧任务报告没有此字段，不能将其耗时解释为 TCP 建连耗时。
   checkedAt?: string
   tested: number
   available: number

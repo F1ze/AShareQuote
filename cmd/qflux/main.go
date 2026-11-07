@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"quotes/internal/domain"
 	"quotes/internal/handler"
 	"quotes/internal/platform/baostock"
@@ -56,9 +58,8 @@ func run() error {
 	fullSync := flag.Bool("full", false, "批处理重新扫描整个请求区间，用于历史修订和补洞")
 	syncSource := flag.String("source", "tdx", "批处理数据源：tdx 或 baostock（仅沪深，含源提供的退市证券）")
 	collectFactors := flag.Bool("factors", true, "BaoStock 采集时同步独立复权因子表")
-	workers := flag.Int("workers", 12, "通达信最大并发证券数，1–64")
+	workers := flag.Int("workers", domain.DefaultWorkers, "通达信最大并发证券数，1–64")
 	requestRate := flag.Int("request-rate", domain.DefaultRequestRate, "通达信全局请求启动频率，次/秒，1–200")
-	hostRequestRate := flag.Int("host-request-rate", domain.DefaultHostRequestRate, "通达信单站请求启动频率，次/秒，不超过全局频率")
 	proxyURL := flag.String("proxy", "", "出站代理（socks5/socks5h/http/https 地址）；留空使用已保存设置或环境变量")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -116,11 +117,13 @@ func run() error {
 
 	// 第 3 步：组装通达信线路/客户端、原始归档、DuckDB 和可扩展来源，恢复已有任务日志。
 	// 线路探测仅建立并关闭 TCP 连接，不发送行情数据；任务客户端接收可用线路列表，失败时可自行轮换。
-	traffic := tdx.NewTrafficController(domain.DefaultRequestRate, domain.DefaultHostRequestRate)
-	provider := lines.NewBuiltin(dialer.DialContext, traffic.Wait)
+	limiter := rate.NewLimiter(rate.Limit(domain.DefaultRequestRate), 1)
+	provider := lines.NewBuiltin(dialer.DialContext, func(ctx context.Context, _ domain.Host) error {
+		return limiter.Wait(ctx)
+	})
 	factory := func(hosts []domain.Host, timeout time.Duration, offset int) service.Client {
 		client := tdx.NewClient(hosts, timeout, offset)
-		client.SetTrafficController(traffic)
+		client.SetWaitFunc(limiter.Wait)
 		client.SetDialer(dialer.DialContext)
 		return client
 	}
@@ -140,7 +143,7 @@ func run() error {
 		return err
 	}
 	manager, err := service.NewJobService(service.JobDependencies{
-		ConfigureTraffic: traffic.Configure,
+		ConfigureTraffic: func(requestRate int) { limiter.SetLimit(rate.Limit(requestRate)) },
 		DefaultOutput:    absoluteOr(*outputDir, "downloads"), Lines: provider, NewClient: factory,
 		Archives: func(output string) service.Archive { return &repository.CSVArchive{Directory: output} },
 		Factors:  repository.FileFactors{}, Jobs: jobs, Warehouse: warehouse, Local: historyfile.New(),
@@ -177,13 +180,13 @@ func run() error {
 		if *syncSource == "baostock" {
 			markets = []int{0, 1}
 		}
-		return runSync(ctx, manager, domain.DownloadOptions{Workers: *workers, RequestRate: *requestRate, HostRequestRate: *hostRequestRate, Markets: markets, Codes: *syncCodes, Category: *syncCategory, StartDate: *syncFrom, EndDate: *syncTo, ASharesOnly: true, Incremental: !*fullSync, Storage: "duckdb", Source: *syncSource, CollectFactors: *collectFactors && *syncSource == "baostock", OutputDir: manager.DefaultOutput()}, *resumeID)
+		return runSync(ctx, manager, domain.DownloadOptions{Workers: *workers, RequestRate: *requestRate, Markets: markets, Codes: *syncCodes, Category: *syncCategory, StartDate: *syncFrom, EndDate: *syncTo, ASharesOnly: true, Incremental: !*fullSync, Storage: "duckdb", Source: *syncSource, CollectFactors: *collectFactors && *syncSource == "baostock", OutputDir: manager.DefaultOutput()}, *resumeID)
 	}
 	// 第 4 步：网页模式先实际绑定 API 端口，再启动前端，避免端口冲突时留下无用 Vite 进程。
 	frontendURL := localURL(*host, *port)
 	apiURL := localURL(*host, *apiPort)
 	apiHandler := handler.NewServer(handler.Dependencies{
-		Jobs: manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider),
+		Jobs: manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider, factory),
 		Preview:   service.NewPreviewService(manager.OutputDir, func(output string) service.PreviewRepository { return &repository.CSVArchive{Directory: output} }),
 		Warehouse: service.NewWarehouseService(warehouse),
 		Proxy:     proxySettings,

@@ -89,7 +89,7 @@ func TestWorkerPoolProcessesThousandSecuritiesWithBoundedParallelism(t *testing.
 			var configured atomic.Bool
 			manager, err := NewJobService(JobDependencies{
 				DefaultOutput: "unused", Lines: boundedLines{&configured},
-				ConfigureTraffic: func(global, perHost int) { configured.Store(global == 40 && perHost == 8) },
+				ConfigureTraffic: func(requestRate int) { configured.Store(requestRate == 40) },
 				Archives:         func(string) Archive { return concurrentArchive{f} },
 				NewClient:        func([]domain.Host, time.Duration, int) Client { f.created.Add(1); return &boundedClient{fixture: f} },
 			})

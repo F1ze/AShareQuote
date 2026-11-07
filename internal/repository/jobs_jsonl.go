@@ -111,6 +111,22 @@ func (j *JobJournal) Load(id string) (domain.SavedRun, error) {
 	return result, nil
 }
 
+// Delete 只移除指定执行编号的日志文件；编号白名单同时阻止路径穿越。
+func (j *JobJournal) Delete(id string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !runIDPattern.MatchString(id) {
+		return fmt.Errorf("%w：任务编号无效", domain.ErrInvalidInput)
+	}
+	if err := os.Remove(filepath.Join(j.directory, id+".jsonl")); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w：任务记录", domain.ErrNotFound)
+		}
+		return err
+	}
+	return nil
+}
+
 // NewJobJournal 准备 JSONL 日志目录；服务只拿到接口，不负责创建目录或选择文件格式。
 func NewJobJournal(directory string) (*JobJournal, error) {
 	if err := os.MkdirAll(directory, 0700); err != nil {

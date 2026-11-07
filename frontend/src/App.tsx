@@ -34,9 +34,8 @@ const initialOptions: DownloadOptions = {
   count: 800,
   startDate: "1990-12-19",
   endDate: yesterday(),
-  workers: 12,
+  workers: 32,
   requestRate: 40,
-  hostRequestRate: 8,
   timeout: 8,
   outputDir: "",
   gbbqPath: ""
@@ -93,7 +92,6 @@ export default function App() {
           markets: defaults.markets,
           ...restored,
           requestRate: restored?.requestRate || defaults.requestRate || 40,
-          hostRequestRate: restored?.hostRequestRate || defaults.hostRequestRate || 8,
           importDir: undefined,
           source: restored?.source === "baostock" ? "baostock" : "tdx",
           storage: restored?.storage === "csv" ? "csv" : "duckdb",
@@ -146,11 +144,8 @@ export default function App() {
     if (!Number.isInteger(options.timeout) || options.timeout < 2 || options.timeout > 60)
       return "等待超时须为 2–60 秒的整数，请在高级设置中修改"
     const requestRate = options.requestRate ?? 40
-    const hostRequestRate = options.hostRequestRate ?? 8
     if (!Number.isInteger(requestRate) || requestRate < 1 || requestRate > 200)
       return "全局请求频率须为 1–200 的整数，请在高级设置中修改"
-    if (!Number.isInteger(hostRequestRate) || hostRequestRate < 1 || hostRequestRate > requestRate)
-      return "单站请求频率须为 1–全局请求频率的整数，请在高级设置中修改"
     return ""
   }
   const start = async () => {
@@ -308,16 +303,16 @@ export default function App() {
                 <p className="mt-1 text-[11px] leading-4 text-[var(--text-muted)]">
                   {checkedAt && Number.isFinite(checkedAt.getTime()) ? `最近检测：${checkedAt.toLocaleString("zh-CN", { hour12: false })}` : "下载前自动检测，也可手动检测"}
                 </p>
-                {testing && <p role="status" className="mt-3 text-xs text-[var(--text-secondary)]">正在检测 TCP 连通性，请稍候…</p>}
+                {testing && <p role="status" className="mt-3 text-xs text-[var(--text-secondary)]">正在请求真实行情并等待完整响应，请稍候…</p>}
                 {hostError && <p role="alert" className="mt-3 break-words text-xs text-[var(--danger)]">{hostError}</p>}
                 {!latestHostReport && !testing && !hostError && <p className="py-5 text-center text-xs text-[var(--text-muted)]">尚无检测结果</p>}
                 {latestHostReport && <>
-                  <div className="mt-2 text-[11px] leading-4 text-[var(--text-secondary)]">可用 {available.length} · 未通过 {failed.length} · 已检测 {latestHostReport.tested} · {latestHostReport.probe === "tcp" ? "仅 TCP 连通性" : "历史检测结果"}</div>
+                  <div className="mt-2 text-[11px] leading-4 text-[var(--text-secondary)]">可用 {available.length} · 未通过 {failed.length} · 已检测 {latestHostReport.tested} · {latestHostReport.probe === "quote" ? "完整行情往返（含握手与响应）" : latestHostReport.probe === "tcp" ? "仅 TCP 连通性" : "历史检测结果"}</div>
                   {!available.length && <p className="py-4 text-xs text-[var(--danger)]">本次没有可用行情站点，请检查网络或代理后重试。</p>}
                   <div className="mt-2 max-h-[min(32rem,calc(100dvh-12rem))] overflow-auto" tabIndex={0} role="region" aria-label="全部站点检测结果，可横向滚动">
                     <table className="w-full min-w-[42rem] whitespace-nowrap text-left text-[11px] leading-4" aria-label="全部行情站点">
                       <thead className="sticky top-0 bg-[var(--surface-raised)] text-[var(--text-muted)]">
-                        <tr><th className="py-1.5 pr-3 font-normal">状态</th><th className="px-2 py-1.5 font-normal">站点</th><th className="px-2 py-1.5 font-normal">IP / 端口</th><th className="py-1.5 pl-3 text-right font-normal">{latestHostReport.probe === "tcp" ? "TCP 耗时" : "检测耗时"}</th></tr>
+                        <tr><th className="py-1.5 pr-3 font-normal">状态</th><th className="px-2 py-1.5 font-normal">站点</th><th className="px-2 py-1.5 font-normal">IP / 端口</th><th className="py-1.5 pl-3 text-right font-normal">{latestHostReport.probe === "quote" ? "往返耗时" : latestHostReport.probe === "tcp" ? "TCP 耗时" : "检测耗时"}</th></tr>
                       </thead>
                       <tbody className="divide-y divide-[var(--line)]">
                         {(latestHostReport.results || []).map((host) => <tr key={host.address} title={host.ok ? host.name : `${host.name || "未命名站点"}：${host.error || "连接检测未通过"}`}>

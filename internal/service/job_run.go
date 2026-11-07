@@ -15,7 +15,7 @@ import (
 // 取消由 preparing/running → cancelling → cancelled；准备失败也可直接进入 failed。
 // 重启从日志观察到未终结任务时标成 interrupted，用户恢复会创建独立的新任务。
 type jobRun struct {
-	configureTraffic func(int, int)               // 进入通达信流程前更新共享预算；本地/历史源和完整离线恢复不调用。
+	configureTraffic func(int)                    // 进入通达信流程前更新全局限速；本地/历史源和完整离线恢复不调用。
 	lineReport       *domain.LineReport           // 受 mu 保护的本任务探测快照，成功与失败线路均保留供 SSE 展示。
 	mu               sync.RWMutex                 // 保护可变进度、状态和展示切片；不覆盖网络或磁盘 I/O，避免锁长期占用。
 	id               string                       // 本次执行编号，与对应的 <id>.jsonl 日志文件名一致。

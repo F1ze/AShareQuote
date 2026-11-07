@@ -59,6 +59,7 @@ type JobRepository interface {
 	Append(string, domain.JobEvent) error  // 单事件持久提交，返回成功后才更新成功计数。
 	Load(string) (domain.SavedRun, error)  // 重建某次执行，不能自动发起采集。
 	Recent(int) ([]domain.SavedRun, error) // 倒序返回有限份最近执行记录。
+	Delete(string) error                   // 只删除一次执行的日志，不触碰行情归档或数据仓库。
 }
 
 // FactorRepository 只负责因子文件读写，是否获取和何时计为成功由服务决定。

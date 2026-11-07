@@ -5,26 +5,25 @@ import "time"
 // DownloadOptions 是任务的固定配置。日期模式优先于旧版 Start/Count 偏移模式。
 // Markets 使用 []int，避免 []uint8 被 JSON 编码成 Base64 字符串而破坏前后端约定。
 type DownloadOptions struct {
-	Markets         []int  `json:"markets"`         // 批量市场：0=深圳、1=上海、2=北京；手填 Codes 时以代码清单为准。
-	Codes           string `json:"codes"`           // 可选证券清单，如 sh600000,sz000001；非空时不再下载整张市场码表。
-	Category        int    `json:"category"`        // 协议周期编号，如 9=日线、7=1分钟、0=5分钟；完整映射见 domain.categoryNames。
-	Start           int    `json:"start"`           // 旧版偏移模式：跳过最近多少根 K 线，0 为最新；日期模式会重置为 0。
-	Count           int    `json:"count"`           // 旧版偏移模式的任务总条数，默认 800；日期模式不以它限制总条数。
-	StartDate       string `json:"startDate"`       // 日期模式起点，YYYY-MM-DD，北京时间，包含当天；增量模式也必须提供。
-	EndDate         string `json:"endDate"`         // 日期模式终点，YYYY-MM-DD，包含当天全部分钟；不得晚于北京时间今天。
-	Workers         int    `json:"workers"`         // 通达信并发 worker 数，0 使用默认 12，允许 1–64；SDK 来源不按此值并发。
-	RequestRate     int    `json:"requestRate"`     // 所有通达信连接共享的每秒请求启动上限，0 默认 40，允许 1–200。
-	HostRequestRate int    `json:"hostRequestRate"` // 同站点连接共享的每秒请求启动上限，0 默认 8，不得超过全局上限。
-	Timeout         int    `json:"timeout"`         // 通达信拨号/读写超时秒数，0 使用默认 8，允许 2–60；不是整项任务总时限。
-	OutputDir       string `json:"outputDir"`       // 原始 CSV 和因子附件的目录；空值用 JobService 默认目录，启动时转绝对路径。
-	GBBQPath        string `json:"gbbqPath"`        // 可选通达信 gbbq 文件路径；显式指定却无法读取时任务失败。
-	ASharesOnly     bool   `json:"aSharesOnly"`     // 通达信批量筛选 A 股；手填清单中的非 A 股会被拒绝，历史源/本地导入本身也筛 A 股。
-	Incremental     bool   `json:"incremental"`     // 从已有归档最新日回看 7 个自然日重取，合并时保留更早历史；不自动补齐远期空洞。
-	Storage         string `json:"storage"`         // duckdb=归档后入库；csv 或空值=仅归档，数据库是 CSV 之外的附加存储。
-	ImportDir       string `json:"importDir"`       // 非空时走本地历史导入流程；空值时从网络来源采集。
-	CSVVolumeUnit   string `json:"csvVolumeUnit"`   // 外部 CSV 的成交量单位：shares=股、lots=手；本地导入必须显式选择，不猜单位。
-	Source          string `json:"source"`          // 网络来源注册键，空值为 tdx；例如 baostock，其支持范围由 SourceSpec 声明。
-	CollectFactors  bool   `json:"collectFactors"`  // 历史源采集时同步独立比例因子；要求来源实现 Factors，可选仓库实现 StoreFactors。
+	Markets        []int  `json:"markets"`        // 批量市场：0=深圳、1=上海、2=北京；手填 Codes 时以代码清单为准。
+	Codes          string `json:"codes"`          // 可选证券清单，如 sh600000,sz000001；非空时不再下载整张市场码表。
+	Category       int    `json:"category"`       // 协议周期编号，如 9=日线、7=1分钟、0=5分钟；完整映射见 domain.categoryNames。
+	Start          int    `json:"start"`          // 旧版偏移模式：跳过最近多少根 K 线，0 为最新；日期模式会重置为 0。
+	Count          int    `json:"count"`          // 旧版偏移模式的任务总条数，默认 800；日期模式不以它限制总条数。
+	StartDate      string `json:"startDate"`      // 日期模式起点，YYYY-MM-DD，北京时间，包含当天；增量模式也必须提供。
+	EndDate        string `json:"endDate"`        // 日期模式终点，YYYY-MM-DD，包含当天全部分钟；不得晚于北京时间今天。
+	Workers        int    `json:"workers"`        // 通达信并发 worker 数，0 使用默认 32，允许 1–64；SDK 来源不按此值并发。
+	RequestRate    int    `json:"requestRate"`    // 所有通达信连接共享的每秒请求启动上限，0 默认 40，允许 1–200。
+	Timeout        int    `json:"timeout"`        // 通达信拨号/读写超时秒数，0 使用默认 8，允许 2–60；不是整项任务总时限。
+	OutputDir      string `json:"outputDir"`      // 原始 CSV 和因子附件的目录；空值用 JobService 默认目录，启动时转绝对路径。
+	GBBQPath       string `json:"gbbqPath"`       // 可选通达信 gbbq 文件路径；显式指定却无法读取时任务失败。
+	ASharesOnly    bool   `json:"aSharesOnly"`    // 通达信批量筛选 A 股；手填清单中的非 A 股会被拒绝，历史源/本地导入本身也筛 A 股。
+	Incremental    bool   `json:"incremental"`    // 从已有归档最新日回看 7 个自然日重取，合并时保留更早历史；不自动补齐远期空洞。
+	Storage        string `json:"storage"`        // duckdb=归档后入库；csv 或空值=仅归档，数据库是 CSV 之外的附加存储。
+	ImportDir      string `json:"importDir"`      // 非空时走本地历史导入流程；空值时从网络来源采集。
+	CSVVolumeUnit  string `json:"csvVolumeUnit"`  // 外部 CSV 的成交量单位：shares=股、lots=手；本地导入必须显式选择，不猜单位。
+	Source         string `json:"source"`         // 网络来源注册键，空值为 tdx；例如 baostock，其支持范围由 SourceSpec 声明。
+	CollectFactors bool   `json:"collectFactors"` // 历史源采集时同步独立比例因子；要求来源实现 Factors，可选仓库实现 StoreFactors。
 }
 
 type LogEntry struct {

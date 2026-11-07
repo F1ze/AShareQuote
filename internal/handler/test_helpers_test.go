@@ -13,5 +13,5 @@ func newTestServer(t *testing.T, dir string) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(Dependencies{Jobs: jobs, Workspace: service.NewWorkspaceService(nil, nil), Preview: service.NewPreviewService(jobs.OutputDir, func(output string) service.PreviewRepository { return &repository.CSVArchive{Directory: output} }), Warehouse: service.NewWarehouseService(nil)})
+	return NewServer(Dependencies{Jobs: jobs, Workspace: service.NewWorkspaceService(nil, nil, nil), Preview: service.NewPreviewService(jobs.OutputDir, func(output string) service.PreviewRepository { return &repository.CSVArchive{Directory: output} }), Warehouse: service.NewWarehouseService(nil)})
 }

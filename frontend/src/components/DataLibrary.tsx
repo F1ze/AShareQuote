@@ -11,12 +11,24 @@ import {
   LoaderCircle,
   RefreshCw,
   Search,
-  ShieldCheck
+  ShieldCheck,
+  Trash2
 } from "lucide-react"
 import { api } from "@/lib/api"
 import { isTaskActive } from "@/hooks/useTask"
 import { PathBrowser } from "@/components/PathBrowser"
 import { PricePreview } from "@/components/PricePreview"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger
+} from "@/components/ui/alert-dialog"
 import type { DatasetPage, TaskSnapshot, WarehouseDataset, WarehouseStatus } from "@/types"
 
 interface Props {
@@ -213,21 +225,73 @@ export function DataLibrary({ outputDir, active, onTaskStarted }: Props) {
                     : `${job.options.incremental ? "增量维护" : "历史采集"} · ${periodLabel(String(job.options.category === 9 ? "day" : job.options.category === 7 ? "1m" : job.options.category === 0 ? "5m" : "历史"))}`}
                 </strong>
                 <small>
-                  {job.startedAt.slice(0, 19).replace("T", " ")} · {job.succeeded} 个文件 ·{" "}
-                  {stateNames[job.state] || job.state}
+                  {job.startedAt.slice(0, 19).replace("T", " ")} · 成功 {job.succeeded}
+                  {job.failed > 0 ? ` · 失败 ${job.failed}` : ""} ·{" "}
+                  {job.failed > 0
+                    ? job.succeeded > 0
+                      ? "部分失败"
+                      : "下载失败"
+                    : stateNames[job.state] || job.state}
                 </small>
               </span>
-              <button
-                type="button"
-                className="text-button shrink-0"
-                disabled={active || Boolean(action) || isTaskActive(job)}
-                onClick={() =>
-                  void run(job.id, async () => onTaskStarted(await api.resume(job.id)))
-                }
-              >
-                {action === job.id ? "正在恢复…" : "从断点继续"}
-                <ArrowRight className="size-3" />
-              </button>
+              <div className="job-actions">
+                <button
+                  type="button"
+                  className="secondary-button job-resume"
+                  disabled={active || Boolean(action) || isTaskActive(job)}
+                  title={job.failed > 0 ? "复用已验证的成功断点，只重新处理失败项" : "校验并复用已保存的文件断点"}
+                  onClick={() =>
+                    void run(job.id, async () => onTaskStarted(await api.resume(job.id)))
+                  }
+                >
+                  {action === job.id
+                    ? "正在恢复…"
+                    : job.failed > 0
+                      ? `重试 ${job.failed} 只失败`
+                      : "从断点继续"}
+                  <ArrowRight className="size-3" />
+                </button>
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <button
+                      type="button"
+                      className="job-delete"
+                      disabled={active || Boolean(action) || isTaskActive(job)}
+                      aria-label={action === `delete:${job.id}` ? `正在删除任务记录 ${job.startedAt}` : `删除任务记录 ${job.startedAt}`}
+                      title="删除任务记录（保留行情文件）"
+                    >
+                      {action === `delete:${job.id}` ? (
+                        <LoaderCircle className="size-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="size-4" />
+                      )}
+                    </button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent className="rounded-2xl">
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>删除这条任务记录？</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        只删除任务日志和恢复断点，不会删除已下载的 CSV 或 DuckDB 数据。此操作无法撤销。
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>保留记录</AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-red-600 hover:bg-red-700"
+                        onClick={() =>
+                          void run(`delete:${job.id}`, async () => {
+                            await api.deleteJob(job.id)
+                            setJobs((current) => current.filter((item) => item.id !== job.id))
+                            setNotice("任务记录已删除，行情文件未受影响")
+                          })
+                        }
+                      >
+                        删除记录
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              </div>
             </div>
           ))
         )}

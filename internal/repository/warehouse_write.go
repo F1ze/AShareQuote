@@ -22,7 +22,7 @@ import (
 	"quotes/internal/domain"
 )
 
-// Ingest 的流程：核验归档 → 精确解析临时表 → 整批质量检查 → 保存旧值并合并行情
+// Ingest 的流程：核验归档 → Go 精确解析 → 整批质量检查 → 保存旧值并集合式合并行情
 // → 更新证券资料/回执/独立因子 → 再次核验归档 → 提交事务。
 // 中途任何失败均回滚数据库；已有 CSV 不删除，可供下一次幂等重放。
 func (d *DuckDB) Ingest(ctx context.Context, b domain.Batch, r domain.Receipt) error {
@@ -86,8 +86,8 @@ func ingestTx(ctx context.Context, tx *gorm.DB, b domain.Batch, r domain.Receipt
 		return fmt.Errorf("归档时间边界与回执不一致")
 	}
 
-	// 3. 通过 GORM 读取重叠主键、保存实际变化的旧值，再批量 upsert 新值。
-	if err = mergeBarsTx(ctx, tx, incoming, exchange, b.Security.Code, period, first, last, b.RunID); err != nil {
+	// 3. 通过 GORM 读取重叠主键、保存实际变化的旧值，再用原生集合写入 upsert 新值。
+	if err = mergeBarsTx(ctx, tx, incoming, path, exchange, b.Security.Code, period, first, last, b.RunID); err != nil {
 		return err
 	}
 	// 4. 行情、回执、元数据和因子属于同一事务；因子失败时不能宣称该证券已成功入库。
@@ -270,7 +270,8 @@ func archiveQuality(records []barRecord) (first, last string, bad int64) {
 }
 
 // mergeBarsTx 只写入新增或数值变化的记录；同值重放不会更新来源和入库时间，也不会制造修订。
-func mergeBarsTx(ctx context.Context, tx *gorm.DB, incoming []barRecord, exchange, code, period, first, last, runID string) error {
+// 已在 Go 中完成精确校验的归档交由 DuckDB 集合写入，避免逐批绑定数万个参数造成二次解析开销。
+func mergeBarsTx(ctx context.Context, tx *gorm.DB, incoming []barRecord, path, exchange, code, period, first, last, runID string) error {
 	stored := []barRecord{}
 	columns := []string{
 		"exchange", "code", "period", "strftime(ts,'%Y-%m-%d %H:%M') AS ts",
@@ -289,15 +290,14 @@ func mergeBarsTx(ctx context.Context, tx *gorm.DB, incoming []barRecord, exchang
 	}
 
 	now := time.Now().UTC()
-	changes := make([]barRecord, 0, len(incoming))
+	changed := false
 	revisions := []revisionRecord{}
 	for _, record := range incoming {
 		old, found := existing[record.Time]
 		if found && sameBarValues(old, record) {
 			continue
 		}
-		record.IngestedAt = now
-		changes = append(changes, record)
+		changed = true
 		if found {
 			revisions = append(revisions, revisionRecord{Exchange: old.Exchange, Code: old.Code, Period: old.Period, Time: old.Time,
 				OldOpen: old.Open, OldHigh: old.High, OldLow: old.Low, OldClose: old.Close, OldVolumeShares: old.VolumeShares,
@@ -309,15 +309,24 @@ func mergeBarsTx(ctx context.Context, tx *gorm.DB, incoming []barRecord, exchang
 			return err
 		}
 	}
-	if len(changes) == 0 {
+	if !changed {
 		return nil
 	}
-	return tx.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: conflictColumns("exchange", "code", "period", "ts"),
-		DoUpdates: clause.AssignmentColumns([]string{
-			"open", "high", "low", "close", "volume_shares", "amount_cny", "source", "ingested_at",
-		}),
-	}).CreateInBatches(&changes, 500).Error
+	// WHERE 与上面的变化判断保持同一语义：同值行不会被更新，新增及修订行仍共享当前事务。
+	return tx.WithContext(ctx).Exec(`INSERT INTO bars
+		(exchange, code, period, ts, open, high, low, close, volume_shares, amount_cny, source, ingested_at)
+		SELECT ?, ?, ?, CAST("date" AS TIMESTAMP),
+		CAST(open AS DECIMAL(18,6)), CAST(high AS DECIMAL(18,6)), CAST(low AS DECIMAL(18,6)), CAST(close AS DECIMAL(18,6)),
+		CAST(ROUND(CAST(volume AS DECIMAL(24,8)) * 100) AS BIGINT), CAST(amount AS DECIMAL(24,4)), ?, now()
+		FROM read_csv(?, header=TRUE, all_varchar=TRUE)
+		ON CONFLICT (exchange, code, period, ts) DO UPDATE SET
+		open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close,
+		volume_shares=EXCLUDED.volume_shares, amount_cny=EXCLUDED.amount_cny,
+		source=EXCLUDED.source, ingested_at=EXCLUDED.ingested_at
+		WHERE bars.open IS DISTINCT FROM EXCLUDED.open OR bars.high IS DISTINCT FROM EXCLUDED.high
+		OR bars.low IS DISTINCT FROM EXCLUDED.low OR bars.close IS DISTINCT FROM EXCLUDED.close
+		OR bars.volume_shares IS DISTINCT FROM EXCLUDED.volume_shares OR bars.amount_cny IS DISTINCT FROM EXCLUDED.amount_cny`,
+		exchange, code, period, incoming[0].Source, path).Error
 }
 
 func sameBarValues(a, b barRecord) bool {

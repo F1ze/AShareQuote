@@ -53,6 +53,7 @@ func (j recordingJobs) Append(_ string, event domain.JobEvent) error {
 }
 func (j recordingJobs) Load(string) (domain.SavedRun, error)  { return domain.SavedRun{}, nil }
 func (j recordingJobs) Recent(int) ([]domain.SavedRun, error) { return nil, nil }
+func (j recordingJobs) Delete(string) error                   { return nil }
 
 // 成功断点是跨资源流水线的最后边界；不能因已经写出 CSV 就提前计成功。
 func TestIngestionCheckpointsOnlyAfterRequiredResources(t *testing.T) {

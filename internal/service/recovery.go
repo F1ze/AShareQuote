@@ -89,6 +89,21 @@ func (m *JobService) Resume(id string) (TaskSnapshot, error) {
 	return m.start(run.Snapshot.Options, &run)
 }
 
+// Delete 只删除历史日志；活动任务仍可能追加事件，必须拒绝删除。
+func (m *JobService) Delete(id string) error {
+	if m.journal == nil {
+		return fmt.Errorf("未启用任务持久化")
+	}
+	m.mu.RLock()
+	current := m.current
+	if current != nil && current.id == id && activeState(current.snapshot().State) {
+		m.mu.RUnlock()
+		return fmt.Errorf("运行中的任务不能删除，请先停止或等待完成")
+	}
+	m.mu.RUnlock()
+	return m.journal.Delete(id)
+}
+
 // restoreEntirePlan 是所有资源均有效时的离线恢复捷径：直接重放入库，不探测行情线路。
 // 只要有一项无法通过哈希验证，就交回正常流程逐项恢复或重新获取。
 // 返回值表示“本函数是否接管本次任务”，不表示每个文件都已成功入库；结果必须看终态。

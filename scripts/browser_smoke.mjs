@@ -183,7 +183,7 @@ try {
   if (!theme.dark || !theme.canvas || !theme.panel) throw new Error('页面未完整应用暗色主题：' + JSON.stringify(theme))
   if (appearance.selectedMarkets.some((item) => item.color !== theme.selected))
     throw new Error(`选中市场缺少视觉反馈：${JSON.stringify(appearance)}`)
-  if (appearance.serviceColor !== theme.online) throw new Error('服务状态缺少清晰颜色反馈')
+  if (appearance.serviceColor !== theme.online) throw new Error(`服务状态缺少清晰颜色反馈：${JSON.stringify({appearance, theme})}`)
   console.log(JSON.stringify({ appearance }))
   await screenshot("desktop.png")
   const controls =
@@ -257,10 +257,6 @@ try {
   await clickText("开始下载")
   await waitFor(`document.body.innerText.includes('全局请求频率须为')`, "全局频率范围校验")
   await setTrafficField("request-rate", 40)
-  await setTrafficField("host-request-rate", 41)
-  await clickText("开始下载")
-  await waitFor(`document.body.innerText.includes('单站请求频率须为')`, "单站频率不能超过全局")
-  await setTrafficField("host-request-rate", 8)
 
   await send("Page.navigate", { url: `${base}/` })
   await waitFor(`document.body.innerText.includes('已就绪，下载前')`, "重新载入页面")
@@ -283,10 +279,10 @@ try {
       if (new URL(String(input),location.href).pathname !== '/api/hosts/test') return window.hostSmokeFetch(input,init)
       window.hostSmokeCalls++
       await new Promise(resolve => setTimeout(resolve,500))
-      return new Response(JSON.stringify({checkedAt:new Date().toISOString(),probe:"tcp",tested:13,available:12,results:[
+      return new Response(JSON.stringify({checkedAt:new Date().toISOString(),probe:"quote",tested:13,available:12,results:[
         {name:'银河证券上证云上海二',address:'114.141.177.40:7709',ok:true,latencyMs:82},
         {name:'银河证券IPV6行情',address:'[2408:4003:1f20::1e6]:7709',ok:true,latencyMs:128},
-        {name:'失败测试站',address:'127.0.0.2:7709',ok:false,latencyMs:1000,error:'TCP 连接失败'},
+        {name:'失败测试站',address:'127.0.0.2:7709',ok:false,latencyMs:1000,error:'行情握手失败'},
         ...Array.from({length:10},(_,i)=>({name:'行情测试站 '+(i+1),address:'192.0.2.'+(i+1)+':7709',ok:true,latencyMs:150+i}))
       ]}), {headers:{'Content-Type':'application/json'}})
     }`)
@@ -298,7 +294,7 @@ try {
   await waitFor(`Boolean(document.querySelector('[data-testid="available-hosts-trigger"] [aria-label="线路检测中"]'))`, "线路加载状态")
   await waitFor(`document.querySelector('[data-testid="available-hosts-trigger"]')?.innerText.includes('可用 12/13')`, "可用线路统计")
   await waitFor(`document.querySelector('table[aria-label="全部行情站点"]')?.innerText.includes('[2408:4003:1f20::1e6]:7709')`, "站点名称与 IPv6 地址")
-  await waitFor(`document.body.innerText.includes("仅 TCP 连通性") && document.querySelector('table[aria-label="全部行情站点"] thead')?.innerText.includes("TCP 耗时")`, "TCP 探测口径说明")
+  await waitFor(`document.body.innerText.includes("完整行情往返") && document.querySelector('table[aria-label="全部行情站点"] thead')?.innerText.includes("往返耗时")`, "完整行情测速口径说明")
   if (await evaluate(`document.querySelectorAll('table[aria-label="全部行情站点"] tbody tr').length !== 13 || !document.querySelector('table[aria-label="全部行情站点"]').innerText.includes('失败测试站')`)) throw new Error("站点状态未完整展示")
   await screenshot("available-hosts-desktop.png")
   await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
@@ -334,12 +330,26 @@ try {
     const status = await fetch('/api/warehouse').then(r => r.json())
     const rows = Array.from({length: 2301}, (_, i) => ({ts: new Date(Date.UTC(2024,0,2,9,30+i)).toISOString().replace('T',' ').slice(0,19), open:'10', high:'12', low:'9', close:String(10 + Math.sin(i/20)), volume_shares:95, amount_cny:'1000'}))
     const dataset = {exchange:'SH', code:'600000', name:'预览测试', period:'1m', rows:rows.length, earliest:rows[0].ts, latest:rows.at(-1).ts, updatedAt:rows.at(-1).ts}
+    const options = {source:'tdx', markets:[0,1,2], codes:'', category:9, start:0, count:800, startDate:'2024-01-01', endDate:'2024-12-31', workers:32, requestRate:40, timeout:8, outputDir:'D:\\qflux', gbbqPath:'', storage:'csv', incremental:false, aSharesOnly:true}
+    const job = {id:'retry-fixture', state:'completed_with_errors', total:3, done:3, succeeded:2, failed:1, bars:480, pages:3, warnings:0, skipped:0, percent:100, speed:1, elapsed:3, message:'1 只失败', outputDir:options.outputDir, startedAt:'2026-01-01T12:00:00+08:00', options, recent:[], logs:[]}
+    const deleteJob = {...job, id:'delete-fixture', startedAt:'2026-01-02T12:00:00+08:00'}
     window.previewPageCalls = 0
+    window.retryCalls = 0
+    window.deleteCalls = 0
     window.fetch = async (input, init) => {
       const url = new URL(String(input), location.href)
+      if (url.pathname === '/api/jobs/delete-fixture' && init?.method === 'DELETE') {
+        window.deleteCalls++
+        return new Response(null, {status:204})
+      }
       let body
       if (url.pathname === '/api/warehouse') body = {...status, ready:true, rows:2301, symbols:1, earliest:dataset.earliest, latest:dataset.latest}
       if (url.pathname === '/api/warehouse/datasets') body = {items:[dataset], total:1, page:1, pageSize:50}
+      if (url.pathname === '/api/jobs') body = [job, deleteJob]
+      if (url.pathname === '/api/jobs/retry-fixture/resume') {
+        window.retryCalls++
+        body = {...job, id:'retry-run', state:'running', done:0, succeeded:0, failed:0, percent:0}
+      }
       if (url.pathname === '/api/warehouse/bars') {
         window.previewPageCalls++
         const before = url.searchParams.get('before')
@@ -390,8 +400,34 @@ try {
   await sleep(250)
   if (await evaluate(`document.querySelector('[data-slot="sheet-content"]').scrollWidth > innerWidth`)) throw new Error("手机行情预览横向溢出")
   await screenshot("preview-mobile-full.png")
-  await evaluate(`document.querySelector('[data-slot="sheet-content"] button[aria-label="关闭"]').click(); window.fetch = window.previewOriginalFetch`)
+  await evaluate(`document.querySelector('[data-slot="sheet-content"] button[aria-label="关闭"]').click()`)
+  await send("Emulation.setDeviceMetricsOverride", {width:1440,height:1000,deviceScaleFactor:1,mobile:false})
   await sleep(200)
+  await waitFor(`[...document.querySelectorAll('.job-row button')].some(button => button.textContent.includes('重试 1 只失败'))`, "失败任务重试入口")
+  const jobRowHeight = await evaluate(`document.querySelector('.job-row').getBoundingClientRect().height`)
+  if (jobRowHeight > 70) throw new Error(`任务记录行高未压缩：${jobRowHeight}`)
+  await evaluate(`document.querySelector('.library-jobs').scrollIntoView({block:'center'})`)
+  await screenshot("recovery-records.png")
+  await send("Emulation.setDeviceMetricsOverride", {width:390,height:844,deviceScaleFactor:1,mobile:true})
+  await evaluate(`document.querySelector('.library-jobs').scrollIntoView({block:'center'})`)
+  await sleep(200)
+  if (await evaluate(`document.documentElement.scrollWidth > innerWidth`)) throw new Error("手机任务记录横向溢出")
+  await screenshot("recovery-records-mobile.png")
+  await send("Emulation.setDeviceMetricsOverride", {width:1440,height:1000,deviceScaleFactor:1,mobile:false})
+  const deleteTrigger = `document.querySelector('button[aria-label="删除任务记录 2026-01-02T12:00:00+08:00"]')`
+  await evaluate(`${deleteTrigger}.click()`)
+  await waitFor(`document.body.innerText.includes('不会删除已下载的 CSV')`, "删除记录确认弹窗")
+  await clickText("保留记录")
+  await waitFor(`!document.querySelector('[data-slot="alert-dialog-content"]')`, "取消删除记录")
+  if (await evaluate(`window.deleteCalls !== 0`)) throw new Error("取消删除仍调用了接口")
+  await evaluate(`${deleteTrigger}.click()`)
+  await clickText("删除记录")
+  await waitFor(`window.deleteCalls === 1 && !${deleteTrigger} && document.body.innerText.includes('行情文件未受影响')`, "删除记录并保留行情文件")
+  await clickText("重试 1 只失败")
+  await waitFor(`window.retryCalls === 1`, "重试请求接入现有恢复接口")
+  await evaluate(`window.fetch = window.previewOriginalFetch`)
+  await send("Page.navigate", {url:`${base}/`})
+  await waitFor(`document.body.innerText.includes('已就绪，下载前') && Boolean(document.querySelector('.welcome-state'))`, "重置离线任务场景")
   await clickText("数据采集")
   let pricePreview = false
   let minutePagination = false
@@ -458,6 +494,8 @@ try {
       from: downloaded.recent[0].from,
       to: downloaded.recent[0].to
     })
+    const resultRowHeight = await evaluate(`document.querySelector('.result-row')?.getBoundingClientRect().height || 0`)
+    if (resultRowHeight <= 0 || resultRowHeight > 60) throw new Error(`下载结果行高异常：${resultRowHeight}`)
     await evaluate(`window.scrollTo(0, 0)`)
     await screenshot("download-results.png")
     await evaluate(`document.querySelector('button[aria-label="预览 sh600000_day.csv"]').click()`)

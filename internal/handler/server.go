@@ -24,6 +24,7 @@ type JobUseCases interface {
 	Cancel() error
 	History() ([]domain.TaskSnapshot, error)
 	Resume(string) (domain.TaskSnapshot, error)
+	Delete(string) error
 }
 
 // Dependencies 在组装根构造；Handler 只依赖用例，不构造存储、协议或 SDK。
@@ -90,6 +91,7 @@ func (s *Server) Handler(frontendOrigins ...string) http.Handler {
 	e.GET("/api/events", s.handleEvents)
 	e.GET("/api/jobs", s.handleHistory)
 	e.POST("/api/jobs/:id/resume", s.handleResume)
+	e.DELETE("/api/jobs/:id", s.handleDeleteJob)
 	e.GET("/api/warehouse", s.handleWarehouse)
 	e.GET("/api/warehouse/bars", s.handleWarehouseBars)
 	e.GET("/api/warehouse/datasets", s.handleDatasets)
@@ -116,9 +118,8 @@ func (s *Server) handleDefaults(c echo.Context) error {
 		"outputDir":        s.manager.DefaultOutput(),
 		"category":         9,
 		"count":            800,
-		"workers":          12,
+		"workers":          domain.DefaultWorkers,
 		"requestRate":      domain.DefaultRequestRate,
-		"hostRequestRate":  domain.DefaultHostRequestRate,
 		"timeout":          8,
 		"markets":          []int{0, 1, 2},
 		"warehouseEnabled": s.warehouse.Enabled(),
