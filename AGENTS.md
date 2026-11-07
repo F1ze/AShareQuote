@@ -126,6 +126,8 @@ node scripts/go.mjs run \
 - 按职责在现有包内分文件，禁止每增加一个用例就增加一个 internal 顶层目录。
 - 通过 RegisterSource(SourceSpec) 注册新的历史来源，避免向用例添加供应商名称分支；本地格式通过解码器注册表扩展。
 - `handler` 只负责传输语义，不实现通达信协议或下载业务。
+- 所有出站连接（含裸 TCP 与出站 HTTP）统一经 `internal/platform/netdial` 的全局拨号器：协议客户端通过 SetDialer 注入，HTTP 侧使用其 HTTPTransport（`Proxy` 保持 nil，避免双重代理）。禁止新的 `net.Dialer` 直连、`http.DefaultClient` 或散落的自建 Transport。
+- 出站代理设置持久化在数据目录 `settings.json`，经 `/api/proxy` 读写；初始值按 `ALL_PROXY` → `HTTPS_PROXY` → `HTTP_PROXY` 环境变量约定读取一次，不得引入私有命名的代理变量。子进程只注入标准代理变量，不与 Go 侧当前状态分叉。
 - 下载失败必须关闭受影响的连接并换线重试，不能复用可能错位的报文流。
 - CSV 使用临时文件写入，成功后再原子替换目标文件。
 - 无行情、任意分页失败或取消时不得用空文件或半成品覆盖已有 CSV。

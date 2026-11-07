@@ -39,8 +39,7 @@ import zlib
 
 # 安装目录：优先 TDX_ROOT，否则取仓库旁的 neptune（相对路径解析，换机可用）
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.environ.get("TDX_ROOT")
-                       or os.path.join(REPO_DIR, os.pardir, os.pardir, "neptune"))
+ROOT = os.path.abspath(os.environ.get("TDX_ROOT") or REPO_DIR)
 
 # ---------------------------------------------------------------- 基础工具
 

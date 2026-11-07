@@ -4,6 +4,7 @@ import type {
   DownloadOptions,
   HostReport,
   PreviewResult,
+  ProxySettings,
   TaskSnapshot,
   WarehouseStatus,
   DatasetPage,
@@ -27,6 +28,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   eventsURL: `${API_BASE}/events`,
   defaults: () => request<Defaults>("/defaults"),
+  proxy: () => request<ProxySettings>("/proxy"),
+  saveProxy: (proxy: string) =>
+    request<ProxySettings>("/proxy", { method: "POST", body: JSON.stringify({ proxy }) }),
   task: () => request<TaskSnapshot | null>("/task"),
   jobs: () => request<TaskSnapshot[]>("/jobs"),
   resume: (id: string) =>

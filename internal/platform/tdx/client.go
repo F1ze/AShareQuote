@@ -53,7 +53,11 @@ type Client struct {
 	offset  int             // 下一次重连优先尝试的线路偏移，通过取模允许跨列表末端轮换。
 	host    Host            // 最近一次成功拨号所用端点；不代表列表中所有端点均可用。
 	ctx     context.Context // 任务取消上下文；拨号直接继承，阻塞读写由取消回调关闭连接打断。
+	dial    DialFunc        // 可注入的统一出站拨号函数；nil 使用系统直连，见 SetDialer。
 }
+
+// DialFunc 与 net.Dialer.DialContext 同签名；组装根注入统一代理拨号器时使用。
+type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 func NewClient(hosts []Host, timeout time.Duration, offset int) *Client {
 	if timeout <= 0 {
@@ -64,6 +68,10 @@ func NewClient(hosts []Host, timeout time.Duration, offset int) *Client {
 
 // SetContext 将任务取消传播到拨号、握手和正在进行的请求；首次使用前设置。
 func (c *Client) SetContext(ctx context.Context) { c.ctx = ctx }
+
+// SetDialer 注入统一出站拨号函数（例如经代理隧道连接）；拨号期限仍按 timeout 约束。
+// 只影响之后建立的新连接；不改变协议读写和线路轮换逻辑。
+func (c *Client) SetDialer(dial DialFunc) { c.dial = dial }
 
 func (c *Client) Close() {
 	if c.conn != nil {
@@ -86,8 +94,17 @@ func (c *Client) connect() error {
 		// 各 worker 从不同偏移开始；成功后移动偏移，让下次重连优先尝试下一条线路。
 		idx := (c.offset + i) % len(c.hosts)
 		host := c.hosts[idx]
-		dialer := net.Dialer{Timeout: c.timeout}
-		conn, err := dialer.DialContext(c.ctx, "tcp", host.Address())
+		// 拨号期限与原 net.Dialer 超时语义一致：注入统一拨号器时也按 timeout 约束。
+		dialCtx, cancel := context.WithTimeout(c.ctx, c.timeout)
+		var conn net.Conn
+		var err error
+		if c.dial != nil {
+			conn, err = c.dial(dialCtx, "tcp", host.Address())
+		} else {
+			dialer := net.Dialer{Timeout: c.timeout}
+			conn, err = dialer.DialContext(dialCtx, "tcp", host.Address())
+		}
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue

@@ -64,7 +64,7 @@ npm run backend:build
 
 Linux/macOS 可以通过 `node scripts/go.mjs run --sync ...` 使用相同参数。批处理可交给系统计划任务调用；GUI 服务持有同一数据目录时，使用其 REST API 启动任务，或先关闭 GUI 服务。操作系统锁会拒绝第二个写者，并在进程退出或崩溃后自动释放。
 
-`--data-dir` / `QFLUX_DATA_DIR` 设置数据库和日志目录；`--output` / `QUOTES_OUTPUT` 设置归档目录；`QFLUX_PYTHON` 仅为 BaoStock SDK 指定现有 Python 环境。完整参数见 `bin/quotes.exe --help`。
+`--data-dir` / `QFLUX_DATA_DIR` 设置数据库和日志目录；`--output` / `QUOTES_OUTPUT` 设置归档目录；`QFLUX_PYTHON` 仅为 BaoStock SDK 指定现有 Python 环境。出站代理可用 `--proxy` 指定，或按 `ALL_PROXY` → `HTTPS_PROXY` → `HTTP_PROXY` 环境变量读取初始值，也可在网页高级设置中配置并持久保存。完整参数见 `bin/quotes.exe --help`。
 
 ## 在自己的研究代码中读取
 

@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	webfront "quotes/internal/platform/frontend"
 	"quotes/internal/platform/historyfile"
 	"quotes/internal/platform/lines"
+	"quotes/internal/platform/netdial"
 	"quotes/internal/platform/processlock"
 	"quotes/internal/platform/tdx"
 	"quotes/internal/repository"
@@ -54,6 +56,7 @@ func run() error {
 	fullSync := flag.Bool("full", false, "批处理重新扫描整个请求区间，用于历史修订和补洞")
 	syncSource := flag.String("source", "tdx", "批处理数据源：tdx 或 baostock（仅沪深，含源提供的退市证券）")
 	collectFactors := flag.Bool("factors", true, "BaoStock 采集时同步独立复权因子表")
+	proxyURL := flag.String("proxy", "", "出站代理（socks5/socks5h/http/https 地址）；留空使用已保存设置或环境变量")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -68,13 +71,57 @@ func run() error {
 	}
 	defer lock.Close()
 
-	// 第 2 步：组装通达信线路/客户端、原始归档、DuckDB 和可扩展来源，恢复已有任务日志。
+	// 第 2 步：装配统一出站代理与拨号器；设置持久化在数据目录，空配置直连。
+	// 拨号器在每次新连接时读取当前快照，网页修改后无需重启即可生效。
+	dialer, err := netdial.NewManager(domain.ProxySettings{})
+	if err != nil {
+		return err
+	}
+	var historySource *baostock.Source
+	proxySettings, err := service.NewProxyService(hotProxyStore{
+		inner: repository.NewSettingsStore(filepath.Join(dataPath, "settings.json")),
+		apply: func(updated domain.ProxySettings) error {
+			if err := dialer.Update(updated); err != nil {
+				return err
+			}
+			// 数据会话进程只在启动时读取代理环境；结束旧会话让下次调用按新代理重建。
+			if historySource != nil {
+				historySource.Close()
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+	// 环境变量按通用约定只提供初始值；界面已保存的设置与 --proxy 始终优先。
+	if env := envProxyValue(); env != "" {
+		if seeded, err := domain.ParseProxyURL(env); err == nil {
+			proxySettings.Seed(seeded)
+		} else {
+			log.Printf("忽略无效的代理环境变量：%v", err)
+		}
+	}
+	if err := dialer.Update(proxySettings.Current()); err != nil {
+		return fmt.Errorf("装配出站代理：%w", err)
+	}
+	if *proxyURL != "" {
+		if _, err := proxySettings.Update(*proxyURL); err != nil {
+			return fmt.Errorf("解析代理地址：%w", err)
+		}
+	}
+
+	// 第 3 步：组装通达信线路/客户端、原始归档、DuckDB 和可扩展来源，恢复已有任务日志。
 	// 线路探测客户端仅验证一个端点；任务客户端接收可用线路列表，失败时可自行轮换。
 	provider := lines.NewBuiltin(func(host domain.Host, timeout time.Duration) lines.SmokeClient {
-		return tdx.NewClient([]domain.Host{host}, timeout, 0)
+		client := tdx.NewClient([]domain.Host{host}, timeout, 0)
+		client.SetDialer(dialer.DialContext)
+		return client
 	})
 	factory := func(hosts []domain.Host, timeout time.Duration, offset int) service.Client {
-		return tdx.NewClient(hosts, timeout, offset)
+		client := tdx.NewClient(hosts, timeout, offset)
+		client.SetDialer(dialer.DialContext)
+		return client
 	}
 	project, err := os.Getwd()
 	if err != nil {
@@ -102,8 +149,17 @@ func run() error {
 	if err = manager.Restore(); err != nil {
 		return fmt.Errorf("恢复任务日志：%w", err)
 	}
-	historySource := baostock.New(project)
+	historySource = baostock.New(project)
 	defer historySource.Close()
+	// 每次启动数据会话时求值；代理变更后由热应用回调结束旧会话并按新值重建。
+	historySource.EnvFunc = func() []string {
+		// 用解析后的统一值改写标准代理变量，避免子进程继承的环境与 Go 侧当前状态分叉。
+		current := proxySettings.Current().URL
+		return []string{
+			"ALL_PROXY=" + current, "all_proxy=" + current,
+			"HTTPS_PROXY=", "https_proxy=", "HTTP_PROXY=", "http_proxy=",
+		}
+	}
 	if err := manager.RegisterSource(historySource.Registration()); err != nil {
 		return err
 	}
@@ -128,6 +184,7 @@ func run() error {
 		Jobs: manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider),
 		Preview:   service.NewPreviewService(manager.OutputDir, func(output string) service.PreviewRepository { return &repository.CSVArchive{Directory: output} }),
 		Warehouse: service.NewWarehouseService(warehouse),
+		Proxy:     proxySettings,
 	}).Handler(frontendURL)
 	server := &http.Server{
 		Addr:              net.JoinHostPort(*host, strconv.Itoa(*apiPort)),
@@ -170,6 +227,11 @@ func run() error {
 	fmt.Printf("QFLUX 前端：%s\n", frontendURL)
 	fmt.Printf("Echo API：%s/api\n", apiURL)
 	fmt.Printf("线路配置：内置模板，自动回读与业务自检\n")
+	if current := proxySettings.Current().URL; current != "" {
+		fmt.Printf("出站代理：%s\n", current)
+	} else {
+		fmt.Printf("出站代理：未设置（直连）\n")
+	}
 	fmt.Printf("默认输出目录：%s\n", manager.DefaultOutput())
 	if *apiOnly {
 		fmt.Printf("当前为 API-only 模式，请单独启动 frontend。\n")
@@ -221,4 +283,31 @@ func shutdownOnContext(ctx context.Context, server *http.Server) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+}
+
+// hotProxyStore 在持久化成功后同步执行组装根提供的热应用回调。
+// 属于组装层的组合件：让“保存代理设置”的用例顺带更新拨号器并结束旧数据会话。
+type hotProxyStore struct {
+	inner service.ProxyStore               // 实际落盘的仓库实现。
+	apply func(domain.ProxySettings) error // 落盘成功后的应用回调；返回错误视为保存失败。
+}
+
+func (s hotProxyStore) Load() (domain.ProxySettings, error) { return s.inner.Load() }
+
+func (s hotProxyStore) Save(settings domain.ProxySettings) error {
+	if err := s.inner.Save(settings); err != nil {
+		return err
+	}
+	return s.apply(settings)
+}
+
+// envProxyValue 按 curl 等工具的通用约定读取出站代理初始值：
+// ALL_PROXY → HTTPS_PROXY → HTTP_PROXY，各变量同时接受小写形式。
+func envProxyValue() string {
+	for _, key := range []string{"ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }

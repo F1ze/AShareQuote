@@ -2,12 +2,16 @@
 
 This process only reads public data. It cannot access or mutate the warehouse.
 """
+import base64
 import contextlib
 import datetime as dt
 import json
+import os
 import socket
+import struct
 import sys
 import time
+import urllib.parse
 
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
@@ -22,14 +26,127 @@ class CheckedSocket(socket.socket):
         return data
 
 
+def _recv_exact(sock, size):
+    """Read exactly size bytes; CheckedSocket turns EOF into a hard failure."""
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("代理在握手完成前关闭了连接")
+        data += chunk
+    return data
+
+
+def _socks5_handshake(sock, target_host, target_port, username=None, password=None):
+    """RFC 1928 CONNECT with optional username/password authentication."""
+    methods = b"\x05\x02\x00\x02" if username else b"\x05\x01\x00"
+    sock.sendall(methods)
+    reply = _recv_exact(sock, 2)
+    if reply[0] != 5:
+        raise ConnectionError("代理应答不是 SOCKS5 协议")
+    method = reply[1]
+    if method == 0x02:
+        if not username:
+            raise ConnectionError("代理要求认证，但未配置用户名密码")
+        user = username.encode()
+        secret = (password or "").encode()
+        sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(secret)]) + secret)
+        auth = _recv_exact(sock, 2)
+        if auth[1] != 0:
+            raise ConnectionError("代理认证失败")
+    elif method != 0x00:
+        raise ConnectionError("代理拒绝了全部可用的认证方式")
+    host = target_host.encode()
+    if len(host) > 255:
+        raise ValueError("目标主机名超出 SOCKS5 长度限制")
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", target_port))
+    head = _recv_exact(sock, 4)
+    if head[1] != 0:
+        raise ConnectionError(f"代理连接失败，状态码 {head[1]}")
+    length = {1: 4, 4: 16}.get(head[3])
+    if length is None:
+        length = _recv_exact(sock, 1)[0]
+    _recv_exact(sock, length + 2)
+
+
+def _http_connect(sock, target, auth_header=""):
+    """Open an HTTP CONNECT tunnel to host:port through the proxy."""
+    lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+    if auth_header:
+        lines.append(f"Proxy-Authorization: {auth_header}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("代理在 CONNECT 应答前关闭了连接")
+        response += chunk
+        if len(response) > 8192:
+            raise ConnectionError("代理 CONNECT 应答头过大")
+    status = response.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    parts = status.split()
+    if len(parts) < 2 or parts[1] != "200":
+        raise ConnectionError(f"代理 CONNECT 失败：{status}")
+
+
+def resolve_proxy_url():
+    """Resolve the outbound proxy following the ALL_PROXY → HTTPS_PROXY → HTTP_PROXY convention."""
+    for key in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def build_socket_class(proxy_url=""):
+    """Return the socket.socket replacement; a proxy URL yields a tunneled socket."""
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return CheckedSocket
+    parsed = urllib.parse.urlsplit(proxy_url)
+    scheme = (parsed.scheme or "").lower()
+    default_ports = {"socks5": 1080, "socks5h": 1080, "http": 80, "https": 443}
+    if scheme not in default_ports:
+        raise ValueError("代理协议须为 socks5、http 或 https")
+    if not parsed.hostname:
+        raise ValueError("代理地址缺少主机名")
+    proxy_host = parsed.hostname
+    proxy_port = parsed.port or default_ports[scheme]
+    username = urllib.parse.unquote(parsed.username) if parsed.username else None
+    password = urllib.parse.unquote(parsed.password) if parsed.password else ""
+    auth_header = ""
+    if username:
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        auth_header = "Basic " + credentials
+
+    class ProxySocket(CheckedSocket):
+        """All connections are established through the configured proxy tunnel."""
+        def connect(self, address):
+            if not isinstance(address, tuple) or len(address) != 2:
+                raise ValueError("代理套接字需要 (host, port) 形式的目标地址")
+            target_host, target_port = address
+            super().connect((proxy_host, proxy_port))
+            if scheme in ("socks5", "socks5h"):
+                # The handshake below already delegates hostname resolution to the proxy.
+                _socks5_handshake(self, target_host, int(target_port), username, password)
+            else:
+                _http_connect(self, f"{target_host}:{int(target_port)}", auth_header)
+
+    return ProxySocket
+
+
+bs = None
+socketutil = None
+sdk_send = None
+sdk_missing = False
 try:
     import baostock as bs
     import baostock.util.socketutil as socketutil
+    sdk_send = socketutil.send_msg
 except ImportError:
-    print(json.dumps({"error": "缺少 BaoStock SDK，请运行 npm run setup:data"}), flush=True)
-    sys.exit(1)
+    # Defer the error to main(): importing this module for tests must not exit.
+    sdk_missing = True
 
-sdk_send = socketutil.send_msg
 last_wire_request = 0.0
 
 def checked_send(message):
@@ -42,7 +159,8 @@ def checked_send(message):
         raise ConnectionError("BaoStock 传输中断，未将部分分页当成完整结果保存")
     return result
 
-socketutil.send_msg = checked_send
+if socketutil is not None:
+    socketutil.send_msg = checked_send
 
 logged_in = False
 last_request = 0.0
@@ -133,7 +251,12 @@ def handle(request):
 
 def main():
     global logged_in
-    socket.socket = CheckedSocket
+    if sdk_missing:
+        print(json.dumps({"error": "缺少 BaoStock SDK，请运行 npm run setup:data"}), flush=True)
+        return
+    # The Go bridge rewrites the standard proxy variables at each process start,
+    # so this process mirrors the resolved application state, not raw user env.
+    socket.socket = build_socket_class(resolve_proxy_url())
     for line in sys.stdin:
         try:
             request = json.loads(line)

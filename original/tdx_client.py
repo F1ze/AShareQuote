@@ -23,8 +23,7 @@ import argparse, collections, configparser, csv, json, os, re, socket, struct, s
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 安装目录用相对路径推导，TDX_ROOT 或 TDX_CFG 可覆盖
-NP_DEFAULT = os.path.abspath(os.environ.get("TDX_ROOT")
-                             or os.path.join(BASE_DIR, os.pardir, os.pardir, "neptune"))
+NP_DEFAULT = os.path.abspath(os.environ.get("TDX_ROOT") or BASE_DIR)
 CFG_DEFAULT = os.environ.get("TDX_CFG") or os.path.join(NP_DEFAULT, "connect.cfg")
 VIPDOC_DEFAULT = os.path.join(NP_DEFAULT, "vipdoc")
 

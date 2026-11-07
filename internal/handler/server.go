@@ -32,16 +32,18 @@ type Dependencies struct {
 	Workspace *service.WorkspaceService // 文件选择和线路检查用例。
 	Preview   *service.PreviewService   // 原始归档预览用例。
 	Warehouse *service.WarehouseService // 类型化研究查询、参考导入与快照用例。
+	Proxy     *service.ProxyService     // 统一出站代理设置用例；nil 时禁用相关端点。
 }
 type Server struct {
 	manager   JobUseCases               // 当前共享任务入口，HTTP 不拥有任务生命周期。
 	workspace *service.WorkspaceService // 本机工作区能力，不接触具体文件系统实现。
 	preview   *service.PreviewService   // 读取与复权编排，Handler 只负责响应序列化。
 	warehouse *service.WarehouseService // 仓库用例，不暴露任何通用 Call 或 SQL。
+	proxy     *service.ProxyService     // 代理设置用例；空表示该端点未装配。
 }
 
 func NewServer(d Dependencies) *Server {
-	return &Server{manager: d.Jobs, workspace: d.Workspace, preview: d.Preview, warehouse: d.Warehouse}
+	return &Server{manager: d.Jobs, workspace: d.Workspace, preview: d.Preview, warehouse: d.Warehouse, proxy: d.Proxy}
 }
 
 func (s *Server) Handler(frontendOrigins ...string) http.Handler {
@@ -76,6 +78,8 @@ func (s *Server) Handler(frontendOrigins ...string) http.Handler {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 	e.GET("/api/defaults", s.handleDefaults)
+	e.GET("/api/proxy", s.handleProxyGet)
+	e.POST("/api/proxy", s.handleProxySet)
 	e.GET("/api/task", s.handleTask)
 	e.POST("/api/task", s.handleStart)
 	e.DELETE("/api/task", s.handleCancel)

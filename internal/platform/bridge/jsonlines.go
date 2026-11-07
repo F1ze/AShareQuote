@@ -16,12 +16,13 @@ import (
 // Process 复用一个长驻子进程；mu 覆盖完整请求/应答周期及进程生命周期。
 // 协议没有请求编号，必须串行收发，否则不同调用可能读到彼此的应答。
 type Process struct {
-	mu             sync.Mutex     // 保护进程启动/停止及完整收发周期；同一进程只允许一个未完成请求。
-	Python, Script string         // Python 为解释器路径/名称；Script 为工作脚本路径，二者不是可执行 shell 命令串。
-	Args           []string       // 工作脚本参数，例如 SDK 会话参数，通过 exec 参数传递而非 shell 拼接。
-	cmd            *exec.Cmd      // 当前长驻子进程；nil 表示尚未启动或故障后已回收。
-	input          io.WriteCloser // 子进程 stdin；每次写一个 UTF-8 JSON 对象及换行。
-	output         *bufio.Reader  // 子进程 stdout；每次读取完整的一行 JSON 应答，日志必须写 stderr。
+	mu             sync.Mutex      // 保护进程启动/停止及完整收发周期；同一进程只允许一个未完成请求。
+	Python, Script string          // Python 为解释器路径/名称；Script 为工作脚本路径，二者不是可执行 shell 命令串。
+	Args           []string        // 工作脚本参数，例如 SDK 会话参数，通过 exec 参数传递而非 shell 拼接。
+	EnvFunc        func() []string // 每次启动子进程时求值的附加环境变量（KEY=VALUE）；nil 表示无附加。
+	cmd            *exec.Cmd       // 当前长驻子进程；nil 表示尚未启动或故障后已回收。
+	input          io.WriteCloser  // 子进程 stdin；每次写一个 UTF-8 JSON 对象及换行。
+	output         *bufio.Reader   // 子进程 stdout；每次读取完整的一行 JSON 应答，日志必须写 stderr。
 }
 
 // New 只确定解释器和脚本位置，不立即启动进程；未使用的来源不会产生后台进程。
@@ -48,6 +49,11 @@ func (d *Process) start() error {
 	}
 	// -u 禁用 Python 输出缓冲，让一行应答及时到达，避免请求一直等待缓冲区刷新。
 	cmd := exec.Command(d.Python, append([]string{"-u", d.Script}, d.Args...)...)
+	// 环境在每次启动时求值：代理等运行期设置变更后，重启的会话立即使用新值。
+	cmd.Env = os.Environ()
+	if d.EnvFunc != nil {
+		cmd.Env = append(cmd.Env, d.EnvFunc()...)
+	}
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ internal/
   domain/              领域实体、输入约束、日期规则、纯复权算法
   repository/          CSV、因子附件、JSONL 日志、DuckDB 读写
   platform/            外部技术适配器
+    netdial/           全局出站拨号器（直连 / socks5 / http CONNECT）
     tdx/               TCP 协议和报文解码
     baostock/          官方 SDK 会话
     historyfile/       本地文件输入解码
@@ -21,6 +22,8 @@ internal/
 ```
 
 Platform 子包对应独立协议、SDK 或系统能力，不是业务用例。普通业务操作进入已有 Service；同一职责下用文件组织代码。
+
+出站网络统一收束在 `platform/netdial`：`cmd/qflux` 创建全局唯一的拨号器并注入各协议客户端（`tdx.Client.SetDialer`）和出站 HTTP 传输（`HTTPTransport`，`Proxy` 保持 nil）。代理设置由 `service.ProxyService` 校验并持久化到数据目录 `settings.json`，经 `/api/proxy` 读写；启动时按 `ALL_PROXY` → `HTTPS_PROXY` → `HTTP_PROXY` 环境变量约定读取初始值，界面保存的设置优先。新增出站连接不得绕过该拨号器。
 
 ## 职责和依赖方向
 

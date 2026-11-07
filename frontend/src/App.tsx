@@ -8,7 +8,7 @@ import {
   ShieldCheck
 } from "lucide-react"
 import { toast, Toaster } from "sonner"
-import { DownloadForm, type FormMessage, type Scope } from "@/components/DownloadForm"
+import { DownloadForm, type FormMessage, type ProxyState, type Scope } from "@/components/DownloadForm"
 import { PathBrowser } from "@/components/PathBrowser"
 import { PricePreview } from "@/components/PricePreview"
 import { DataLibrary } from "@/components/DataLibrary"
@@ -48,6 +48,7 @@ export default function App() {
   const [testing, setTesting] = useState(false)
   const [browser, setBrowser] = useState<"folder" | "gbbq" | null>(null)
   const [previewFile, setPreviewFile] = useState<string | null>(null)
+  const [proxy, setProxy] = useState<ProxyState>({ value: "", active: "", saving: false })
   const [speedHistory, setSpeedHistory] = useState<number[]>([])
   const speedTask = useRef("")
   const lastSpeedAt = useRef(0)
@@ -84,6 +85,13 @@ export default function App() {
           type: "error",
           text: reason instanceof Error ? reason.message : "服务连接失败，请点击右上角重试"
         })
+      })
+    // 代理是服务级设置而非任务参数；读取失败不阻塞页面就绪。
+    void api
+      .proxy()
+      .then((settings) => setProxy({ value: settings.proxy, active: settings.proxy, saving: false }))
+      .catch(() => {
+        // 服务未启用代理端点时保持直连显示，不额外打扰用户。
       })
   }, [])
   useEffect(loadDefaults, [loadDefaults])
@@ -161,6 +169,19 @@ export default function App() {
       setMessage({ type: "error", text: reason instanceof Error ? reason.message : "线路检测失败" })
     } finally {
       setTesting(false)
+    }
+  }
+  const saveProxy = async () => {
+    if (proxy.saving) return
+    const next = proxy.value.trim()
+    setProxy((current) => ({ ...current, saving: true }))
+    try {
+      const result = await api.saveProxy(next)
+      setProxy({ value: result.proxy, active: result.proxy, saving: false })
+      toast.success(result.proxy ? "代理已保存，新连接将立即经代理出站" : "已恢复直连，新连接立即生效")
+    } catch (reason) {
+      setProxy((current) => ({ ...current, saving: false }))
+      toast.error(reason instanceof Error ? reason.message : "保存代理设置失败")
     }
   }
   const cancel = async () => {
@@ -264,8 +285,11 @@ export default function App() {
                 testing={testing}
                 ready={ready}
                 message={message}
+                proxy={proxy}
                 onOptionsChange={setOptions}
                 onScopeChange={setScope}
+                onProxyChange={(value) => setProxy((current) => ({ ...current, value }))}
+                onProxySave={() => void saveProxy()}
                 onSubmit={() => void start()}
                 onTest={() => void testHosts()}
                 onBrowse={setBrowser}

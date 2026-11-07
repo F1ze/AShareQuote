@@ -85,6 +85,10 @@ export interface Defaults {
   task: TaskSnapshot | null
 }
 
+export interface ProxySettings {
+  proxy: string
+}
+
 export interface WarehouseDataset {
   exchange: string
   code: string

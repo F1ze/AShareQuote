@@ -15,6 +15,7 @@ import { monthsAgo, periods, today, yesterday } from "@/lib/dates"
 
 export type Scope = "markets" | "codes"
 export type FormMessage = { type: "info" | "success" | "error"; text: string }
+export type ProxyState = { value: string; active: string; saving: boolean }
 interface Props {
   options: DownloadOptions
   scope: Scope
@@ -23,8 +24,11 @@ interface Props {
   testing: boolean
   ready: boolean
   message: FormMessage
+  proxy: ProxyState
   onOptionsChange: (options: DownloadOptions) => void
   onScopeChange: (scope: Scope) => void
+  onProxyChange: (value: string) => void
+  onProxySave: () => void
   onSubmit: () => void
   onTest: () => void
   onBrowse: (kind: "folder" | "gbbq") => void
@@ -384,6 +388,38 @@ export function DownloadForm(props: Props) {
               </button>
             </div>
             <p className="help-text">用于预览前复权、后复权价格，原始行情始终保持不复权。</p>
+            <label htmlFor="proxy-url" className="form-label mt-4">
+              网络代理 <span className="text-muted-foreground">（可选）</span>
+            </label>
+            <div className="path-field">
+              <input
+                id="proxy-url"
+                value={props.proxy.value}
+                onChange={(event) => props.onProxyChange(event.target.value)}
+                placeholder="例如 socks5://127.0.0.1:1080 或 http://proxy:8080，留空直连"
+                className="form-control"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3 mt-2">
+              <button
+                type="button"
+                className="text-button"
+                disabled={busy || props.proxy.saving}
+                onClick={props.onProxySave}
+              >
+                <Network className="size-4" />
+                {props.proxy.saving ? "保存中…" : "保存代理设置"}
+              </button>
+              {props.proxy.active && (
+                <span className="help-text m-0">当前生效：{props.proxy.active}</span>
+              )}
+            </div>
+            <p className="help-text">
+              行情 TCP 与 BaoStock 会话统一经此代理出站；保存后新连接立即生效。留空表示直连；未保存过设置时，启动按
+              ALL_PROXY、HTTPS_PROXY、HTTP_PROXY 环境变量读取初始值。
+            </p>
             <button
               type="button"
               className="text-button mt-3"
