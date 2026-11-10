@@ -36,17 +36,8 @@ func (t *jobRun) worker(offset int, jobs <-chan Security) {
 			options := t.options // 使用副本，单只证券的增量起点不能修改其他 worker 的配置。
 			var err error
 			// 2. 读取有效旧归档计算回看起点；旧归档损坏时传播错误，不按“没有历史”覆盖它。
-			if options.Incremental && t.archive != nil {
-				latest, readErr := t.archive.Latest(t.ctx, security, options.Category)
-				err = readErr
-				if !latest.IsZero() {
-					// 回看 7 个自然日，让重叠区的新数据修正近期行情；更早的缺口仍需全量扫描。
-					overlap := latest.AddDate(0, 0, -7).Format("2006-01-02")
-					if overlap > options.StartDate && overlap <= options.EndDate {
-						options.StartDate = overlap
-					}
-				}
-			}
+			options, err = t.incrementalOptions(options, security)
+
 			// 3. 拉取所有需要的页面；任何错误均跳过后面的资源写入，但仍记录该项失败。
 			var bars []Bar
 			var warning string

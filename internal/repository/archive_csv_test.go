@@ -55,3 +55,33 @@ func TestArchiveMergesAndProtectsHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestArchiveBoundsValidatesStoredHistory(t *testing.T) {
+	ctx := context.Background()
+	a := &CSVArchive{Directory: t.TempDir()}
+	security := domain.Security{Market: 1, Code: "600000"}
+	first, last, err := a.Bounds(ctx, security, 7)
+	if err != nil || !first.IsZero() || !last.IsZero() {
+		t.Fatalf("缺失文件范围：%v %v %v", first, last, err)
+	}
+	b := domain.Batch{Security: security, Category: 7, Bars: []domain.Bar{sample(4, 12), sample(2, 11)}, Source: "fixture"}
+	r, err := a.Commit(ctx, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, last, err = a.Bounds(ctx, security, 7)
+	if err != nil || !first.Equal(sample(2, 11).Date) || !last.Equal(sample(4, 12).Date) {
+		t.Fatalf("范围查询错误：%v %v %v", first, last, err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err = a.Bounds(cancelled, security, 7); err == nil {
+		t.Fatal("忽略取消")
+	}
+	if err = os.WriteFile(r.Path, []byte("broken archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = a.Bounds(ctx, security, 7); err == nil {
+		t.Fatal("损坏文件被当作没有历史")
+	}
+}

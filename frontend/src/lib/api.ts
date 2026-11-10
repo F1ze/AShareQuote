@@ -1,5 +1,8 @@
+import { nativeWidget, widgetRequest } from "@/lib/widget"
+import type { WatchSettings } from "@/lib/realtime"
 import type {
   BrowseResult,
+  RealtimeSnapshot,
   Defaults,
   DownloadOptions,
   HostReport,
@@ -16,6 +19,7 @@ import type {
 const API_BASE = (import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, "")
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (nativeWidget() && new URLSearchParams(location.search).has("widget")) return widgetRequest<T>(path, init?.signal || undefined)
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: init?.body ? { "Content-Type": "application/json", ...init.headers } : init?.headers
@@ -28,6 +32,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+ watchSettings: () => request<WatchSettings>("/realtime/watch"),
+ saveWatch: (settings: WatchSettings) => request<WatchSettings>("/realtime/watch", {method:"POST",body:JSON.stringify(settings)}),
+  realtime: (codes: string[], selected: string, signal: AbortSignal, details = true) =>
+    request<RealtimeSnapshot>(`/realtime?${new URLSearchParams({ codes: codes.join(","), selected, details: String(details) })}`, { signal }),
   eventsURL: `${API_BASE}/events`,
   defaults: () => request<Defaults>("/defaults"),
   proxy: () => request<ProxySettings>("/proxy"),

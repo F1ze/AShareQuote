@@ -32,7 +32,7 @@ npm run dev
 建议依次建立数据：
 
 1. 选择 **BaoStock、沪深、日线、历史建库、DuckDB**，采集来源提供的历史证券（包括退市证券），同时同步上市/退市资料、交易日历和独立复权因子。
-2. 选择 **通达信、北京、日线** 补充北交所。通达信还支持 1 分钟；历史保留长度由行情服务器决定。
+2. 选择 **通达信、北京、日线** 补充北交所。通达信还支持 1 分钟；在线站仅提供其保留的近期记录，不能承诺三年分钟历史。多年 1 分钟数据需在「数据仓库」补录 `.lc1` / 分钟 CSV，再持续增量维护。
 3. 此后使用 **增量维护**。系统保留旧历史，并回看最近 7 个自然日，更新近期记录。
 4. 在 **数据仓库** 查看实际覆盖范围、查询数据集、补录历史文件或导出 Parquet 研究快照。
 
@@ -1182,3 +1182,113 @@ DuckDB 文件是单进程写入模型。应用运行时，用导出快照进行�
 - [DuckDB 并发模型](https://duckdb.org/docs/stable/connect/concurrency)。
 
 下载数据的授权范围以相应来源为准；本仓库只提交程序与测试，不分发采集数据。
+
+
+### 为什么 1 分钟选择三年却只能得到几个月？
+
+`SecurityBars` 请求中的 `start` 是相对最新 K 线的根数偏移，使用 16 位无符号字段（`client.go` 的 `payload[12:14]`），最大为 65,535。程序每页最多请求 800 条并按实际返回量继续翻页，因此 800 不是总量限制。按每天 240 根估算，65,536 根也只相当于约 273 个交易日；行情服务器还可能在此之前返回空页。把日期拆成多段、提高并发或扩大 Go 整数都不会扩展服务端历史。
+
+下载结果遇到空页、重复页或偏移边界时会保留已取得的原始数据，同时列出请求日期、本轮源端实际可见日期、目标区间取得条数和停止原因，标记为需要检查覆盖；完全没有交集时明确报错并保留原文件。该报告不声称仅凭首尾时间已证明中间每一分钟连续。
+
+要补齐三年真实的 1 分钟 OHLCV，需要提供含该范围的 `.lc1` / 分钟 CSV，或接入具备相应历史能力的数据源；当前 BaoStock 适配器没有 1 分钟能力，分时价格也不能代替完整的分钟 OHLCV。已有本地补录会按时间合并并可入库 DuckDB，不受在线偏移限制。增量维护只有在已存最早日期不晚于请求起点时才缩短为七天回看；仅存最近几个月的文件不会让早期请求被静默跳过。内部缺口和历史修订仍应使用历史建库模式全范围扫描。
+
+
+### 实时看盘
+
+运行 `npm run dev`，打开 `http://127.0.0.1:7100`，进入顶部「实时看盘」。默认自选为招商银行、贵州茅台、平安银行、宁德时代；实际名称从本地已存证券名录补充，未收录显示「名称待补充」。添加六位代码或 `sh` / `sz` / `bj` 前缀，最多 20 只，点击列表切换当前主屏。自选、选中项与刷新间隔只保存在浏览器 `qflux.realtime` 中，不写数据库行情表。
+
+主屏提供价、涨幅、昨收、开高低、量额、五档盘口、扩展成交明细及其窗口走势。价格为元，快照与成交数量沿用参考协议的手，成交额为元（页面按万元展示）。走势只有本轮最近至多 200 条扩展成交，不表示全天分时；源端时间没有日期，不伪造交易日。显示的更新时间是本机快照接收时间，休市返回的可能是上个交易日行情。
+
+**当前完整交易所 L2 未接入。** `original/tdx_realtime.py` 的 `0x053E` 提供 L1 五档；`0x0FC2` 提供带秒、通常约三秒聚合的成交明细，没有十档、逐笔委托序号或可验证的 L2 授权。参考模块将非空回包称作 L2 的推断未沿用，API 的 `l2Verified` 为 false；明细可以是 `available` / `empty` / `unavailable`，故障不会屏蔽有效快照。完整 L2 需以后接入授权供应商真实接口，而非把五档改名为十档。
+
+```mermaid
+sequenceDiagram
+    participant UI as React 实时看盘
+    participant H as Handler
+    participant S as RealtimeService
+    participant T as platform/tdx
+    participant N as 通达信站点
+    UI->>H: GET /api/realtime?codes=sh600036,sz000001&selected=sh600036
+    H->>S: 校验代码、传递取消与 8 秒期限
+    alt 同组请求在 0.9 秒缓存内
+        S-->>UI: 返回原接收时间和上游耗时
+    else 需要刷新
+        par 批量五档快照
+            S->>T: RealtimeQuotes，独占客户端
+            T->>N: 统一拨号 + 握手与 0x053E 连续发送
+            N-->>T: 实际市场/代码与快照
+        and 选中股票成交窗口
+            S->>T: RealtimeTrades，另一独占客户端
+            T->>N: 握手与 0x0FC2 连续发送
+            N-->>T: 最多 200 条明细，或错误/空窗口
+        end
+        T-->>S: 严格校验长度与证券匹配，不回填错误股票
+        S-->>UI: 快照 + 明细状态，完整 L2 未验证
+    end
+    UI->>UI: 本轮完成后等待配置间隔；失败指数退避
+    Note over UI,H: 切股/离开 Tab/页面隐藏取消请求，暂停时不轮询
+```
+
+实现复用地图：`internal/platform/tdx/realtime.go` 移植参考采集器的 `SNAP_FIELDS`、`parse_snapshot`、`parse_order` 及握手流水线；解压、变长数、写完整帧复用现有 Go 协议工具。`internal/service/realtime.go` 承接 `tdx_dash.py` 的短缓存与快照/明细分离，限制一轮刷新（内部两条连接），缓存至多 32 组；名称由 `internal/repository/realtime.go` 经 GORM 读取已有名录。`internal/handler/realtime.go` 只负责参数及响应。`RealtimeBoard.tsx` 对应参考 `dash.html` 的主屏，`useRealtime.ts` 管理无重叠刷新、失败退避、10 秒客户端超时与取消。所有连接共用应用代理和请求预算，不启动额外 Python 服务，也不恢复参考脚本的业务健康探测。
+
+默认刷新间隔 3 秒，可选 2 / 3 / 5 / 10 / 30 秒，含义为上一轮完成后等待的间隔。失败延长至最多 30 秒；无扩展明细时显示五档降级，整轮快照失败时保留旧数据并标记过期。报价为 0 时显示缺失，不把除零结果当涨幅。P2 的终端查看可继续使用原脚本；本轮不新增桌面组件。
+
+验证：`npm test`、`node scripts/go.mjs vet ./...`、`npm run frontend:lint`、`npm run frontend:build`；构建后运行 `python scripts/smoke_preview.py`。`internal/platform/tdx/testdata/realtime.json` 的期望值由原 Python 解码器生成；协议测试检查二进制对照、截断与错配拒绝、握手无等待流水线。浏览器测试仅在测试窗口注入样例，覆盖 Tab、多股票、快速切换、暂停/恢复、离开后停止请求、明细降级、失败旧数据提示及手机无溢出；生产路径没有模拟数据开关。
+
+手工验收：添加并切换一只 A 股，核对代码与主屏一致；观察两个刷新周期及列表涨幅；切换间隔、暂停并检查网络面板停止请求；离开 Tab 后确认没有继续请求；断开代理观察旧数据过期提示，恢复代理后确认自动更新；明细不可用时确认五档仍显示，且始终明确完整 L2 未接入。真实站点结果受休市、线路能力及权限影响，不能用接收成功证明交易所实时性。
+
+
+### 高密度自选表格与可选原生小组件
+
+自选监控采用全宽紧凑表格：桌面每行约 32px、手机约 36px。表头固定，价格、涨幅、涨跌额、量额可排序，支持按名称/代码筛选及定位当前股票。名称和代码在宽屏同一行；窄屏收起低频列，仍保留股票、最新价、涨幅和本机接收时间，状态用小色点表示。悬浮行可查看完整数值、开高低、昨收及状态。换手率显示 `—`：现有协议没有流通股本分母，不能按成交量猜算。排序和筛选不改变行情订阅，也不额外请求数据。
+
+点击自选区「轻量窗口」可直接运行独立网页小组件，或访问 `http://127.0.0.1:7100/?widget=1`。弹窗复用当前自选，显示名称/代码、价、幅和接收时间；设置中可修改代码、间隔及背景不透明度。默认间隔为主屏的至少两倍且不低于 10 秒，选项为 10/15/30/60 秒，隐藏页面或暂停时停止轮询。普通浏览器窗口无法真正透明到桌面或保证置顶，页面会标注网页模式；系统窗口边框可用于拖动、关闭。
+
+真正的原生壳位于 `desktop/widget`，采用 **Tauri 2 + 系统 WebView**，不使用 Electron，不捆绑 Chromium。Windows 使用 WebView2，macOS 使用 WKWebView。主 Tab 的 `npm run dev`、构建和 Go 后端均不依赖此目录。原生壳配置无边框透明窗口、默认置顶和可调整尺寸，标题区可拖动，按钮可取消置顶、最小化、关闭；最小化/隐藏时取消报价并停止网络轮询。macOS 透明窗口行为与系统/Tauri 版本相关；当前配置启用相应兼容选项，App Store 发布前需按所用版本审核透明窗口 API 和签名要求，不默认承诺商店可分发。
+
+原生壳运行前需安装 Rust stable 工具链及平台前置条件：Windows 的 MSVC C++ Build Tools 和 WebView2；macOS 的 Xcode Command Line Tools。详见 [Tauri 前置条件](https://v2.tauri.app/start/prerequisites/)。先在 `src` 启动 `npm run dev` 或 API，再另开终端执行：
+
+```bash
+# 独立安装，不会修改主工程 package.json
+npm --prefix desktop/widget ci
+npm --prefix desktop/widget run info
+npm --prefix desktop/widget run dev
+
+# 在对应操作系统上生成原生发行包
+npm --prefix desktop/widget run build
+```
+
+配置默认连接本机 `127.0.0.1:7101/api`，可用环境变量 `QFLUX_WIDGET_API_PORT` 改端口。安装包不包含 Go 后端，需先启动它。Rust 原生桥仅允许固定的报价/自选读取端点，不提供通用 URL 请求、文件系统或 Shell 能力；实际行情连接仍由 Go 统一代理/限流。`GET /api/realtime?...&details=false` 不发起成交明细；`POST /api/realtime/watch` 发布主屏自选，`GET /api/realtime/watch` 供原生壳启动时读取，配置仅保存在当前 Go 进程内。原生壳配置中可手动同步主面板，或独立修改自己的监控股票。
+
+新增/调整文件角色：
+
+```text
+frontend/src/components/
+├── WatchlistTable.tsx        # 固定表头、排序/筛选、对齐数字列及响应式自选表
+├── RealtimeBoard.tsx         # 全宽表格接入、发布自选和打开轻量窗口
+└── QuoteWidget.tsx           # 网页/原生壳共用的轻量页面及窗口操作
+frontend/src/lib/widget.ts   # 最小 Tauri 桥接、请求取消和小组件默认刷新策略
+frontend/src/main.tsx        # 根据 widget 参数动态加载，避免小组件载入主屏图表
+frontend/src/hooks/useRealtime.ts # 共用生命周期；轻量模式只取快照，pagehide 清理
+internal/service/realtime.go # 轻量报价分支、自选配置副本、缓存隔离
+internal/handler/realtime.go # details 参数、自选 GET/POST 与校验
+internal/domain/realtime.go  # 共享自选配置实体及字段语义
+scripts/browser_smoke.mjs    # 20只股票、密度、排序、表头、手机关键列及小组件验收
+
+desktop/widget/
+├── package.json             # 仅此模块需要的 Tauri CLI 与启动/构建命令
+├── package-lock.json        # 独立工具依赖锁定
+├── app-icon.svg             # 小组件图标的矢量源
+└── src-tauri/
+    ├── Cargo.toml           # 独立 Rust 桌面壳依赖
+    ├── build.rs             # Tauri 原生资源构建入口
+    ├── tauri.conf.json      # 系统窗口、透明度基础、置顶、资源路径与 CSP
+    ├── capabilities/main.json # 最小原生窗口操作权限
+    ├── icons/               # Windows/macOS 发行所需图标
+    └── src/main.rs          # 固定本机 API 桥及可取消的单路请求
+```
+
+验证边界：前后端构建、Go 用例/接口测试和浏览器中的轻量页面可在当前 Windows 环境验证。当前机器未安装 Rust/Cargo，因而尚未编译/运行 Tauri 原生壳；macOS 原生透明、拖动、置顶与签名还需在 Mac 上验收。网页降级入口可独立使用，不依赖这一步，也不把网页截图当成原生透明窗口验收。
+
+
+实时交互补充：`frontend/src/components/OrderBookRow.tsx` 按股票建立固定基准，使用单调压缩刻度映射条长，避免每轮最大档归一化把实际增减抵消。数量条用 750ms transform 过渡连续伸缩；不再用数字跳动或增减角标代替。盘口的「条形动效」默认开启，显式开关优先于全局减少动态效果规则，也可单独关闭；不会修改系统设置。准确数量以右侧数字为准，切股重置基准，不推断净买入或撤单。`useRealtime` 切股保留同代码旧快照与原接收时间，只清空前一股票成交窗口；已知名称按市场+代码保留，不被临时空名称回包覆盖。`npm run test:realtime` 验证元数据保留、市场隔离和成交窗口清空；浏览器冒烟直接测量数量条开始、中间、结束的像素宽度，覆盖买一变长、最大卖档变短以及其他档位不误动。

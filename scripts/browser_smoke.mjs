@@ -66,7 +66,7 @@ socket.addEventListener("message", (event) => {
   }
 })
 
-function send(method, params = {}) {
+function send(method, params = {}, sessionId) {
   const id = ++sequence
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -74,7 +74,7 @@ function send(method, params = {}) {
       reject(new Error(`${method} 执行超时`))
     }, 15000)
     pending.set(id, { resolve, reject, timer, method })
-    socket.send(JSON.stringify({ id, method, params }))
+    socket.send(JSON.stringify({ id, method, params, sessionId }))
   })
 }
 
@@ -322,6 +322,133 @@ try {
   await send("Input.dispatchKeyEvent", {type:"keyDown",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
   await send("Input.dispatchKeyEvent", {type:"keyUp",key:"Escape",code:"Escape",windowsVirtualKeyCode:27})
   await evaluate(`window.fetch = window.hostSmokeFetch`)
+  // 实时看盘仅在测试浏览器注入行情；生产服务没有 mock 开关。
+  await send("Emulation.setDeviceMetricsOverride", {width:1440,height:1080,deviceScaleFactor:1,mobile:false})
+  await evaluate(`(() => {
+    window.rtOriginalFetch=window.fetch; window.rtCalls=0; window.rtMode='available'; window.rtBookStep=0;
+    window.fetch=async (input,init) => {
+      const url=new URL(String(input),location.href)
+      if(url.pathname!=='/api/realtime') return window.rtOriginalFetch(input,init)
+      window.rtCalls++
+      if(window.rtMode==='error') throw new Error('测试上游不可用')
+      const selected=url.searchParams.get('selected')
+      if(window.rtMode==='slow') await new Promise(resolve=>setTimeout(resolve,500))
+      if(init?.signal?.aborted) throw new DOMException('Aborted','AbortError')
+      const names={'sh600036':'招商银行','sh600519':'贵州茅台','sz000001':'平安银行','sz300750':'宁德时代'}
+      const quotes=url.searchParams.get('codes').split(',').map((key,i)=>({market:{sz:0,sh:1,bj:2}[key.slice(0,2)],code:key.slice(2),name:window.rtMode==='blankNames'?'':names[key]||'测试证券',price:35+i+window.rtCalls/100,lastClose:34+i,open:34.8+i,high:36+i,low:34.5+i,volume:100000+i,amount:350000000,bids:Array.from({length:5},(_,n)=>({price:35+i-n/100,volume:100+n*25+(n===0?window.rtBookStep*50:0)})),asks:Array.from({length:5},(_,n)=>({price:35.02+i+n/100,volume:200+n*30-(n===4?window.rtBookStep*40:0)}))}))
+      const trades=window.rtMode==='degraded'?[]:Array.from({length:60},(_,i)=>({time:'10:'+String(Math.floor(i/20)).padStart(2,'0')+':'+String(i%20*3).padStart(2,'0'),price:35+Math.sin(i/7)*.25,volume:10+i,trades:2,side:i%3}))
+      return new Response(JSON.stringify({selected,quotes,trades,receivedAt:new Date().toISOString(),latencyMs:82,cached:false,detailStatus:trades.length?'available':'unavailable',detailMessage:trades.length?'完整 L2 未接入：当前是约 3 秒扩展成交窗口':'扩展成交明细不可用，已降级五档快照',l2Verified:false}),{headers:{'Content-Type':'application/json'}})
+    }
+  })()`)
+  await clickText("实时看盘")
+  await waitFor(`document.querySelector('[aria-label="当前股票主屏"]')?.innerText.includes('招商银行')`, "实时股票主屏")
+  await waitFor(`document.querySelector('[aria-label="扩展成交明细"] tbody')?.children.length===60`, "扩展成交窗口")
+  if(!await evaluate(`document.body.innerText.includes('完整 L2 未接入') && document.querySelectorAll('.rt-watch-row').length===4 && document.querySelectorAll('.rt-book-row').length===10`)) throw new Error('行情能力标签或自选列表缺失')
+  await evaluate(`window.scrollTo(0,0)`)
+  await screenshot('realtime-desktop.png')
+  await waitFor(`[...document.querySelectorAll('.book-quantity-bar')].every(bar=>bar.getAnimations().every(animation=>animation.playState!=='running'))`, '首次盘口数量条已稳定')
+  // 直接测量真实条宽，证明存在中间帧，而不是用数字闪烁/增减角标代替条形动画。
+  const barMotion=await evaluate(`(async()=>{
+    const width=(label)=>document.querySelector('.rt-book-row[data-level="'+label+'"] .book-quantity-bar').getBoundingClientRect().width;
+    const before=[width('买 1'),width('卖 5'),width('买 2')];
+    window.rtBookStep=1;document.querySelector('[aria-label="立即刷新行情"]').click();
+    for(let i=0;i<120;i++){if(document.querySelector('.rt-book-row[data-level="买 1"] .book-volume').textContent==='150')break;await new Promise(requestAnimationFrame)}
+    await new Promise(resolve=>setTimeout(resolve,180));const middle=[width('买 1'),width('卖 5'),width('买 2')];
+    await new Promise(resolve=>setTimeout(resolve,750));const after=[width('买 1'),width('卖 5'),width('买 2')];
+    return {before,middle,after,reduced:matchMedia("(prefers-reduced-motion:reduce)").matches,duration:getComputedStyle(document.querySelector(".book-quantity-bar")).transitionDuration};
+  })()`)
+  if(!(barMotion.before[0]<barMotion.middle[0] && barMotion.middle[0]<barMotion.after[0] && barMotion.before[1]>barMotion.middle[1] && barMotion.middle[1]>barMotion.after[1] && Math.abs(barMotion.before[2]-barMotion.after[2])<0.5)) throw new Error('数量条没有连续变长/变短，或未变化档位被重新归一化：'+JSON.stringify(barMotion))
+  fs.writeFileSync(path.join(artifacts,'order-book-motion.json'),JSON.stringify(barMotion,null,2))
+  if(await evaluate(`document.querySelector('.rt-watch-row').getBoundingClientRect().height>36`)) throw new Error('自选行高未压紧')
+  await evaluate(`document.querySelector('[aria-label="按最新价排序"]').click()`)
+  await waitFor(`document.querySelector('.rt-watch-row').innerText.includes('SZ300750')`, '自选价格降序排序')
+  await evaluate(`(() => {const input=document.querySelector('[aria-label="筛选自选股票"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'平安');input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}))})()`)
+  await waitFor(`document.querySelectorAll('.rt-watch-row').length===1`, '名称快速筛选')
+  await clickText('定位当前')
+  await waitFor(`document.querySelectorAll('.rt-watch-row').length===4 && document.activeElement?.getAttribute('aria-pressed')==='true'`, '定位当前并清除筛选')
+  await evaluate(`(() => {
+    const input=document.querySelector('#watch-code')
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'600000')
+    input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}))
+  })()`)
+  await evaluate(`document.querySelector('.rt-add').requestSubmit()`)
+  await waitFor(`document.querySelectorAll('.rt-watch-row').length===5 && document.querySelector('[aria-label="当前股票主屏"]')?.innerText.includes('SH600000')`, '添加监控股票')
+  await evaluate(`document.querySelector('[aria-label="移除 SH600000"]').click()`)
+  await waitFor(`document.querySelectorAll('.rt-watch-row').length===4`, '移除监控股票')
+  await evaluate(`(() => {const select=document.querySelector('#realtime-interval');select.value='5';select.dispatchEvent(new Event('change',{bubbles:true}))})()`)
+  await waitFor(`JSON.parse(localStorage.getItem('qflux.realtime')).interval===5`, '保存刷新间隔')
+  await clickText('暂停')
+  const pausedCount=await evaluate('window.rtCalls')
+  await sleep(3200)
+  if(await evaluate('window.rtCalls')!==pausedCount) throw new Error('暂停后仍在轮询')
+  await clickText('继续')
+  await waitFor(`window.rtCalls>${pausedCount}`, '恢复行情刷新')
+  await evaluate(`window.rtMode='slow';document.querySelector('button[aria-label="查看 SZ000001"]').click()`)
+  if(!await evaluate(`document.querySelector('[aria-label="当前股票主屏"]').innerText.includes('平安银行') && !document.querySelector('[aria-label="多股票实时监控"]').innerText.includes('名称待补充') && [...document.querySelectorAll('.book-quantity-bar')].every(bar=>bar.getAnimations().length===0)`))throw new Error('切股时名称闪空或继承上一股票盘口动画')
+  await waitFor(`document.querySelector('[aria-label="当前股票主屏"]')?.innerText.includes('平安银行')`, '切换主屏证券')
+  await evaluate(`window.rtMode='slow';document.querySelector('[aria-label="立即刷新行情"]').click()`)
+  await evaluate(`document.querySelector('button[aria-label="查看 SH600519"]').click()`)
+  await waitFor(`document.querySelector('[aria-label="当前股票主屏"]')?.innerText.includes('贵州茅台')`, '取消旧股票请求')
+  await waitFor(`!document.querySelector('[aria-label="立即刷新行情"]').disabled`, '切股加载完成')
+  await evaluate(`window.rtMode='blankNames';document.querySelector('[aria-label="立即刷新行情"]').click()`)
+  await waitFor(`!document.querySelector('[aria-label="立即刷新行情"]').disabled`, '空名称回包已完成')
+  if(!await evaluate(`document.querySelector('[aria-label="当前股票主屏"]').innerText.includes('贵州茅台') && !document.querySelector('[aria-label="多股票实时监控"]').innerText.includes('名称待补充')`))throw new Error('临时空名称覆盖已知证券名称')
+  await evaluate(`window.rtMode='degraded'`)
+  await waitFor(`!document.querySelector('[aria-label="立即刷新行情"]').disabled`, '刷新按钮恢复')
+  await evaluate(`document.querySelector('[aria-label="立即刷新行情"]').click()`)
+  await waitFor(`document.querySelector('[aria-label="扩展成交明细"]')?.innerText.includes('已降级五档快照')`, '无扩展权限降级')
+  if(!await evaluate(`document.querySelector('.rt-price-block strong')?.textContent!=='—'`)) throw new Error('明细失败不应清空快照')
+  await evaluate(`window.rtMode='error';document.querySelector('[aria-label="立即刷新行情"]').click()`)
+  await waitFor(`document.querySelector('.rt-board [role="alert"]')?.innerText.includes('已过期')`, '失败保留旧行情并标记过期')
+  await evaluate(`window.rtMode='available';document.querySelector('[aria-label="立即刷新行情"]').click()`)
+  await waitFor(`!document.querySelector('.rt-board [role="alert"]')`, '行情故障恢复')
+  await evaluate(`localStorage.setItem('qflux.realtime', JSON.stringify({...JSON.parse(localStorage.getItem('qflux.realtime')),codes:['sh600036','sh600519','sz000001','sz300750',...Array.from({length:16},(_,i)=>'sh'+String(600001+i))]}))`)
+  await clickText('数据采集'); await clickText('实时看盘')
+  await waitFor(`document.querySelectorAll('.rt-watch-row').length===20`, '二十只股票密度')
+  await evaluate(`document.querySelector('.rt-watch').scrollIntoView({block:'start'})`)
+  await screenshot('watchlist-dense-desktop.png')
+  await evaluate(`document.querySelector('.rt-watch-scroll').scrollTop=120`)
+  if(!await evaluate(`Math.abs(document.querySelector('.rt-watch-table th').getBoundingClientRect().top-document.querySelector('.rt-watch-scroll').getBoundingClientRect().top)<3`)) throw new Error('自选表头未固定')
+  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true})
+  await evaluate(`window.scrollTo(0,0)`)
+  if(await evaluate(`document.documentElement.scrollWidth>innerWidth`)) throw new Error('实时看盘手机页面横向溢出')
+  await screenshot('realtime-mobile.png')
+  if(!await evaluate(`['.watch-price','.watch-change','.watch-time'].every(selector=>getComputedStyle(document.querySelector('.rt-watch-table td'+selector)).display!=='none')`)) throw new Error('手机关键列被隐藏')
+  await clickText('数据采集')
+  const leftCount=await evaluate('window.rtCalls')
+  await sleep(3200)
+  if(await evaluate('window.rtCalls')!==leftCount) throw new Error('离开 Tab 后仍然轮询')
+  await evaluate(`window.fetch=window.rtOriginalFetch`)
+  // 独立小组件使用自己的页面，验证无需加载主屏就能显示报价。
+  const widgetTarget=await send('Target.createTarget',{url:'about:blank'})
+  const widgetSession=(await send('Target.attachToTarget',{targetId:widgetTarget.targetId,flatten:true})).sessionId
+  const widgetEval=async(expression)=>{const result=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true},widgetSession);if(result.exceptionDetails)throw new Error(result.exceptionDetails.text);return result.result.value}
+  await send('Page.enable',{},widgetSession)
+  await send('Emulation.setDeviceMetricsOverride',{width:440,height:320,deviceScaleFactor:1,mobile:false},widgetSession)
+  await send('Page.addScriptToEvaluateOnNewDocument',{source:`
+    window.widgetCalls=0;
+    window.fetch=async(input)=>{
+      const url=new URL(String(input),location.href);
+      if(url.pathname==='/api/realtime/watch')return new Response(JSON.stringify({codes:['sh600036','sz000001'],selected:'sh600036',interval:3}),{headers:{'Content-Type':'application/json'}});
+      if(url.searchParams.get('details')!=='false')throw new Error('小组件请求了成交明细');
+      window.widgetCalls++;
+      const quotes=url.searchParams.get('codes').split(',').map(key=>({market:key.startsWith('sh')?1:0,code:key.slice(2),name:key==='sh600036'?'招商银行':'平安银行',price:43.01,lastClose:42.88}));
+      return new Response(JSON.stringify({quotes,trades:[],receivedAt:new Date().toISOString(),latencyMs:70,selected:url.searchParams.get('selected'),detailStatus:'not_requested',l2Verified:false}),{headers:{'Content-Type':'application/json'}});
+    };
+  `},widgetSession)
+  await send('Page.navigate',{url:base+'/?widget=1&codes=sh600036,sz000001&selected=sh600036&interval=10'},widgetSession)
+  await send('Page.bringToFront',{},widgetSession)
+  for(let attempt=0;attempt<70;attempt++){if(await widgetEval(`Boolean(document.querySelector('.widget-quotes')?.innerText.includes('招商银行'))`))break;if(attempt===69)throw new Error('独立小组件未显示行情');await sleep(100)}
+  if(!await widgetEval(`document.querySelectorAll('.widget-quotes tbody tr').length===2 && document.body.innerText.includes('43.01') && document.body.innerText.includes('网页模式')`))throw new Error('小组件必要字段缺失')
+  await widgetEval(`document.querySelector('[aria-label="暂停小组件刷新"]').click()`)
+  const widgetCount=await widgetEval('window.widgetCalls');await sleep(1200)
+  if(await widgetEval('window.widgetCalls')!==widgetCount)throw new Error('暂停小组件仍在取数')
+  await widgetEval(`document.querySelector('[aria-label="配置小组件"]').click()`)
+  if(!await widgetEval(`document.querySelector('[aria-label="小组件不透明度"]') && document.querySelector('[aria-label="小组件刷新间隔"]').value==='10'`))throw new Error('小组件配置不可用')
+  const widgetShot=await send('Page.captureScreenshot',{format:'png'},widgetSession)
+  fs.writeFileSync(path.join(artifacts,'quote-widget.png'),Buffer.from(widgetShot.data,'base64'))
+  await send('Target.closeTarget',{targetId:widgetTarget.targetId})
+  await send('Page.bringToFront')
   // 离线构造超过两个分页的分钟历史，回归完整读取、日期边界和真实指针框选。
   // 仅替换当前浏览器的 fetch，服务端、用户仓库和下载文件均不改动。
   await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false })
@@ -638,6 +765,12 @@ try {
     trafficLimitValidation: true,
     availableHostNames: true,
     hostsHoverKeyboardAndMobile: true,
+    compactWatchlist: true,
+    watchlistSortFilterStickyHeader: true,
+    lightweightWidget: true,
+    realtimeBoard: true,
+    realtimeSwitchPauseCleanup: true,
+    realtimeL2Degradation: true,
     fullHistoryPreview: true,
     previewDateRange: true,
     previewBoxZoom: true,

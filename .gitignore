@@ -50,3 +50,7 @@ Desktop.ini
 
 # Project-local native compiler
 /.tools/
+
+# Optional native widget build output
+/desktop/widget/src-tauri/target/
+/desktop/widget/src-tauri/gen/

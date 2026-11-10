@@ -13,6 +13,7 @@ import { toast, Toaster } from "sonner"
 import { DownloadForm, type FormMessage, type ProxyState, type Scope } from "@/components/DownloadForm"
 import { PathBrowser } from "@/components/PathBrowser"
 import { PricePreview } from "@/components/PricePreview"
+import { RealtimeBoard } from "@/components/RealtimeBoard"
 import { DataLibrary } from "@/components/DataLibrary"
 import { TaskMonitor } from "@/components/TaskMonitor"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
@@ -43,7 +44,7 @@ const initialOptions: DownloadOptions = {
 
 export default function App() {
   const { task, setTask, connected } = useTask()
-  const [page, setPage] = useState<"collect" | "library">("collect")
+  const [page, setPage] = useState<"collect" | "library" | "realtime">("collect")
   const [options, setOptions] = useState<DownloadOptions>(initialOptions)
   const [scope, setScope] = useState<Scope>("markets")
   const [message, setMessage] = useState<FormMessage>({ type: "info", text: "正在连接行情服务…" })
@@ -277,6 +278,9 @@ export default function App() {
             >
               数据仓库
             </button>
+            <button type="button" aria-current={page === "realtime" ? "page" : undefined} onClick={() => setPage("realtime")}>
+              实时看盘
+            </button>
           </nav>
           <div className="connection-status" data-connected={connected}>
             <Popover open={open} onOpenChange={(next) => { setOpen(next); if (!next) pinned.current = false }}>
@@ -339,17 +343,17 @@ export default function App() {
           <div>
             <div className="eyebrow">市场数据 / WORKSPACE</div>
             <h1>
-              {page === "collect" ? "构建你的 A 股数据底座" : "你的量化数据仓库"}
+              {page === "collect" ? "构建你的 A 股数据底座" : page === "realtime" ? "聚焦此刻，洞察每一次变化" : "你的量化数据仓库"}
               <span className="title-dot">.</span>
             </h1>
-            <p>从历史采集到持续维护，让研究建立在可靠的数据之上。</p>
+            <p>{page === "realtime" ? "一屏关注盘口、成交与自选变化。真实数据，清晰边界。" : "从历史采集到持续维护，让研究建立在可靠的数据之上。"}</p>
           </div>
           <span className="privacy-note">
             <ShieldCheck className="size-4" />
             文件保存在你的电脑
           </span>
         </div>
-        {page === "collect" ? (
+        {page === "realtime" ? <RealtimeBoard /> : page === "collect" ? (
           <main className="workspace-grid">
             <aside className="setup-panel">
               <DownloadForm

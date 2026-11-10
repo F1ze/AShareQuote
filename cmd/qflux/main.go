@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"quotes/internal/platform/lines"
 	"quotes/internal/platform/netdial"
 	"quotes/internal/platform/processlock"
+	"quotes/internal/platform/sitecfg"
 	"quotes/internal/platform/tdx"
 	"quotes/internal/repository"
 	"quotes/internal/service"
@@ -185,8 +187,27 @@ func run() error {
 	// 第 4 步：网页模式先实际绑定 API 端口，再启动前端，避免端口冲突时留下无用 Vite 进程。
 	frontendURL := localURL(*host, *port)
 	apiURL := localURL(*host, *apiPort)
+	// 实时看盘直接复用内置候选，不额外触发行情业务探测；每轮最多两条短连接，共享代理和限流。
+	realtimeHosts := []domain.Host{}
+	seenRealtime := map[string]bool{}
+	realtimeSpec := sitecfg.SeedSpec()
+	for _, h := range append(realtimeSpec.Hosts, realtimeSpec.TryHosts...) {
+		host := domain.Host{IP: h.IP, Port: h.Port, Name: h.Name}
+		if !seenRealtime[host.Address()] {
+			seenRealtime[host.Address()] = true
+			realtimeHosts = append(realtimeHosts, host)
+		}
+	}
+	realtime := service.NewRealtimeService(func(ctx context.Context) service.RealtimeSource {
+		client := tdx.NewClient(realtimeHosts, 3*time.Second, rand.IntN(len(realtimeHosts)))
+		client.SetContext(ctx)
+		client.SetDialer(dialer.DialContext)
+		client.SetWaitFunc(limiter.Wait)
+		return client
+	}, warehouse)
 	apiHandler := handler.NewServer(handler.Dependencies{
-		Jobs: manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider, factory),
+		Realtime: realtime,
+		Jobs:     manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider, factory),
 		Preview:   service.NewPreviewService(manager.OutputDir, func(output string) service.PreviewRepository { return &repository.CSVArchive{Directory: output} }),
 		Warehouse: service.NewWarehouseService(warehouse),
 		Proxy:     proxySettings,

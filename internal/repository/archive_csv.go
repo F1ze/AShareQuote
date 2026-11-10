@@ -196,26 +196,39 @@ func (a *CSVArchive) Commit(ctx context.Context, b domain.Batch) (domain.Receipt
 // Latest 从有效归档中取最大时间，不依赖文件行序；文件缺失表示尚未建库。
 // 已有文件损坏则明确报错，不能按“没有历史”继续下载并覆盖它。
 func (a *CSVArchive) Latest(ctx context.Context, s domain.Security, category int) (time.Time, error) {
+	_, latest, err := a.Bounds(ctx, s, category)
+	return latest, err
+}
+
+// Bounds 从校验后的真实 CSV 查询两端日期，不信任可能过期的 sidecar，也不假设输入有序。
+// 缺失返回双零值；损坏或取消返回错误，调用方不能按“没有历史”继续覆盖。
+func (a *CSVArchive) Bounds(ctx context.Context, s domain.Security, category int) (time.Time, time.Time, error) {
 	if err := ctx.Err(); err != nil {
-		return time.Time{}, err
+		return time.Time{}, time.Time{}, err
 	}
 	bars, err := ReadCSV(filepath.Join(a.Directory, domain.FileName(s, category)))
 	if os.IsNotExist(err) {
-		return time.Time{}, nil
+		return time.Time{}, time.Time{}, nil
 	}
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, time.Time{}, err
 	}
 	if err = domain.ValidateBars(bars); err != nil {
-		return time.Time{}, err
+		return time.Time{}, time.Time{}, err
 	}
-	var latest time.Time
+	var first, latest time.Time
 	for _, b := range bars {
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		if first.IsZero() || b.Date.Before(first) {
+			first = b.Date
+		}
 		if b.Date.After(latest) {
 			latest = b.Date
 		}
 	}
-	return latest, nil
+	return first, latest, nil
 }
 
 // WriteJSON 为元数据和因子附件提供临时写入后替换，失败时清理临时文件。

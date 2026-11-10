@@ -279,7 +279,9 @@ export function DownloadForm(props: Props) {
           </div>
           {(options.category < 4 || options.category === 7 || options.category === 8) && (
             <p className="notice notice-warn mt-3">
-              分钟数据的历史长度取决于行情源。下载后请查看实际覆盖日期。
+              {(options.source || "tdx") === "tdx" && (options.category === 7 || options.category === 8)
+                ? "通达信在线 1 分钟仅能获取服务器保留的近期数据，不能保证近 3 年；偏移最多 65,536 根，服务器还可能更早截断。多年历史请到「数据仓库」补录 .lc1 或分钟 CSV，之后可用增量维护持续积累。"
+                : "分钟数据的历史长度取决于行情源。下载后请查看实际覆盖日期。"}
             </p>
           )}
         </FormSection>

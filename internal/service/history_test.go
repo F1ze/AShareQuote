@@ -5,8 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"quotes/internal/domain"
+	"quotes/internal/repository"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -218,5 +221,79 @@ func TestDiscoveryUsesActualPageLength(t *testing.T) {
 		if err != nil || len(securities) != 5 || !reflect.DeepEqual(client.calls, []int{0, 2, 4}) {
 			t.Fatalf("discovery skipped securities: %+v %v %v", securities, client.calls, err)
 		}
+	}
+}
+
+// 三年请求遇到只保留近期记录的行情站，必须保留实际数据并明确报告缺失，而非宣称取齐。
+func TestMinuteThreeYearsReportsActualSourceWindow(t *testing.T) {
+	client := &historyClient{}
+	base := time.Date(2024, 10, 1, 9, 31, 0, 0, exchangeTime)
+	for day := 0; day < 90; day++ {
+		for minute := 0; minute < 240; minute++ {
+			client.bars = append(client.bars, Bar{Date: base.AddDate(0, 0, day).Add(time.Duration(minute) * time.Minute)})
+		}
+	}
+	task := historyTask("2022-01-01", "2024-12-31")
+	task.options.Category = 7
+	bars, warning, err := task.fetchBars(client, Security{})
+	if err != nil || len(bars) != 21600 {
+		t.Fatalf("分页丢失：%d %v", len(bars), err)
+	}
+	for _, want := range []string{"2022-01-01", "2024-12-31", "2024-10-01 09:31", "21600", "未确认完整覆盖", ".lc1"} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("范围诊断缺少 %q：%s", want, warning)
+		}
+	}
+	task.options.EndDate = "2023-12-31"
+	_, _, err = task.fetchBars(&historyClient{bars: client.bars}, Security{})
+	if err == nil || !strings.Contains(err.Error(), "2024-10-01") || !strings.Contains(err.Error(), "原有文件已保留") {
+		t.Fatalf("无交集应说明源端实际范围：%v", err)
+	}
+}
+
+func TestMinuteOffsetBoundaryNeverWraps(t *testing.T) {
+	client := &historyClient{}
+	base := time.Date(2024, 1, 2, 9, 31, 0, 0, exchangeTime)
+	for i := 0; i < 70000; i++ {
+		client.bars = append(client.bars, Bar{Date: base.Add(time.Duration(i) * time.Minute)})
+	}
+	task := historyTask("2020-01-01", "2024-12-31")
+	task.options.Category = 7
+	bars, warning, err := task.fetchBars(client, Security{})
+	if err != nil || len(bars) != 65536 || !strings.Contains(warning, "65,536") {
+		t.Fatalf("偏移边界：%d %s %v", len(bars), warning, err)
+	}
+	for i, call := range client.calls {
+		if call[0] > 65535 || call[0]+call[1] > 65536 || (i > 0 && call[0] <= client.calls[i-1][0]) {
+			t.Fatalf("历史位置回绕：%v", call)
+		}
+	}
+}
+
+func TestIncrementalRetainsEarlierRequestedHistory(t *testing.T) {
+	security := Security{Code: "600000", Market: 1}
+	for _, tc := range []struct{ name, first, want string }{
+		{"已有文件仅含近期，不得跳过早期请求", "2024-10-01", "2022-01-01"},
+		{"已有左边界时仅刷新尾部", "2021-01-01", "2024-11-23"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := &repository.CSVArchive{Directory: t.TempDir()}
+			first, _ := time.ParseInLocation("2006-01-02", tc.first, exchangeTime)
+			bars := []Bar{{Date: first, Open: 10, High: 10, Low: 10, Close: 10}, {Date: time.Date(2024, 11, 30, 15, 0, 0, 0, exchangeTime), Open: 10, High: 10, Low: 10, Close: 10}}
+			if _, err := archive.Commit(context.Background(), domain.Batch{Security: security, Category: 7, Bars: bars}); err != nil {
+				t.Fatal(err)
+			}
+			task := historyTask("2022-01-01", "2024-12-31")
+			task.archive = archive
+			task.options.Category = 7
+			task.options.Incremental = true
+			options, err := task.incrementalOptions(task.options, security)
+			if err != nil || options.StartDate != tc.want {
+				t.Fatalf("请求起点被错误跳过：%+v %v", options, err)
+			}
+			if task.options.StartDate != "2022-01-01" {
+				t.Fatal("修改了任务共享选项")
+			}
+		})
 	}
 }

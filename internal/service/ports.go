@@ -19,6 +19,12 @@ type Archive interface {
 	Latest(context.Context, domain.Security, int) (time.Time, error)
 }
 
+// ArchiveBounds 是增量更新可选的范围查询端口；缺少此能力时不能仅凭最新时间跳过早期范围。
+// 返回零时间表示文件不存在；非零边界仅描述已存记录，不证明内部连续性。
+type ArchiveBounds interface {
+	Bounds(context.Context, domain.Security, int) (first, latest time.Time, err error)
+}
+
 // Warehouse 仅要求幂等入库，重复处理同一归档不得产生重复行情。
 // 查询、名录和因子等可选能力独立声明，CSV-only 用例无需依赖它们。
 type Warehouse interface {

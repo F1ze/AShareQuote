@@ -187,3 +187,37 @@ export interface PreviewResult {
   factorEvents: number
   bars: PreviewBar[]
 }
+
+
+export interface RealtimeQuote {
+  market: number
+  code: string
+  name: string
+  price: number
+  lastClose: number
+  open: number
+  high: number
+  low: number
+  volume: number // 手，沿用参考快照协议。
+  amount: number // 元。
+  bids: { price: number; volume: number }[]
+  asks: { price: number; volume: number }[]
+}
+export interface RealtimeTrade {
+  time: string
+  price: number
+  volume: number
+  trades: number
+  side: number
+}
+export interface RealtimeSnapshot {
+  selected: string
+  quotes: RealtimeQuote[]
+  trades: RealtimeTrade[]
+  receivedAt: string // 本机接收时间，不能当作交易所行情时间。
+  latencyMs: number
+  cached: boolean
+  detailStatus: "available" | "empty" | "unavailable" | "not_requested"
+  detailMessage: string
+  l2Verified: boolean
+}

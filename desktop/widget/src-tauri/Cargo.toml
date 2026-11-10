@@ -1,0 +1,14 @@
+[package]
+name = "qflux-widget"
+version = "0.1.0"
+edition = "2021"
+description = "Optional native quote widget for QFLUX"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["sync", "macros"] }

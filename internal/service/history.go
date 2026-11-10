@@ -44,6 +44,7 @@ func (t *jobRun) fetchBarsWithOptions(client Client, security Security, options 
 	remaining := options.Count // 仅旧版模式递减；日期模式一直翻到跨过开始日或触及来源边界。
 	fromKey, untilKey := from.Format("2006-01-02"), until.Format("2006-01-02")
 	unique := make(map[string]Bar) // 市场日期时分→唯一行情，跨页重叠也只保留一根。
+	newest := ""                   // 本轮访问到的源端最新时间；与 oldest 一起用于诊断空区间。
 	oldest := ""                   // 上一页最早时间，用于检测“翻页却没有向过去推进”的重复响应。
 	warning := ""
 	for {
@@ -52,7 +53,7 @@ func (t *jobRun) fetchBarsWithOptions(client Client, security Security, options 
 			return nil, "", err
 		}
 		if start > maxBarOffset {
-			warning = "已到达接口历史访问边界，所选时段可能未完整覆盖"
+			warning = "已达到 16 位历史偏移边界（最多访问 65,536 根 K 线），继续分页会发生位置回绕，已停止"
 			break
 		}
 		// 800 是单次请求上限，不是整个任务上限；最后一页还要受 16 位位置边界约束。
@@ -69,13 +70,16 @@ func (t *jobRun) fetchBarsWithOptions(client Client, security Security, options 
 		t.pages++
 		t.mu.Unlock()
 		if len(page) == 0 {
-			warning = "行情源没有提供更早的数据，请核对实际日期（可能受上市时间或历史保留范围影响）"
+			warning = "行情源返回空页，未提供更早记录（可能受历史保留范围或上市时间影响）"
 			break
 		}
 		// 第 3 步：不假设页面内部已排序，扫描最早时间，同时只把目标区间记录放入去重表。
 		pageOldest := page[0].Date.Format("2006-01-02 15:04")
 		for _, bar := range page {
 			key := bar.Date.Format("2006-01-02 15:04")
+			if key > newest {
+				newest = key
+			}
 			if key < pageOldest {
 				pageOldest = key
 			}
@@ -114,8 +118,55 @@ func (t *jobRun) fetchBarsWithOptions(client Client, security Security, options 
 		bars = append(bars, bar)
 	}
 	sort.Slice(bars, func(i, j int) bool { return bars[i].Date.Before(bars[j].Date) })
+	if warning != "" && ranged {
+		warning = historyCoverageWarning(options, warning, oldest, newest, len(bars))
+	}
 	if len(bars) == 0 {
+		if warning != "" {
+			return nil, "", fmt.Errorf("%s；所选时段无记录，原有文件已保留", warning)
+		}
 		return nil, "", errors.New("所选时段没有可用行情；原有文件已保留，请更换日期或检查证券代码")
 	}
 	return bars, warning, nil
+}
+
+// historyCoverageWarning 同时给出请求范围和本轮源端可见范围，避免把“已保存”误读为“三年已取齐”。
+// 这里只描述本轮观测，不据此声称源端从未有过更早数据，也不将分时价格伪造为 OHLCV。
+func historyCoverageWarning(options DownloadOptions, reason, oldest, newest string, rows int) string {
+	observed := "未取得任何源端记录"
+	if oldest != "" && newest != "" {
+		observed = fmt.Sprintf("本轮源端可见 %s 至 %s", oldest, newest)
+	}
+	message := fmt.Sprintf("%s；请求 %s 至 %s，%s，所选范围取得 %d 条，未确认完整覆盖", reason, options.StartDate, options.EndDate, observed, rows)
+	if options.Category == 7 || options.Category == 8 {
+		message += "；多年 1 分钟历史需补录 .lc1/分钟 CSV 或接入可提供该时段的历史源；拆分日期和提高并发不能突破该接口的保留范围"
+	}
+	return message
+}
+
+// incrementalOptions 只在已有归档的最早日期不晚于请求起点时缩短更新窗口。
+// 原实现只看最新一条，会把“三年请求、仅存最近几月”直接缩到最近七天，永久跳过早期缺口。
+// 最早/最新边界并不证明中间无缺口；历史建库模式仍应扫描全范围。
+func (t *jobRun) incrementalOptions(options DownloadOptions, security Security) (DownloadOptions, error) {
+	if !options.Incremental || t.archive == nil {
+		return options, nil
+	}
+	bounds, ok := t.archive.(ArchiveBounds)
+	if !ok {
+		// 不知道历史左边界时保守地保持用户范围，同时保留旧端口的损坏检测。
+		_, err := t.archive.Latest(t.ctx, security, options.Category)
+		return options, err
+	}
+	first, latest, err := bounds.Bounds(t.ctx, security, options.Category)
+	if err != nil || first.IsZero() || latest.IsZero() {
+		return options, err
+	}
+	if first.In(exchangeTime).Format("2006-01-02") > options.StartDate {
+		return options, nil
+	}
+	overlap := latest.In(exchangeTime).AddDate(0, 0, -7).Format("2006-01-02")
+	if overlap > options.StartDate && overlap <= options.EndDate {
+		options.StartDate = overlap
+	}
+	return options, nil
 }

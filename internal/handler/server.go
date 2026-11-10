@@ -29,6 +29,7 @@ type JobUseCases interface {
 
 // Dependencies 在组装根构造；Handler 只依赖用例，不构造存储、协议或 SDK。
 type Dependencies struct {
+	Realtime  *service.RealtimeService  // 实时看盘用例；nil 时返回明确不可用状态。
 	Jobs      JobUseCases               // 任务创建、取消和恢复。
 	Workspace *service.WorkspaceService // 文件选择和线路检查用例。
 	Preview   *service.PreviewService   // 原始归档预览用例。
@@ -36,6 +37,7 @@ type Dependencies struct {
 	Proxy     *service.ProxyService     // 统一出站代理设置用例；nil 时禁用相关端点。
 }
 type Server struct {
+	realtime  *service.RealtimeService  // 批量快照和主屏成交明细。
 	manager   JobUseCases               // 当前共享任务入口，HTTP 不拥有任务生命周期。
 	workspace *service.WorkspaceService // 本机工作区能力，不接触具体文件系统实现。
 	preview   *service.PreviewService   // 读取与复权编排，Handler 只负责响应序列化。
@@ -44,7 +46,7 @@ type Server struct {
 }
 
 func NewServer(d Dependencies) *Server {
-	return &Server{manager: d.Jobs, workspace: d.Workspace, preview: d.Preview, warehouse: d.Warehouse, proxy: d.Proxy}
+	return &Server{realtime: d.Realtime, manager: d.Jobs, workspace: d.Workspace, preview: d.Preview, warehouse: d.Warehouse, proxy: d.Proxy}
 }
 
 func (s *Server) Handler(frontendOrigins ...string) http.Handler {
@@ -75,6 +77,9 @@ func (s *Server) Handler(frontendOrigins ...string) http.Handler {
 		_ = c.JSON(status, map[string]string{"error": message})
 	}
 
+	e.GET("/api/realtime", s.handleRealtime)
+	e.GET("/api/realtime/watch", s.handleRealtimeWatchGet)
+	e.POST("/api/realtime/watch", s.handleRealtimeWatchSet)
 	e.GET("/api/health", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})

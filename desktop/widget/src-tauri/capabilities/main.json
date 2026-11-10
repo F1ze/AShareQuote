@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "quote-window",
+  "description": "Only local quote widget window controls; no shell or filesystem access.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-is-visible",
+    "core:window:allow-is-minimized",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-start-dragging"
+  ]
+}
