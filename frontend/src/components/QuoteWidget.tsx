@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Minus, Pause, Pin, Play, Settings2, X } from "lucide-react"
 import { useRealtime } from "@/hooks/useRealtime"
 import { api } from "@/lib/api"
-import { priceChange, quoteKey, readWatch, stockKey } from "@/lib/realtime"
+import { priceChange, quoteKey, readWatch, realtimeClock, stockKey } from "@/lib/realtime"
 import { browserWidgetSettings, nativeWidget, widgetInterval } from "@/lib/widget"
 
 // 同一轻量页面可运行在普通弹窗或 Tauri 的系统 WebView 中，不导入主屏图表或任务 SSE。
@@ -19,6 +19,7 @@ export function QuoteWidget() {
   const native = nativeWidget()
   const state = useRealtime(settings.codes, settings.selected, settings.interval, paused || nativeHidden, 0, false)
   const quotes = new Map((state.data?.quotes || []).map((quote) => [quoteKey(quote), quote]))
+  const receivedTime = realtimeClock(state.data?.receivedAt)
   const sync = async () => {
     try {
       const watch = await api.watchSettings()
@@ -64,7 +65,7 @@ export function QuoteWidget() {
     {message && <p role="alert" className="widget-message">{message}</p>}
     <div className="widget-quotes"><table><thead><tr><th>股票 / 代码</th><th>最新价</th><th>涨跌幅</th><th>接收时间</th></tr></thead><tbody>{settings.codes.map((key) => {
       const quote = quotes.get(key), delta = priceChange(quote)
-      return <tr key={key} title={state.error ? "旧数据：" + state.error : paused ? "已暂停" : "本机接收时间，非交易所时间"}><td><strong>{quote?.name || key.toUpperCase()}</strong>{quote?.name && <small>{key.toUpperCase()}</small>}</td><td className={delta === null ? "" : delta > 0 ? "rt-up" : delta < 0 ? "rt-down" : ""}>{quote && quote.price > 0 ? quote.price.toFixed(2) : "—"}</td><td className={delta === null ? "" : delta > 0 ? "rt-up" : delta < 0 ? "rt-down" : ""}>{delta === null ? "—" : `${delta > 0 ? "+" : ""}${delta.toFixed(2)}%`}</td><td>{quote && state.data ? new Date(state.data.receivedAt).toLocaleTimeString("zh-CN", { hour12: false }) : "—"}</td></tr>
+      return <tr key={key} title={state.error ? "旧数据：" + state.error : paused ? "已暂停" : "本机接收时间，非交易所时间"}><td><strong>{quote?.name || key.toUpperCase()}</strong>{quote?.name && <small>{key.toUpperCase()}</small>}</td><td className={delta === null ? "" : delta > 0 ? "rt-up" : delta < 0 ? "rt-down" : ""}>{quote && quote.price > 0 ? quote.price.toFixed(2) : "—"}</td><td className={delta === null ? "" : delta > 0 ? "rt-up" : delta < 0 ? "rt-down" : ""}>{delta === null ? "—" : `${delta > 0 ? "+" : ""}${delta.toFixed(2)}%`}</td><td>{quote ? receivedTime : "—"}</td></tr>
     })}</tbody></table></div>
     <footer><button type="button" onClick={() => setPaused(!paused)} aria-label={paused ? "继续小组件刷新" : "暂停小组件刷新"}>{paused ? <Play /> : <Pause />}</button><span>{paused ? "已暂停" : state.error ? "旧数据 · 自动退避" : state.loading ? "刷新中" : `${settings.interval}s 间隔 · 五档报价`}</span>{!native && <small title="普通浏览器窗口不能获得原生置顶或桌面透明能力">网页模式 · 无原生置顶</small>}</footer>
   </main>

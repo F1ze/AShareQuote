@@ -1,5 +1,12 @@
 import type { RealtimeQuote, RealtimeSnapshot } from "@/types"
 
+const clock = new Intl.DateTimeFormat("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+
+export function realtimeClock(value?: string) {
+  const time = value ? Date.parse(value) : NaN
+  return Number.isFinite(time) ? clock.format(time) : "—"
+}
+
 export const quoteKey = (quote: Pick<RealtimeQuote, "market" | "code">) => `${["sz", "sh", "bj"][quote.market]}${quote.code}`
 export const priceChange = (quote?: RealtimeQuote): number | null =>
   quote && quote.price > 0 && quote.lastClose > 0 ? (quote.price / quote.lastClose - 1) * 100 : null
@@ -43,4 +50,15 @@ export function retainRealtimeNames(previous: Readonly<Record<string, string>>, 
   for (const key of codes) if (previous[key]) names[key] = previous[key]
   for (const quote of next.quotes) if (codes.includes(quoteKey(quote)) && quote.name?.trim()) names[quoteKey(quote)] = quote.name.trim()
   return { names, data: { ...next, quotes: next.quotes.map((quote) => ({ ...quote, name: names[quoteKey(quote)] || "" })) } }
+}
+
+// 每次 JSON 响应都会创建新数组。成交窗口未变化时复用引用，让图表和明细跳过渲染。
+export function retainRealtimeTrades(previous: RealtimeSnapshot | null, next: RealtimeSnapshot) {
+  if (!previous || previous.selected !== next.selected || previous.trades.length !== next.trades.length) return next
+  const unchanged = next.trades.every((trade, index) => {
+    const old = previous.trades[index]
+    return trade.time === old.time && trade.price === old.price && trade.volume === old.volume
+      && trade.trades === old.trades && trade.side === old.side
+  })
+  return unchanged ? { ...next, trades: previous.trades } : next
 }

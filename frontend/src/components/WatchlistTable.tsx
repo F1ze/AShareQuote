@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react"
 import { ArrowDown, ArrowUp, Crosshair, Search, X } from "lucide-react"
 import type { RealtimeQuote } from "@/types"
-import { priceChange } from "@/lib/realtime"
+import { priceChange, realtimeClock } from "@/lib/realtime"
 
 type SortColumn = "name" | "price" | "change" | "absolute" | "volume" | "amount"
 interface Props {
@@ -21,7 +21,6 @@ const money = (value?: number) => value && Number.isFinite(value) ? value.toFixe
 const compact = (value?: number) => value === undefined ? "—" : value >= 1e8 ? `${(value / 1e8).toFixed(2)}亿` : value >= 1e4 ? `${(value / 1e4).toFixed(2)}万` : numeric.format(value)
 const signed = (value: number | null, suffix = "") => value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}${suffix}`
 const tone = (value: number | null) => value === null || value === 0 ? "rt-neutral" : value > 0 ? "rt-up" : "rt-down"
-const clock = (value?: string) => value ? new Date(value).toLocaleTimeString("zh-CN", { hour12: false }) : "—"
 
 // 排序和筛选仅改变展示顺序，不修改订阅数组，不触发额外行情请求。
 export function WatchlistTable({ names, codes, selected, quotes, receivedAt, paused, loading, error, onSelect, onRemove }: Props) {
@@ -50,6 +49,7 @@ export function WatchlistTable({ names, codes, selected, quotes, receivedAt, pau
   const header = (label: string, column: SortColumn, className = "") => <th className={className} scope="col" aria-sort={sort?.column === column ? sort.descending ? "descending" : "ascending" : "none"}>
     <button type="button" onClick={() => setSort({ column, descending: sort?.column === column ? !sort.descending : column !== "name" })} aria-label={`按${label}排序`}>{label}<span aria-hidden="true">{sort?.column === column ? sort.descending ? "↓" : "↑" : "↕"}</span></button>
   </th>
+  const receivedTime = realtimeClock(receivedAt)
   const locate = () => {
     setQuery("")
     requestAnimationFrame(() => region.current?.querySelector<HTMLElement>('tr[data-selected="true"] button')?.focus())
@@ -68,7 +68,7 @@ export function WatchlistTable({ names, codes, selected, quotes, receivedAt, pau
           const quote = quotes.get(key), delta = priceChange(quote)
           const absolute = quote && delta !== null ? quote.price - quote.lastClose : null
           const status = paused ? "已暂停" : error ? "已过期" : loading ? "刷新中" : quote ? "已接收" : "未返回"
-          const info = `${quote?.name || names?.[key] || "名称待补充"} ${key.toUpperCase()}；${status}；本机接收 ${quote ? clock(receivedAt) : "—"}；开 ${money(quote?.open)} / 高 ${money(quote?.high)} / 低 ${money(quote?.low)} / 昨收 ${money(quote?.lastClose)}；涨跌额 ${signed(absolute)} 元；成交量 ${quote ? numeric.format(quote.volume) : "—"} 手；成交额 ${quote ? numeric.format(quote.amount) : "—"} 元；换手率未提供（缺少流通股本）`
+          const info = `${quote?.name || names?.[key] || "名称待补充"} ${key.toUpperCase()}；${status}；本机接收 ${quote ? receivedTime : "—"}；开 ${money(quote?.open)} / 高 ${money(quote?.high)} / 低 ${money(quote?.low)} / 昨收 ${money(quote?.lastClose)}；涨跌额 ${signed(absolute)} 元；成交量 ${quote ? numeric.format(quote.volume) : "—"} 手；成交额 ${quote ? numeric.format(quote.amount) : "—"} 元；换手率未提供（缺少流通股本）`
           return <tr key={key} className={`rt-watch-row ${selected === key ? "is-selected" : ""}`} data-selected={selected === key} title={info}>
             <td className="watch-symbol"><button type="button" aria-pressed={selected === key} aria-label={`查看 ${key.toUpperCase()}`} onClick={() => onSelect(key)}><strong>{quote?.name || names?.[key] || "名称待补充"}</strong><small>{key.toUpperCase()}</small><span className="watch-status-dot" data-status={status} aria-label={status} /></button></td>
             <td className={`watch-price ${tone(delta)}`}>{money(quote?.price)}</td>
@@ -76,7 +76,7 @@ export function WatchlistTable({ names, codes, selected, quotes, receivedAt, pau
             <td className={`watch-absolute ${tone(delta)}`}>{signed(absolute)}</td>
             <td className="watch-volume">{compact(quote?.volume)}</td><td className="watch-amount">{compact(quote?.amount)}</td>
             <td className="watch-turnover" title="缺少流通股本，未计算换手率">—</td>
-            <td className="watch-time"><time dateTime={quote ? receivedAt : undefined}>{quote ? clock(receivedAt) : "—"}</time></td>
+            <td className="watch-time"><time dateTime={quote ? receivedAt : undefined}>{quote ? receivedTime : "—"}</time></td>
             <td className="watch-state"><span data-status={status}>{status}</span></td>
             <td className="watch-action"><button type="button" className="rt-remove" aria-label={`移除 ${key.toUpperCase()}`} onClick={() => onRemove(key)}><X className="size-3" /></button></td>
           </tr>

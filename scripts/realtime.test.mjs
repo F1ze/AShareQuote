@@ -5,7 +5,7 @@ import ts from "../frontend/node_modules/typescript/lib/typescript.js"
 
 const source = fs.readFileSync(new URL("../frontend/src/lib/realtime.ts", import.meta.url), "utf8")
 const javascript = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
-const { carryRealtimeQuotes, retainRealtimeNames } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`)
+const { carryRealtimeQuotes, retainRealtimeNames, retainRealtimeTrades } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`)
 const a = { market: 1, code: "600036", name: "招商银行", price: 43.01 }
 const b = { market: 0, code: "000001", name: "平安银行", price: 11.89 }
 const snapshot = { selected: "sh600036", quotes: [a, b], trades: [{ time: "10:00:03", price: 43.01 }], receivedAt: "2026-11-10T02:00:00Z", detailStatus: "available" }
@@ -30,4 +30,19 @@ test("瞬时空名称不覆盖已知名称，真实更新生效，不按六位�
   assert.equal(result.data.quotes[2].name, "")
   assert.equal(result.names.sh600519, undefined)
   assert.equal(next.quotes[0].name, "")
+})
+
+test("仅成交字段变化或切股时替换成交窗口引用", () => {
+  const trade = { time: "10:00:03", price: 43.01, volume: 20, trades: 2, side: 0 }
+  const before = { ...snapshot, trades: [trade] }
+  const after = { ...before, receivedAt: "2026-11-10T02:00:03Z", trades: [{ ...trade }] }
+  const retained = retainRealtimeTrades(before, after)
+  assert.equal(retained.trades, before.trades)
+  assert.equal(retained.receivedAt, after.receivedAt)
+  for (const patch of [{ time: "10:00:06" }, { price: 44 }, { volume: 21 }, { trades: 3 }, { side: 1 }]) {
+    const changed = { ...after, trades: [{ ...trade, ...patch }] }
+    assert.equal(retainRealtimeTrades(before, changed), changed)
+  }
+  const switched = { ...after, selected: "sz000001" }
+  assert.equal(retainRealtimeTrades(before, switched), switched)
 })

@@ -1,19 +1,21 @@
-import { useEffect, useState } from "react"
+import { memo, useEffect, useMemo, useState } from "react"
 import { Activity, CircleAlert, Pause, Play, Plus, Radio, RefreshCw, PanelsTopLeft } from "lucide-react"
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import { api } from "@/lib/api"
 import { WatchlistTable } from "@/components/WatchlistTable"
 import { useRealtime } from "@/hooks/useRealtime"
-import { priceChange, quoteKey, readWatch, stockKey } from "@/lib/realtime"
+import { priceChange, quoteKey, readWatch, realtimeClock, stockKey } from "@/lib/realtime"
+import type { RealtimeSnapshot } from "@/types"
 import { OrderBook } from "@/components/OrderBookRow"
 
 const number = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 })
 const price = (value?: number) => value && Number.isFinite(value) ? value.toFixed(2) : "—"
 const change = (value: number | null) => value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`
 const tone = (value: number | null) => value === null || value === 0 ? "rt-neutral" : value > 0 ? "rt-up" : "rt-down"
-const clock = (value?: string) => value ? new Date(value).toLocaleTimeString("zh-CN", { hour12: false }) : "尚未接收"
+type Trade = RealtimeSnapshot["trades"][number]
+const emptyTrades: Trade[] = []
 
-export function RealtimeBoard() {
+export const RealtimeBoard = memo(function RealtimeBoard() {
   const [settings, setSettings] = useState(readWatch)
   const [bookMotion, setBookMotion] = useState(true)
   const [paused, setPaused] = useState(false)
@@ -24,11 +26,12 @@ export function RealtimeBoard() {
   const { data, names, loading, error } = useRealtime(codes, selected, interval, paused, revision)
   useEffect(() => { try { localStorage.setItem("qflux.realtime", JSON.stringify(settings)) } catch { /* 私密模式不影响看盘。 */ } }, [settings])
   useEffect(() => { void api.saveWatch(settings).catch(() => { /* 发布失败不阻塞主看盘，桌面可手工配置。 */ }) }, [settings])
-  const quotes = new Map((data?.quotes || []).map((quote) => [quoteKey(quote), quote]))
+  const quoteList = data?.quotes
+  const quotes = useMemo(() => new Map(quoteList?.map((quote) => [quoteKey(quote), quote])), [quoteList])
   const current = quotes.get(selected)
   const movement = priceChange(current)
-  const trades = [...(data?.trades || [])].sort((a, b) => a.time.localeCompare(b.time))
-  const chart = trades.map((trade, index) => ({ ...trade, index }))
+  const tradeWindow = data?.trades
+  const trades = useMemo(() => tradeWindow?.length ? [...tradeWindow].sort((a, b) => a.time.localeCompare(b.time)) : emptyTrades, [tradeWindow])
   const add = (event: React.FormEvent) => {
     event.preventDefault()
     const key = stockKey(input)
@@ -44,7 +47,7 @@ export function RealtimeBoard() {
   }
   return <main className="rt-board" aria-label="实时看盘工作区">
     <div className="rt-toolbar">
-      <div className="rt-live-label"><Radio className="size-4" /><span>{paused ? "刷新已暂停" : "行情轮询"}</span><small>接收于 {clock(data?.receivedAt)}</small></div>
+      <div className="rt-live-label"><Radio className="size-4" /><span>{paused ? "刷新已暂停" : "行情轮询"}</span><small>接收于 {data ? realtimeClock(data.receivedAt) : "尚未接收"}</small></div>
       <div className="rt-controls">
         <label className="sr-only" htmlFor="realtime-interval">刷新间隔</label>
         <select id="realtime-interval" aria-label="刷新间隔" value={interval} onChange={(event) => setSettings({ ...settings, interval: Number(event.target.value) })} className="form-control select-control">
@@ -63,7 +66,7 @@ export function RealtimeBoard() {
         <div className="rt-metrics">{[["开盘", price(current?.open)], ["最高", price(current?.high)], ["最低", price(current?.low)], ["成交量 / 手", current ? number.format(current.volume) : "—"], ["成交额 / 万元", current ? number.format(current.amount / 10000) : "—"]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</div>
         <div className="rt-chart-heading"><h3>成交窗口走势</h3><span>最近至多 200 条 · 非全天分时</span></div>
         <div className="rt-chart" aria-label="扩展成交窗口价格走势">
-          {chart.length > 1 ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={chart} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}><defs><linearGradient id="rt-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#a7b6ff" stopOpacity={0.3} /><stop offset="100%" stopColor="#a7b6ff" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#29384f" strokeDasharray="3 6" vertical={false} /><XAxis dataKey="time" minTickGap={65} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["auto", "auto"]} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: "#131e2e", borderColor: "#3d506d", borderRadius: 8 }} formatter={(value) => [Number(value).toFixed(2), "成交价 / 元"]} /><Area type="linear" dataKey="price" stroke="#a7b6ff" strokeWidth={2} fill="url(#rt-fill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer> : <div className="rt-empty" role="status"><Activity className="size-7" /><span>{loading ? "正在读取真实行情…" : "暂无可绘制的成交窗口"}</span><small>不使用模拟价格填充图表</small></div>}
+          {trades.length > 1 ? <TradeChart trades={trades} /> : <div className="rt-empty" role="status"><Activity className="size-7" /><span>{loading ? "正在读取真实行情…" : "暂无可绘制的成交窗口"}</span><small>不使用模拟价格填充图表</small></div>}
         </div>
         <div className="rt-source-line"><span>通达信 · 0x053E / 0x0FC2</span><span>快照耗时 {data ? `${data.latencyMs} ms` : "—"}{data?.cached ? " · 缓存" : ""}</span></div>
       </section>
@@ -86,8 +89,16 @@ export function RealtimeBoard() {
       <section className="rt-tape rt-card" aria-label="扩展成交明细">
         <div className="rt-card-title"><h3>扩展成交明细 <small>{selected.toUpperCase()}</small></h3><span className="rt-tag">{data?.detailStatus === "available" ? `${trades.length} 条窗口` : "五档降级"}</span></div>
         <p className="rt-muted">{data?.detailMessage || "正在尝试读取扩展成交接口，不据此认定完整 L2 权限。"}</p>
-        <div className="rt-tape-scroll"><table><thead><tr><th>源端时间</th><th>成交价 / 元</th><th>成交量 / 手</th><th>聚合笔数</th><th>方向</th></tr></thead><tbody>{trades.length ? [...trades].reverse().map((trade, index) => <tr key={`${trade.time}-${index}`}><td>{trade.time}</td><td>{price(trade.price)}</td><td>{number.format(trade.volume)}</td><td>{trade.trades}</td><td className={trade.side === 0 ? "rt-up" : trade.side === 1 ? "rt-down" : "rt-neutral"}>{({ 0: "主动买", 1: "主动卖", 2: "中性", 5: "盘后" } as Record<number, string>)[trade.side] || "未知"}</td></tr>) : <tr><td colSpan={5} className="rt-empty-cell">{loading ? "正在读取…" : "暂无明细；五档快照和自选监控独立可用"}</td></tr>}</tbody></table></div>
+        <div className="rt-tape-scroll"><table><thead><tr><th>源端时间</th><th>成交价 / 元</th><th>成交量 / 手</th><th>聚合笔数</th><th>方向</th></tr></thead><tbody>{trades.length ? <TradeRows trades={trades} /> : <tr><td colSpan={5} className="rt-empty-cell">{loading ? "正在读取…" : "暂无明细；五档快照和自选监控独立可用"}</td></tr>}</tbody></table></div>
       </section>
     </div>
   </main>
-}
+})
+
+const TradeChart = memo(function TradeChart({ trades }: { trades: Trade[] }) {
+  return <ResponsiveContainer width="100%" height="100%"><AreaChart data={trades} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}><defs><linearGradient id="rt-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#a7b6ff" stopOpacity={0.3} /><stop offset="100%" stopColor="#a7b6ff" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#29384f" strokeDasharray="3 6" vertical={false} /><XAxis dataKey="time" minTickGap={65} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["auto", "auto"]} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip isAnimationActive={false} contentStyle={{ background: "#131e2e", borderColor: "#3d506d", borderRadius: 8 }} formatter={(value) => [Number(value).toFixed(2), "成交价 / 元"]} /><Area type="linear" dataKey="price" stroke="#a7b6ff" strokeWidth={2} fill="url(#rt-fill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
+})
+
+const TradeRows = memo(function TradeRows({ trades }: { trades: Trade[] }) {
+  return [...trades].reverse().map((trade, index) => <tr key={`${trade.time}-${index}`}><td>{trade.time}</td><td>{price(trade.price)}</td><td>{number.format(trade.volume)}</td><td>{trade.trades}</td><td className={trade.side === 0 ? "rt-up" : trade.side === 1 ? "rt-down" : "rt-neutral"}>{({ 0: "主动买", 1: "主动卖", 2: "中性", 5: "盘后" } as Record<number, string>)[trade.side] || "未知"}</td></tr>)
+})

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { carryRealtimeQuotes, retainRealtimeNames } from "@/lib/realtime"
+import { carryRealtimeQuotes, retainRealtimeNames, retainRealtimeTrades } from "@/lib/realtime"
 import { api } from "@/lib/api"
 import type { RealtimeSnapshot } from "@/types"
 
@@ -23,7 +23,7 @@ export function useRealtime(codes: string[], selected: string, interval: number,
       setState((old) => ({ key, names: old.names, data: old.key === key ? old.data : carryRealtimeQuotes(old.data, codes, selected), loading: true, error: old.key === key ? old.error : "" }))
       try {
         const data = await api.realtime(codes, selected, signal, details)
-        if (!disposed && !signal.aborted) { failures = 0; setState((old) => ({ key, ...retainRealtimeNames(old.names, data, codes), loading: false, error: "" })) }
+        if (!disposed && !signal.aborted) { failures = 0; setState((old) => ({ key, ...retainRealtimeNames(old.names, retainRealtimeTrades(old.data, data), codes), loading: false, error: "" })) }
       } catch (error) {
         if (!disposed && !requestController.signal.aborted) {
           failures++
