@@ -36,6 +36,15 @@ CATEGORY = {
 }
 
 CT_BARS, CT_MINUTE, CT_TICK = 0x052D, 0x051D, 0x0FC5
+CT_SNAPSHOT, CT_ORDER = 0x053E, 0x0FC2        # L1 快照 / 带秒逐笔
+SNAP_CAT, SNAP_VER, SNAP_FLAG = 0x0218, 0x0093, 0   # 快照帧头（37 章实测）
+TICK_CAT, TICK_VER, TICK_FLAG = 0x0801, 0x0300, 1   # 逐笔帧头（客户端真包同值）
+SNAP_PREFIX = b"\x05\x00\x00\x00" + b"\x00\x00\x00\x00"
+SNAP_TAIL = b"\x0c\x01"      # 必须排证券表之后，放数量后面服务端会错位解析
+SNAP_REC = 56
+HS1 = bytes.fromhex("0c0218930001030003000d0001")
+HS2 = bytes.fromhex("0c0218940001030003000d0002")
+HS3 = bytes.fromhex("0c0318990001200020000fdbd5d0c9ccd6a4a8af0000008fc22540130000d500c9ccbdf0d7ea00000002")
 CAT_BARS, CAT_MINUTE, CAT_TICK = 0x01, 0x1B, 0x17
 VER_BARS, VER_MINUTE, VER_TICK = 0x0164, 0x0100, 0x0101
 
@@ -159,8 +168,304 @@ class TdxError(RuntimeError):
     pass
 
 
+def parse_ticks(body, scale=100.0):
+    """解析 0x0FC5 逐笔：u16 条数，随后每条 分钟 u16 + 价差分 varint + 量 varint + 笔数 varint + 方向 u16。"""
+    if len(body) < 2:
+        return []
+    num = struct.unpack_from("<H", body, 0)[0]
+    pos, px, out = 2, 0, []
+    for _ in range(num):
+        if pos + 2 > len(body):
+            break
+        tmin = struct.unpack_from("<H", body, pos)[0]
+        dp, pos = get_price(body, pos + 2)
+        vol, pos = get_price(body, pos)
+        cnt, pos = get_price(body, pos)
+        side = struct.unpack_from("<H", body, pos)[0] if pos + 2 <= len(body) else 2
+        pos += 2
+        px += dp
+        out.append({"t": "%02d:%02d" % (tmin // 60, tmin % 60), "price": px / scale,
+                    "vol": vol, "trades": cnt, "side": side})
+    return out
+
+
+# ---------------------------------------------------------------- 行情记录解码
+
+# ---------------------------------------------------------------- 价格与成交量解码
+
+def read_varint(buf, pos):
+    """带符号可变长整数，第一字节低 6 位起算：0x40 是符号位、0x80 是续位，随后每字节 7 位。
+
+    与 tdx_client.get_price 同一套编码（首字节只给 6 位），别按常见的 7 位 LEB128 实现。
+    """
+    n = buf[pos]
+    val = n & 0x3F
+    neg = bool(n & 0x40)
+    shift = 6
+    while n & 0x80:
+        pos += 1
+        n = buf[pos]
+        val += (n & 0x7F) << shift
+        shift += 7
+    pos += 1
+    return (-val if neg else val), pos
+
+
+def read_float4(buf, pos):
+    """4 字节对数浮点（成交量族）：与 K 线同一套编码。"""
+    raw = struct.unpack_from("<I", buf, pos)[0]
+    if raw == 0:                                          # 零点数据别解成 5.9e-39
+        return 0.0, pos + 4
+    return get_volume(raw), pos + 4
+
+
+# ---------------------------------------------------------------- 价格精度
+
+# 053E 的价是 价格×10^小数位 的整数，股票 2 位、ETF 3 位、转债 4 位都一样；
+# 固定按分（1/100）解会把 ETF 放大 10 倍、转债放大 100 倍。小数位在码表记录偏移 20。
+# 052D 的 K 线反过来一律是 1/1000，不分证券，所以那边不用这张表。
+_PREC = {}
+_PREC_READY = set()
+_PREC_LOCK = threading.Lock()
+
+
+def price_scale(market, code):
+    """该证券的价格分母（10 的 小数位 次方）；查不到按 100 兜底。"""
+    dp = _PREC.get((market, code))
+    if dp is None:
+        dp = 2
+    return float(10 ** dp)
+
+
+def tick_scale(market, code):
+    """逐笔的价格分母：股票 100，ETF 与转债 1000（实测转债逐笔比快照少一个 0）。
+
+    K 线又是另一套，一律 1/1000，不分证券；三个口径互不相同，改哪边都要重新对一次价。
+    """
+    dp = _PREC.get((market, code), 2)
+    return float(10 ** max(2, min(3, dp)))
+
+
+PREC_CACHE = os.path.join(BASE_DIR, "db", "precision.json")
+PREC_TTL = 7 * 86400        # 小数位基本不变，缓存一周，免得每次启动都翻 28 页码表
+
+
+def _prec_cache_load():
+    """从磁盘缓存恢复整张小数位表，过期或缺失就返回空。"""
+    try:
+        if time.time() - os.path.getmtime(PREC_CACHE) > PREC_TTL:
+            return {}
+        with open(PREC_CACHE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    with _PREC_LOCK:
+        for key, dp in raw.items():
+            mkt, code = key.split(":", 1)
+            _PREC[(int(mkt), code)] = int(dp)
+    return raw
+
+
+def _prec_cache_save():
+    """把内存里的表写回磁盘；失败了不影响本次运行。"""
+    os.makedirs(os.path.dirname(PREC_CACHE), exist_ok=True)
+    with _PREC_LOCK:
+        raw = {"%d:%s" % k: v for k, v in _PREC.items()}
+    try:
+        with open(PREC_CACHE, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_precision(call, market):
+    """把某个市场的 代码 -> 小数位 读进缓存，一次一页 1000 条。call(market, start) 是取一页的函数。
+
+    先看磁盘缓存：命中就直接返回，不再发请求；没命中才翻码表，翻完写回。
+    """
+    cached = _prec_cache_load()
+    if any(k.startswith("%d:" % market) for k in cached):
+        return len(cached)
+    start = 0
+    while start < 40000:
+        try:
+            body = call(market, start)
+        except Exception as exc:                       # noqa: BLE001
+            print("码表第 %d 页取不到（%r），小数位按 2 兜底" % (start, exc)[:120], file=sys.stderr)
+            break
+        num = struct.unpack_from("<H", body, 0)[0]
+        if not num:
+            break
+        pos = 2
+        with _PREC_LOCK:
+            for _ in range(num):
+                code = body[pos:pos + 6].decode("ascii", "ignore")
+                _PREC[(market, code)] = body[pos + 20]
+                pos += 29
+        if num < 1000:
+            break
+        start += num
+        time.sleep(0.05)                     # 连打太快会被主站关连接，稍微让一下
+    _prec_cache_save()
+    return start
+
+
+# ---------------------------------------------------------------- 解析：快照
+
+# 记录字段顺序（用真实快照对齐过：基准价 1174 分 = 11.74 元、最高 1186、最低 1168、量 1437905 手、
+# 额 1689184000 元，与当日日线逐项吻合）。价格是相对基准价的差分，单位是**分**（1/100 元），不是千分之一。
+# 第 2 个 varint（amount_cents 之后的 skip1）语义未定，先留着；记录尾部还有 2 个原始字节与 4 个跳过位。
+SNAP_FIELDS = (
+    ("active", "u16"),
+    ("price", "price"),
+    ("last_close", "price"),
+    ("open", "price"),
+    ("high", "price"),
+    ("low", "price"),
+    ("amount_hundred", "varint"),
+    ("skip1", "varint"),
+    ("vol", "varint"),
+    ("cur_vol", "varint"),
+    ("amount", "float4"),
+    ("s_vol", "varint"),
+    ("b_vol", "varint"),
+    ("skip2", "varint"),
+    ("skip3", "varint"),
+)
+for _lvl in range(1, 6):
+    SNAP_FIELDS += (("bid%d" % _lvl, "price"), ("ask%d" % _lvl, "price"),
+                    ("bid_vol%d" % _lvl, "varint"), ("ask_vol%d" % _lvl, "varint"))
+SNAP_FIELDS += (("raw2", "raw2"), ("skip4", "varint"), ("skip5", "varint"),
+                ("skip6", "varint"), ("skip7", "varint"),
+                ("speed", "i16"), ("active2", "u16"))
+
+PRICE_SCALE = 100.0     # 快照价单位是分（股票的小数位 2；ETF 3 位、转债 4 位按码表缩放）
+CT_LIST, CAT_LIST, VER_LIST, FLAG_LIST = 0x0450, 0x1801, 0x0164, 0x01   # 码表，取小数位用
+
+
+def parse_snapshot(body, want, scale=None):
+    """解析 0x053E 应答。
+
+    body: 4 字节头（01 01 / u16 只数），随后每只一条记录：市场 u8 + 代码 6s + 字段。
+    want: 请求里的 [(market, code)]，顺序即回包顺序。头部之后第 k 条就是请求第 k 只，
+          回包的码也确实是它（实测 24 只双市场全对），want 只用来兜底改写。
+
+    scale 是每只的价格分母（10 的 小数位 次方）：股票 100、ETF 1000、转债 10000，
+    固定按分算会把 ETF 放大 10 倍、转债放大 100 倍。给了就按只套，没给按 100。
+    记录是变长的（价量都是 varint，全零时 56 字节、带真实值 81 字节），所以从记录起点顺序推进。
+    单条坏了不影响后面的：捕获异常后整条标记 _truncated，位置由调用方按消费到的位置续。
+    """
+    if len(body) < 4:
+        return []
+    num = struct.unpack_from("<H", body, 2)[0]
+    out = []
+    pos = 4
+    for i in range(num):
+        start = pos
+        mkt = body[start]
+        code = body[start + 1:start + 7].decode("ascii", "replace")
+        if i < len(want):                                  # 按请求顺序回填，回包码只作核对
+            mkt, code = want[i][0], want[i][1].decode("ascii", "replace")
+        rec = {"market": mkt, "code": code}
+        pos = start + 7
+        base = 0
+        try:
+            for name, kind in SNAP_FIELDS:
+                if kind == "u16":
+                    rec[name] = struct.unpack_from("<H", body, pos)[0]
+                    pos += 2
+                elif kind == "i16":
+                    rec[name] = struct.unpack_from("<h", body, pos)[0] / 100.0
+                    pos += 2
+                elif kind == "raw2":
+                    rec[name] = body[pos:pos + 2].hex()
+                    pos += 2
+                elif kind == "float4":
+                    rec[name], pos = read_float4(body, pos)
+                elif kind == "varint":
+                    rec[name], pos = read_varint(body, pos)
+                else:
+                    delta, pos = read_varint(body, pos)
+                    k = scale[i] if scale else PRICE_SCALE
+                    if name == "price":
+                        base = delta                           # 基准价自身
+                        rec[name] = delta / k
+                    else:
+                        rec[name] = (base + delta) / k
+            rec["ts"] = time.time()
+        except (IndexError, struct.error):
+            rec["_truncated"] = True
+        out.append(rec)
+    return out
+
+
+# ---------------------------------------------------------------- 解析：逐笔
+
+def parse_tick(body, scale=PRICE_SCALE):
+    """解析 0x0FC5 逐笔成交。体是 u16 条数，随后每条：
+
+        u16 时间（当日分钟数） / 价 varint / 量 varint / 笔数 varint / u16 方向
+
+    价是**差分**：0 表示与上一条相同，0x40 位是负号，单位分；第一条是绝对值。
+    量单位手，笔数是这一跳聚合的成交笔数，方向 u16 取 0 主动买 / 1 主动卖 /
+    2 中性 / 5 盘后固定价格（15:00 之后那批价格不动、全是 5）。
+    布局是用 200 条样本回溯出来的：整段恰好消费完 1472 字节，一条不多一条不少，
+    所以尾部那个 u16 不能省，省了后面全错位。
+    """
+    if len(body) < 2:
+        return []
+    num = struct.unpack_from("<H", body, 0)[0]
+    out = []
+    pos = 2
+    px = 0
+    for _ in range(num):
+        if pos + 4 > len(body):
+            break
+        tmin = struct.unpack_from("<H", body, pos)[0]
+        dp, pos2 = read_varint(body, pos + 2)
+        px += dp
+        vol, pos3 = read_varint(body, pos2)
+        cnt, pos4 = read_varint(body, pos3)
+        side = struct.unpack_from("<H", body, pos4)[0] if pos4 + 2 <= len(body) else 2
+        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, 0),
+                    "price": px / scale, "vol": vol, "trades": cnt, "side": side})
+        pos = pos4 + 2
+    return out
+
+
+def parse_order(body, scale=PRICE_SCALE):
+    """解析 0x0FC2。它是 0FC5 同一条成交流的细时标版：每条**末尾**多一个字节，那字节是秒。
+
+        u16 时间(分) / 价 varint（同上，0 与上一条相同） / 量 varint / 笔数 varint / u16 方向 / u8 秒
+
+    证据是条数守恒：3 条回 27 字节 = 2 + 3×8，6 条回 52 = 2 + 6×8，多出来那一字节落在每条末尾。
+    该字节是 0 到 59、相邻恒差 3 的秒（3600 条里 0 条越界，97% 以上相邻差正好 3，跨 60 回卷），
+    即时间是 3 秒粒度：t 输出到秒，sec 另给一份原值。与 0FC5 逐条比 1200 条，价格/量/方向完全一致。
+    """
+    if len(body) < 2:
+        return []
+    num = struct.unpack_from("<H", body, 0)[0]
+    out = []
+    pos = 2
+    px = 0
+    for _ in range(num):
+        if pos + 5 > len(body):
+            break
+        tmin = struct.unpack_from("<H", body, pos)[0]
+        dp, pos2 = read_varint(body, pos + 2)
+        px += dp
+        vol, pos3 = read_varint(body, pos2)
+        cnt, pos4 = read_varint(body, pos3)
+        side = struct.unpack_from("<H", body, pos4)[0] if pos4 + 2 <= len(body) else 2
+        sec = body[pos4 + 2] if pos4 + 2 < len(body) else 0
+        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, sec),
+                    "price": px / scale, "vol": vol, "trades": cnt,
+                    "side": side, "sec": sec, "kind_code": sec})
+        pos = pos4 + 3
+    return out
+
 class TdxConnection:
-    def __init__(self, cfg_path=CFG_DEFAULT, timeout=8.0, verbose=False):
+    def __init__(self, cfg_path=CFG_DEFAULT, timeout=8.0, verbose=False, hosts=None, on_ban=None):
         self.cfg_path = cfg_path or CFG_DEFAULT   # None 会让 configparser 抛 TypeError
         self.timeout = timeout
         self.verbose = verbose
@@ -170,6 +475,9 @@ class TdxConnection:
         self._lock = threading.Lock()
         self._inflight = 0
         self._sem = threading.Semaphore(MAX_INFLIGHT)
+        self._banned = []          # 这轮撞过"连上即关"的主机，重连时先跳过
+        self._hosts = list(hosts) if hosts else None   # 给定就只用这张表（池子用它）
+        self.on_ban = on_ban       # 主机被拉黑时的回调，池子用它挪队尾
 
     # ---------- 配置与连接 ----------
     @staticmethod
@@ -207,6 +515,8 @@ class TdxConnection:
         return got
 
     def load_hosts(self):
+        if self._hosts:
+            return list(self._hosts)
         """主机来源：connect.cfg 优先；没有站点时退到客户端维护的 newhost.lst。
 
         两个地址都可被 TDX_CFG 覆盖；newhost.lst 由官方更新器写入，
@@ -299,9 +609,139 @@ class TdxConnection:
                         last_exc = TdxError("应答 commtype 不匹配（期望 0x%04X）" % commtype)
                     except (TdxError, OSError) as exc:
                         last_exc = exc
+                        if self.host and self.host not in self._banned:
+                            self._banned.append(self.host)   # 换一台再试
                     # 实测该服务端每连接只服务一次业务请求，失败后重连再试。
                     self._close()
                 raise TdxError("请求失败: %r" % (last_exc,))
+
+    ## 帧调用
+    # 一次调用 = 一条连接：连接 -> 握手三帧与业务帧同发 -> 按 commtype 认领应答。
+    # 声明长度可以由 extra 抬高（逐笔族要比实际体多 2），主机撞上"连上即关"就换一台重试。
+    def call(self, commtype, payload, catword, ver, flag, extra=0, tries=3):
+        last = None
+        for i in range(tries):
+            try:
+                return self._call_once(commtype, payload, catword, ver, flag, extra)
+            except (TdxError, OSError) as exc:
+                last = exc
+                self._close()
+                self._ban_current()
+                if i + 1 < tries:
+                    time.sleep(0.15 * (i + 1))
+        raise last
+
+    def _ban_current(self):
+        """把刚失败的主机记下来并回调，重连时先跳过它。"""
+        if self.host and self.host not in self._banned:
+            self._banned.append(self.host)
+            if self.on_ban:
+                self.on_ban(self.host)
+
+    def _call_once(self, commtype, payload, catword, ver, flag, extra=0):
+        if self.sock is None:
+            self.connect()
+        declared = len(payload) + extra
+        frame = (bytes([0x0C]) + struct.pack("<HHBHH", catword, ver, flag, declared, declared)
+                 + struct.pack("<H", commtype) + payload)
+        self.sock.sendall(HS1 + HS2 + HS3 + frame)
+        # 握手应答条数不固定（实测 1 到 2 条），所以不预读，统一按 commtype 认领业务应答。
+        for _ in range(8):
+            got = self._read_message()
+            if self._last_commtype == commtype:
+                return got
+        raise TdxError("commtype 不匹配（期望 0x%04X）" % commtype)
+
+    ## 码表分页
+    # 这族要握住手、三条握手一条一条发，声明长度还要把 2 字节 commtype 算进去；
+    # 照快照那套一次灌进去或者少算长度，服务端会一直不理。
+    def list_page(self, market, start, count=1000):
+        last = None
+        for attempt in range(5):
+            try:
+                return self._list_page_once(market, start, count)
+            except (TdxError, OSError) as exc:
+                last = exc
+                self._close()
+                self._ban_current()
+                time.sleep(0.15 * (attempt + 1))
+        raise last
+
+    def _list_page_once(self, market, start, count=1000):
+        if self.sock is None:
+            self.connect()
+        for pkt in (HS1, HS2):                     # Setup1/2 各回一条，必须读干净
+            self.sock.sendall(pkt)
+            self._read_message()
+        self.sock.sendall(HS3)
+        body = struct.pack("<H", CT_LIST) + struct.pack("<HH", market, start)
+        frame = (bytes([0x0C]) + struct.pack("<HHBHH", CAT_LIST, VER_LIST, FLAG_LIST, len(body), len(body))
+                 + body)
+        self.sock.sendall(frame)
+        for _ in range(8):
+            got = self._read_message()
+            if self._last_commtype == CT_LIST:
+                return got
+        raise TdxError("码表 commtype 不匹配")
+
+    ## 业务取数
+    def _scales(self, stocks):
+        """这批证券的价格分母；表没加载过先加载该市场，查不到按 100 兜底。"""
+        for mkt, _code in stocks:
+            if mkt not in _PREC_READY:
+                try:
+                    load_precision(self.list_page, mkt)
+                except Exception as exc:               # noqa: BLE001
+                    print("小数位表取不到（%r），按 100 兜底" % (exc,), file=sys.stderr)
+                _PREC_READY.add(mkt)
+                self._close()              # 码表把连接用掉了，别留给业务帧
+        return [price_scale(m, c.decode("ascii", "replace")) for m, c in stocks]
+
+    def snapshot(self, stocks):
+        """五档快照。请求体：前缀 + 数量 + 证券表 + 0C 01。
+
+        0C 01 必须排在证券表之后（客户端原包如此）。放到数量后面也能回包，但服务端会按错位解析：
+        代码只认末位、回包恒带 600839、数据错开一条，三个老毛病都出自这一个字节位。
+        """
+        ask = list(stocks)
+        scales = self._scales(ask)
+        payload = (SNAP_PREFIX + struct.pack("<H", len(ask))
+                   + b"".join(struct.pack("<B6s", m, c) for m, c in ask) + SNAP_TAIL)
+        body = self.call(CT_SNAPSHOT, payload, SNAP_CAT, SNAP_VER, SNAP_FLAG)
+        recs = parse_snapshot(body, ask, scales)
+        if len(recs) < len(ask):
+            recs += [{}] * (len(ask) - len(recs))
+        out = recs[:len(ask)]
+        for rec, (mkt, code) in zip(out, ask):
+            srv = rec.get("code", "")
+            rec["market"] = mkt
+            rec["code"] = code.decode("ascii", "replace")
+            rec["code_srv"] = srv
+            if srv and srv != rec["code"]:
+                rec["mismatch"] = srv
+        return out
+
+    def ticks(self, market, code, start=0, count=30):
+        """逐笔成交（0FC5 分钟版）。"""
+        self._scales([(market, code)])
+        scale = tick_scale(market, code.decode("ascii", "replace"))
+        payload = struct.pack("<H", market) + code.ljust(6, b"\x00") + struct.pack("<HH", start, count)
+        body = self.call(CT_TICK, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
+        return parse_tick(body, scale)
+
+    def orders(self, market, code, start=0, count=30):
+        """逐笔成交带秒（0FC2），同一路流水，每条尾多一个 3 秒粒度的秒字节。"""
+        self._scales([(market, code)])
+        scale = tick_scale(market, code.decode("ascii", "replace"))
+        payload = struct.pack("<H", market) + code.ljust(6, b"\x00") + struct.pack("<HH", start, count)
+        body = self.call(CT_ORDER, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
+        return parse_order(body, scale)
+
+    def probe(self):
+        """健康探测：发一条日线请求，能回包就算活。"""
+        payload = (b"\x00" + struct.pack("<H", 9) + struct.pack("<B6s", 1, b"600000")
+                   + struct.pack("<HH", 0, 1))
+        return self.call(CT_BARS, payload, (0x08 << 8) | CAT_BARS, VER_BARS, 0, tries=2)
 
     ## 应答帧
     # 16 字节头：前 10 字节是回显，10..12 是命令字（用来丢弃夹带的推送），12..16 是压缩后与解压后长度。
@@ -480,11 +920,460 @@ class TdxConnection:
         return out
 
     def minute_time_data(self, market, code):
-        body = self._request(struct.pack("<H6sI", market, code.encode(), 0),
-                             CAT_MINUTE, VER_MINUTE, CT_MINUTE)
+        """当日分时 240 点，返回 [{t, price, vol}]；价格是逐点差分累加。"""
+        self._scales([(market, code.encode())])
+        scale = price_scale(market, code)
+        body = self.call(CT_MINUTE, struct.pack("<H6sI", market, code.encode(), 0),
+                         CAT_MINUTE, VER_MINUTE, 0, extra=2)
         # 应答头：条数(u16) + 0000 + 01 + 代码(6 字节) + 2 字节填充，记录自偏移 13 起。
         num = struct.unpack_from("<H", body, 0)[0]
-        pos, last, out = 13, 0, []
-        for _ in range(num):
+        pos, px, out = 13, 0, []
+        for i in range(num):
             diff, pos = get_price(body, pos)
             vol, pos = get_price(body, pos)
+            px += diff
+            out.append({"t": "%02d:%02d" % (i // 60 + 9, i % 60), "price": px / scale, "vol": vol})
+        return out
+
+    def minute(self, market, code):
+        """当日分时 240 点。"""
+        return self.minute_time_data(market, code)
+
+    def tick(self, market, code, start=0, count=50):
+        """逐笔成交（0x0FC5 分钟版）。要秒级时标用 orders()。"""
+        self._scales([(market, code.encode())])
+        scale = tick_scale(market, code)
+        payload = struct.pack("<H6sHH", market, code.encode(), start, count)
+        body = self.call(CT_TICK, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
+        return parse_ticks(body, scale)
+
+
+# ---------------------------------------------------------------- 分钟记录与文件
+
+def normalize_codes(codes):
+    """把代码补齐六位：PowerShell 会把 000016,301139 当数字数组传，前导零会丢。"""
+    return [str(c).strip().zfill(6) for c in codes if str(c).strip()]
+
+
+# 分钟族的落点：kind -> (category, 子目录, 扩展名)。1 分钟是 cat 7，5 分钟是 cat 0。
+# 15/30/60 分钟客户端本地没有独立目录，落在 fzline 下用 .lc15/.lc30/.lc60 区分（记录同为 32 字节）
+KIND_MAP = {"day": (9, "lday", ".day"), "min": (7, "minline", ".lc1"), "5min": (0, "fzline", ".lc5"),
+            "15min": (1, "fzline", ".lc15"), "30min": (2, "fzline", ".lc30"), "60min": (3, "fzline", ".lc60")}
+# 分钟记录 32 字节：u16 打包日 + u16 分钟 + 五浮点 + u32 量 + u32 保留。
+# 打包日把年放在 bit11 以上（减 2004），低 11 位是 月*100+日。
+MIN_REC = 32
+
+
+def pack_min(y, mo, d, hh, mm, o, h, lo, c, amt, vol):
+    """把一条分钟记录打成 32 字节，时间用 TDX 的打包日加分钟数。"""
+    zipday = ((y - 2004) << 11) | (mo * 100 + d)
+    return struct.pack("<HH5fII", zipday, hh * 60 + mm, o, h, lo, c, amt, vol, 0)
+
+
+def pack_day(ymd, o, h, lo, c, amt, vol):
+    """把一条日线打成 32 字节：u32 日期 + 四价（分）+ 额 + 量 + 保留。"""
+    return struct.pack("<IIIIIfII", ymd, int(round(o * 100)), int(round(h * 100)),
+                       int(round(lo * 100)), int(round(c * 100)), float(amt), int(vol), 0)
+
+
+def unpack_min(raw, off):
+    """解一条分钟记录，返回 ((年,月,日,时,分), 开,高,低,收,额,量)。"""
+    zipday, minutes = struct.unpack_from("<HH", raw, off)
+    y = (zipday >> 11) + 2004
+    mo, d = divmod(zipday % 2048, 100)
+    hh, mm = divmod(minutes, 60)
+    o, h, lo, c, amt = struct.unpack_from("<5f", raw, off + 4)
+    vol = struct.unpack_from("<I", raw, off + 24)[0]
+    return (y, mo, d, hh, mm), o, h, lo, c, amt, vol
+
+
+def read_ticks_file(path):
+    """按 kind 读出已有文件，统一成 {时间键: 载荷} 的字典，供合并写用。"""
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    raw = open(path, "rb").read()
+    if path.endswith(".day"):
+        for off in range(0, len(raw) - 31, 32):
+            out[struct.unpack_from("<I", raw, off)[0]] = raw[off:off + 32]
+        return out
+    for off in range(0, len(raw) - MIN_REC + 1, MIN_REC):
+        key = unpack_min(raw, off)[0]
+        out[key] = raw[off:off + MIN_REC]
+    return out
+
+
+def write_all(path, store):
+    """把合并后的字典按时间升序整体重写；日线的键是数字日期，分钟是元组。"""
+    with open(path, "wb") as fh:
+        for k in sorted(store):
+            fh.write(store[k])
+
+
+# ---------------------------------------------------------------- 本地读取
+
+def read_day(path):
+    """读本地 .day：32 字节记录（日期 + 四价 + 额 + 量 + 保留），价格除 100。"""
+    out = []
+    raw = open(path, "rb").read()
+    for off in range(0, len(raw) - 31, 32):
+        ymd, o, h, lo, c, amt, vol, _ = struct.unpack_from("<IIIIIfII", raw, off)
+        out.append({"date": ymd, "dt": (ymd // 10000, (ymd % 10000) // 100, ymd % 100),
+                    "open": o / 100.0, "high": h / 100.0, "low": lo / 100.0,
+                    "close": c / 100.0, "amount": amt, "vol": vol})
+    return out
+
+
+def read_lc1(path):
+    """读本地分钟线（.lc1/.lc5 同布局）：u16 打包日 + u16 分钟 + 五浮点 + u32 量 + 保留。"""
+    out = []
+    raw = open(path, "rb").read()
+    for off in range(0, len(raw) - 31, 32):
+        zipday, minutes = struct.unpack_from("<HH", raw, off)
+        o, h, lo, c, amt = struct.unpack_from("<5f", raw, off + 4)
+        vol = struct.unpack_from("<I", raw, off + 24)[0]
+        out.append({"dt": ((zipday >> 11) + 2004, (zipday % 2048) // 100, (zipday % 2048) % 100,
+                           minutes // 60, minutes % 60),
+                    "open": o, "high": h, "low": lo, "close": c, "amount": amt, "vol": vol})
+    return out
+
+
+def vipdoc_path(root, market, code, kind="lday"):
+    """拼本地行情文件路径。"""
+    ext = {"lday": ".day", "minline": ".lc1", "fzline": ".lc5"}.get(kind, "." + kind)
+    return os.path.join(root, "vipdoc", MARKET_DIR[market], kind,
+                        "%s%s%s" % (PREFIX[market], code, ext))
+
+
+def _print_rows(rows, out=None, limit=10):
+    if out:
+        with open(out, "w", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["date", "open", "high", "low", "close", "amount", "volume"])
+            for r in rows:
+                d = r.get("dt", (0, 0, 0))
+                w.writerow(["%04d%02d%02d" % (d[0], d[1], d[2]), r["open"], r["high"],
+                            r["low"], r["close"], r.get("amount", 0), r.get("vol", 0)])
+        print("已写 %d 条到 %s" % (len(rows), out))
+        return
+    for r in rows[:limit]:
+        d = r.get("dt", (0, 0, 0))
+        print("%04d%02d%02d %8.2f %8.2f %8.2f %8.2f %12d" % (
+            d[0], d[1], d[2], r["open"], r["high"], r["low"], r["close"], r.get("vol", 0)))
+    if len(rows) > limit:
+        print("... 共 %d 条" % len(rows))
+
+
+def _gbbq_of(vipdoc):
+    return os.path.join(os.path.dirname(os.path.abspath(vipdoc)), "T0002", "hq_cache", "gbbq")
+
+
+def _maybe_adjust(rows, args, market, code):
+    """按 --adjust 调 tdx_adjust；缺文件或无事件时提示并按不复权返回。"""
+    if getattr(args, "adjust", "none") == "none" or not rows:
+        return rows
+    path = getattr(args, "gbbq", None) or _gbbq_of(getattr(args, "vipdoc", None) or VIPDOC_DEFAULT)
+    if not os.path.isfile(path):
+        print("缺 gbbq（%s），按不复权输出" % path, file=sys.stderr)
+        return rows
+    sys.path.insert(0, BASE_DIR)
+    import tdx_adjust
+    events = tdx_adjust.load_events(path, market, code)
+    if not events:
+        print("%s 无复权事件，按不复权输出" % code, file=sys.stderr)
+        return rows
+    return tdx_adjust.adjust_records(rows, events, args.adjust)
+
+
+# ---------------------------------------------------------------- 退市清单
+
+def list_delisted(src, markets=(0, 1), out=None):
+    """从现成的 vipdoc 里找退市股：本地有文件、主站码表里没有的代码就是。
+
+    主站只服务在册证券（25 台全试过，300431、300104 这类退市票一律 0 条），
+    但客户端安装目录或旧备份里往往还留着它们的 .day。这份差集就是该保住的东西。
+    """
+    conn = TdxConnection()
+    table = set()
+    try:
+        for m in markets:
+            total = conn.security_count(m)
+            got = 0
+            while got < total:
+                rows = conn.security_list(m, got, 1000)
+                conn._close()
+                if not rows:
+                    break
+                got += len(rows)
+                table.update((m, cd) for _mk, cd, _nm in rows)
+    finally:
+        conn._close()
+
+    rows = []
+    for m in markets:
+        d = os.path.join(src, "vipdoc", "sh" if m == 1 else "sz", "lday")
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".day") or len(name) < 11:
+                continue
+            code = name[2:8]
+            if not code.isdigit():
+                continue
+            if (m, code) not in table:
+                rows.append((m, code))
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            for m, code in rows:
+                fh.write("%d:%s\n" % (m, code))
+        print("写出 %s" % out)
+    return rows, len(table)
+
+
+def archive_base(src, out_dir=None, day=None):
+    """把 base.dbf 的财务快照按日期存一份，攒历史用。
+
+    服务端只给最新一期的财务与股本（base.dbf 单个快照、GXRQ 一个日期），
+    历史某天的每股净资产取不到；每天存一份，PB/PE/换手率这些才有人能算。
+    """
+    src = os.path.abspath(src)
+    if os.path.isdir(src):
+        src = os.path.join(src, "base.dbf")
+    if not os.path.isfile(src):
+        raise SystemExit("没有 base.dbf：%s" % src)
+    day = day or time.strftime("%Y%m%d")
+    out_dir = out_dir or os.path.join(HERE, "db", "base")
+    os.makedirs(out_dir, exist_ok=True)
+    dst = os.path.join(out_dir, "%s.dbf" % day)
+    if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+        return dst, False                     # 同一天重复跑，内容大小一致就不重写
+    shutil.copyfile(src, dst)
+    return dst, True
+
+
+# ---------------------------------------------------------------- 命令
+
+def cmd_smoke(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        n = c.security_count(a.market)
+        rows = c.tick(a.market, a.code, 0, 5)
+        print(json.dumps({"market": a.market, "code": a.code, "count": n,
+                          "ticks": len(rows)}, ensure_ascii=False))
+        return 0 if rows else 4
+    finally:
+        c._close()
+
+
+def cmd_count(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        print(c.security_count(a.market))
+        return 0
+    finally:
+        c._close()
+
+
+def cmd_codes(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        for m, code, name in c.security_list(a.market, a.start, a.count):
+            print("%d %s %s" % (m, code, name))
+        return 0
+    finally:
+        c._close()
+
+
+def cmd_bars(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        rows = c.security_bars(a.category, a.market, a.code, a.start, a.count)
+    finally:
+        c._close()
+    rows = _maybe_adjust(rows, a, a.market, a.code)
+    _print_rows(rows, a.out)
+    return 0 if rows else 4
+
+
+def cmd_minute(a):
+    """当日分时。走 1 分钟 K 线（category 7）再筛出今天，比 0x051D 稳。"""
+    c = TdxConnection(timeout=8.0)
+    rows, start = [], 0
+    try:
+        while len(rows) < 320:                 # 指数一次只回一根，得按根往后挪
+            batch = c.security_bars(7, a.market, a.code, start, 240)
+            c._close()
+            if not batch:
+                break
+            rows.extend(batch)
+            start += len(batch)
+    finally:
+        c._close()
+    if rows:
+        today = rows[-1]["dt"][:3]
+        rows = [r for r in rows if r["dt"][:3] == today][::-1]
+    rows = [{"t": "%02d:%02d" % (r["dt"][3], r["dt"][4]), "price": r["close"], "vol": r["vol"]}
+            for r in rows]
+    for r in rows:
+        print("%s %8.3f %10d" % (r["t"], r["price"], r["vol"]))
+    print("共 %d 点" % len(rows))
+    return 0 if rows else 4
+
+
+def cmd_tick(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        rows = c.tick(a.market, a.code, a.start, a.count)
+    finally:
+        c._close()
+    for r in rows:
+        print("%s %8.3f %8d %d" % (r["t"], r["price"], r["vol"], r["side"]))
+    return 0 if rows else 4
+
+
+def cmd_xdxr(a):
+    c = TdxConnection(timeout=8.0)
+    try:
+        rows = c.xdxr_info(a.market, a.code)
+    finally:
+        c._close()
+    for r in rows:
+        print(json.dumps(r, ensure_ascii=False, sort_keys=True))
+    return 0 if rows else 4
+
+
+def cmd_local(a):
+    path = vipdoc_path(a.vipdoc, a.market, a.code, a.kind)
+    if not os.path.isfile(path):
+        print("没有文件: %s" % path, file=sys.stderr)
+        return 2
+    rows = read_lc1(path) if a.kind in ("minline", "fzline") else read_day(path)
+    rows = _maybe_adjust(rows, a, a.market, a.code)
+    _print_rows(rows, a.out)
+    return 0 if rows else 4
+
+
+def cmd_login(a):
+    """探 7709 的 0x0004 与 UserHost 登录口 TCP 可达性，结果写 JSON。"""
+    cfg = a.cfg or CFG_DEFAULT
+    got = {"cfg": cfg, "main": [], "login_ports": []}
+    host, port, err = None, None, None
+    try:
+        host, port = TdxConnection(cfg_path=cfg).load_hosts()[0]
+    except Exception as exc:                           # noqa: BLE001
+        err = repr(exc)[:120]
+    sock = None
+    if host:
+        try:
+            sock = socket.create_connection((host, port), timeout=6)
+            sock.sendall(bytes.fromhex("0c0218930001030003000d0001"))
+            sock.settimeout(6)
+            got["main"].append({"variant": "setup1", "host": host, "port": port,
+                                "ok": bool(sock.recv(64))})
+        except Exception as exc:                       # noqa: BLE001
+            got["main"].append({"variant": "setup1", "error": repr(exc)[:120]})
+        finally:
+            if sock:
+                sock.close()
+    else:
+        got["main"].append({"variant": "setup1", "error": err})
+    cp = configparser.ConfigParser(strict=False)
+    cp.read(cfg, encoding="gbk")
+    uh_host = cp.get("UserHost", "IPAddress", fallback="") if cp.has_section("UserHost") else ""
+    try:
+        uh_port = int(cp.get("UserHost", "Port", fallback="7715")) if cp.has_section("UserHost") else 7715
+    except ValueError:
+        uh_port = 7715
+    if uh_host:
+        try:
+            socket.create_connection((uh_host, uh_port), timeout=6).close()
+            got["login_ports"].append({"host": uh_host, "port": uh_port, "tcp": True})
+        except Exception as exc:                       # noqa: BLE001
+            got["login_ports"].append({"host": uh_host, "port": uh_port, "tcp": False,
+                                       "error": repr(exc)[:120]})
+    out = a.out or os.path.join(BASE_DIR, "login.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(got, fh, ensure_ascii=False, indent=2)
+    print("已写", out)
+    return 0
+
+
+def cmd_info_hello(a):
+    c = TdxConnection(cfg_path=a.cfg or None, timeout=8.0)
+    c.sections = ("INFOHOST", "DSHOST")
+    c.handshake = False
+    try:
+        got = c.info_hello()
+    finally:
+        c._close()
+    got["raw"] = "%d 字节" % len(got.get("raw") or b"")
+    print(json.dumps(got, ensure_ascii=False, indent=2))
+    return 0 if got.get("time") or got.get("build") else 4
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description="通达信 7709 行情客户端")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("smoke")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", default="600000")
+    p.set_defaults(func=cmd_smoke)
+    p = sub.add_parser("count")
+    p.add_argument("--market", type=int, default=1)
+    p.set_defaults(func=cmd_count)
+    p = sub.add_parser("codes")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--count", type=int, default=100)
+    p.set_defaults(func=cmd_codes)
+    p = sub.add_parser("bars")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", required=True)
+    p.add_argument("--category", type=int, default=9)
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--count", type=int, default=100)
+    p.add_argument("--out")
+    p.add_argument("--adjust", default="none", choices=("none", "hfq", "qfq"))
+    p.add_argument("--gbbq")
+    p.add_argument("--vipdoc")
+    p.set_defaults(func=cmd_bars)
+    p = sub.add_parser("minute")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", required=True)
+    p.set_defaults(func=cmd_minute)
+    p = sub.add_parser("tick")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", required=True)
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--count", type=int, default=50)
+    p.set_defaults(func=cmd_tick)
+    p = sub.add_parser("xdxr")
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", required=True)
+    p.set_defaults(func=cmd_xdxr)
+    p = sub.add_parser("local")
+    p.add_argument("--vipdoc", default=VIPDOC_DEFAULT)
+    p.add_argument("--market", type=int, default=1)
+    p.add_argument("--code", required=True)
+    p.add_argument("--kind", default="lday", choices=("lday", "minline", "fzline"))
+    p.add_argument("--out")
+    p.add_argument("--adjust", default="none", choices=("none", "hfq", "qfq"))
+    p.add_argument("--gbbq")
+    p.set_defaults(func=cmd_local)
+    p = sub.add_parser("login")
+    p.add_argument("--cfg")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_login)
+    p = sub.add_parser("info-hello")
+    p.add_argument("--cfg")
+    p.set_defaults(func=cmd_info_hello)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

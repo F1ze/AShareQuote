@@ -337,7 +337,9 @@ try {
       const names={'sh600036':'招商银行','sh600519':'贵州茅台','sz000001':'平安银行','sz300750':'宁德时代'}
       const quotes=url.searchParams.get('codes').split(',').map((key,i)=>({market:{sz:0,sh:1,bj:2}[key.slice(0,2)],code:key.slice(2),name:window.rtMode==='blankNames'?'':names[key]||'测试证券',price:35+i+window.rtCalls/100,lastClose:34+i,open:34.8+i,high:36+i,low:34.5+i,volume:100000+i,amount:350000000,bids:Array.from({length:5},(_,n)=>({price:35+i-n/100,volume:100+n*25+(n===0?window.rtBookStep*50:0)})),asks:Array.from({length:5},(_,n)=>({price:35.02+i+n/100,volume:200+n*30-(n===4?window.rtBookStep*40:0)}))}))
       const trades=window.rtMode==='degraded'?[]:Array.from({length:60},(_,i)=>({time:'10:'+String(Math.floor(i/20)).padStart(2,'0')+':'+String(i%20*3).padStart(2,'0'),price:35+Math.sin(i/7)*.25,volume:10+i,trades:2,side:i%3}))
-      return new Response(JSON.stringify({selected,quotes,trades,receivedAt:new Date().toISOString(),latencyMs:82,cached:false,detailStatus:trades.length?'available':'unavailable',detailMessage:trades.length?'完整 L2 未接入：当前是约 3 秒扩展成交窗口':'扩展成交明细不可用，已降级五档快照',l2Verified:false}),{headers:{'Content-Type':'application/json'}})
+      const namesOnly=window.rtMode==='namesOnly'
+      const missing=['111024','589020']
+      return new Response(JSON.stringify({selected,quotes:namesOnly?quotes.filter(quote=>!missing.includes(quote.code)):quotes,names:namesOnly?{sh111024:'澳弘转债',sh589020:'KC半导体'}:undefined,trades,receivedAt:new Date().toISOString(),latencyMs:82,cached:false,detailStatus:trades.length?'available':'unavailable',detailMessage:trades.length?'完整 L2 未接入：当前是约 3 秒扩展成交窗口':'扩展成交明细不可用，已降级五档快照',l2Verified:false}),{headers:{'Content-Type':'application/json'}})
     }
   })()`)
   await clickText("实时看盘")
@@ -415,6 +417,10 @@ try {
   await screenshot('realtime-mobile.png')
   if(!await evaluate(`['.watch-price','.watch-change','.watch-time'].every(selector=>getComputedStyle(document.querySelector('.rt-watch-table td'+selector)).display!=='none')`)) throw new Error('手机关键列被隐藏')
   await clickText('数据采集')
+  await evaluate(`window.rtMode='namesOnly';localStorage.setItem('qflux.realtime',JSON.stringify({codes:['sh600036','sh111024','sh589020'],selected:'sh600036',interval:5}))`)
+  await clickText('实时看盘')
+  await waitFor(`['澳弘转债','KC半导体'].every(name=>document.querySelector('.rt-watch-table')?.innerText.includes(name))`, '自选无报价仍显示 ETF 和转债名称')
+  await clickText('数据采集')
   const leftCount=await evaluate('window.rtCalls')
   await sleep(3200)
   if(await evaluate('window.rtCalls')!==leftCount) throw new Error('离开 Tab 后仍然轮询')
@@ -432,7 +438,7 @@ try {
       if(url.pathname==='/api/realtime/watch')return new Response(JSON.stringify({codes:['sh600036','sz000001'],selected:'sh600036',interval:3}),{headers:{'Content-Type':'application/json'}});
       if(url.searchParams.get('details')!=='false')throw new Error('小组件请求了成交明细');
       window.widgetCalls++;
-      const quotes=url.searchParams.get('codes').split(',').map(key=>({market:key.startsWith('sh')?1:0,code:key.slice(2),name:key==='sh600036'?'招商银行':'平安银行',price:43.01,lastClose:42.88}));
+      const quotes=url.searchParams.get('codes').split(',').map(key=>({market:key.startsWith('sh')?1:0,code:key.slice(2),name:key==='sh600036'?'招商银行':'平安银行',price:key==='sh600036'?43.01:12.05,lastClose:key==='sh600036'?42.88:11.50}));
       return new Response(JSON.stringify({quotes,trades:[],receivedAt:new Date().toISOString(),latencyMs:70,selected:url.searchParams.get('selected'),detailStatus:'not_requested',l2Verified:false}),{headers:{'Content-Type':'application/json'}});
     };
   `},widgetSession)
@@ -441,6 +447,15 @@ try {
   for(let attempt=0;attempt<70;attempt++){if(await widgetEval(`Boolean(document.querySelector('.widget-quotes')?.innerText.includes('招商银行'))`))break;if(attempt===69)throw new Error('独立小组件未显示行情');await sleep(100)}
   if(!await widgetEval(`document.querySelectorAll('.widget-quotes tbody tr').length===2 && document.body.innerText.includes('43.01') && document.body.innerText.includes('网页模式')`))throw new Error('小组件必要字段缺失')
   await widgetEval(`document.querySelector('[aria-label="暂停小组件刷新"]').click()`)
+  for (const [column, first, second] of [['最新价', 'SH600036', 'SZ000001'], ['涨跌幅', 'SZ000001', 'SH600036'], ['证券 / 代码', 'SZ000001', 'SH600036'], ['接收时间', 'SH600036', 'SH600036']]) {
+    for (const [index, symbol] of [first, second].entries()) {
+      const label = JSON.stringify('按' + column + '排序')
+      await widgetEval(`document.querySelector('button[aria-label=' + ${JSON.stringify(label)} + ']').click()`)
+      await sleep(50)
+      const direction = (column === '证券 / 代码') === (index === 0) ? 'ascending' : 'descending'
+      if (!await widgetEval(`document.querySelector('.widget-quotes tbody tr').innerText.includes(${JSON.stringify(symbol)}) && document.querySelector('.widget-quotes th[aria-sort]')?.getAttribute('aria-sort') === ${JSON.stringify(direction)}`)) throw new Error('小组件列排序错误：' + column)
+    }
+  }
   const widgetCount=await widgetEval('window.widgetCalls');await sleep(1200)
   if(await widgetEval('window.widgetCalls')!==widgetCount)throw new Error('暂停小组件仍在取数')
   await widgetEval(`document.querySelector('[aria-label="配置小组件"]').click()`)

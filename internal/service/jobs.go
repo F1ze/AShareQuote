@@ -140,8 +140,8 @@ func (m *JobService) start(options DownloadOptions, resume *savedRun) (TaskSnaps
 		if remote {
 			securities, _ := domain.ParseCodes(options.Codes)
 			for _, security := range securities {
-				if !slices.Contains(spec.Markets, int(security.Market)) {
-					return TaskSnapshot{}, fmt.Errorf("%s 不支持该证券市场", spec.Label)
+				if !domain.IsAShare(security) || !slices.Contains(spec.Markets, int(security.Market)) {
+					return TaskSnapshot{}, fmt.Errorf("%s 不支持该证券品种或市场", spec.Label)
 				}
 			}
 		}

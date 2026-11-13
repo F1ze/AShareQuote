@@ -49,7 +49,7 @@ func TestRealtimeDecodersMatchOriginalPython(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(quotes, wantQuotes) {
 		t.Fatalf("快照与参考模块不同：%+v %v", quotes, err)
 	}
-	gotTrades, err := decodeRealtimeTrades(trades)
+	gotTrades, err := decodeRealtimeTrades(trades, 100)
 	if err != nil || !reflect.DeepEqual(gotTrades, wantTrades) {
 		t.Fatalf("成交与参考模块不同：%+v %v", gotTrades, err)
 	}
@@ -59,13 +59,38 @@ func TestRealtimeDecodersMatchOriginalPython(t *testing.T) {
 		}
 	}
 	for i := 0; i < len(trades); i++ {
-		if _, err := decodeRealtimeTrades(trades[:i]); err == nil {
+		if _, err := decodeRealtimeTrades(trades[:i], 100); err == nil {
 			t.Fatalf("接受截断成交 %d", i)
 		}
 	}
 	copy(snapshot[5:11], "600839")
 	if _, err := decodeRealtimeQuotes(snapshot, stocks); err == nil {
 		t.Fatal("把错配证券强行回填为当前股票")
+	}
+}
+
+func TestRealtimeFundAndBondPriceScale(t *testing.T) {
+	snapshot, trades, _, _ := realtimeFixture(t)
+	for _, tc := range []struct {
+		code            string
+		price, bid, ask float64
+	}{
+		{"589020", 1.174, 1.173, 1.175},
+		{"111024", 0.1174, 0.1173, 0.1175},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			stock := Security{Market: domain.MarketSH, Code: tc.code}
+			body := bytes.Clone(snapshot)
+			copy(body[5:11], tc.code)
+			quotes, err := decodeRealtimeQuotes(body, []Security{stock, {Market: domain.MarketSZ, Code: "000001"}})
+			if err != nil || quotes[0].Price != tc.price || quotes[0].Bids[0].Price != tc.bid || quotes[0].Asks[0].Price != tc.ask {
+				t.Fatalf("快照价格精度错误：%+v %v", quotes, err)
+			}
+			rows, err := decodeRealtimeTrades(trades, realtimePriceScale(stock, false))
+			if err != nil || rows[0].Price != 1.174 || rows[1].Time != "09:31:03" {
+				t.Fatalf("带秒成交解码错误：%+v %v", rows, err)
+			}
+		})
 	}
 }
 

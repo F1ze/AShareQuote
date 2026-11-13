@@ -95,7 +95,7 @@ export function DownloadForm(props: Props) {
               : "当前码表并非全部历史证券。沪深退市资料可用 BaoStock 补充，较早分钟线可本地补录。"}
           </p>
         </div>
-        <FormSection step="01" title="选择证券" hint="沪 · 深 · 北 A 股">
+        <FormSection step="01" title="选择证券" hint={options.source === "baostock" ? "沪 · 深 A 股" : "A 股 · ETF · 可转债"}>
           <div className="segmented" aria-label="证券选择方式">
             {(["markets", "codes"] as Scope[]).map((item) => (
               <button
@@ -148,11 +148,11 @@ export function DownloadForm(props: Props) {
                 id="codes"
                 value={options.codes}
                 onChange={(event) => update("codes", event.target.value)}
-                placeholder="例如：600000，000001，920002"
+                placeholder={options.source === "baostock" ? "例如：600000，000001" : "例如：600000，589020，111024"}
                 rows={3}
                 className="form-control code-input"
               />
-              <p className="help-text">支持中文逗号、空格或换行，也可填写 sh600000。</p>
+              <p className="help-text">支持中文逗号、空格或换行，也可填写 sh600000。{options.source === "baostock" ? "仅支持沪深 A 股。" : "可混填 A 股、ETF 和可转债。"}</p>
             </div>
           )}
           {scope === "markets" && (

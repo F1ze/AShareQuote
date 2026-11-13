@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -295,6 +296,55 @@ func TestSecurityBarsWireAndDecode(t *testing.T) {
 	}
 	if bar.Date.Format("2006-01-02") != "2024-01-02" {
 		t.Fatalf("日期解码错误：%s", bar.Date)
+	}
+}
+
+func TestSecurityBarsFundAndBond(t *testing.T) {
+	for _, tc := range []struct {
+		code                          string
+		category, wireCategory, count int
+		date                          string
+		volume                        float64
+	}{
+		{"111024", 7, 7, 240, "2024-01-02 15:00", 51.2},
+		{"589020", 0, 0, 96, "2024-01-02 15:00", 5.12},
+		{"111024", 9, 4, 5, "2024-01-02 00:00", 51.2},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tc.code, tc.category), func(t *testing.T) {
+			host := startTestServer(t, func(conn net.Conn) error {
+				if err := serveTestHandshake(conn); err != nil {
+					return err
+				}
+				_, body, err := readTestFrame(conn)
+				if err != nil {
+					return err
+				}
+				if binary.LittleEndian.Uint16(body[2:4]) != 1 || string(body[4:10]) != tc.code ||
+					int(binary.LittleEndian.Uint16(body[10:12])) != tc.wireCategory ||
+					int(binary.LittleEndian.Uint16(body[16:18])) != tc.count {
+					t.Errorf("证券、周期或条数不匹配：%x", body)
+				}
+				response := []byte{1, 0}
+				if tc.wireCategory == 4 {
+					response = binary.LittleEndian.AppendUint32(response, 20240102)
+				} else {
+					response = binary.LittleEndian.AppendUint16(response, (2024-2004)<<11|102)
+					response = binary.LittleEndian.AppendUint16(response, 15*60)
+				}
+				response = appendTestPrice(response, 882)
+				response = append(response, 0, 0, 0)
+				response = binary.LittleEndian.AppendUint32(response, 0x44000000) // 原始量 512。
+				response = binary.LittleEndian.AppendUint32(response, 0)
+				return writeTestMessage(conn, ctBars, response, false)
+			})
+			client := NewClient([]Host{host}, time.Second, 0)
+			defer client.Close()
+			bars, err := client.SecurityBars(tc.category, 1, tc.code, 0, tc.count)
+			if err != nil || len(bars) != 1 || bars[0].Close != 0.882 || bars[0].Volume != tc.volume ||
+				bars[0].Date.Format("2006-01-02 15:04") != tc.date {
+				t.Fatalf("历史行情解码错误：%+v %v", bars, err)
+			}
+		})
 	}
 }
 

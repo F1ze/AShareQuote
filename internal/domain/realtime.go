@@ -29,21 +29,22 @@ type RealtimeQuote struct {
 type RealtimeTrade struct {
 	Time   string  `json:"time"`   // 源端交易时刻 HH:MM:SS，无交易日期，不与本地日期拼成伪时间。
 	Price  float64 `json:"price"`  // 差分还原后的成交价，元。
-	Volume int64   `json:"volume"` // 该记录成交量，手。
+	Volume int64   `json:"volume"` // 该记录成交量，保留源端单位。
 	Trades int64   `json:"trades"` // 该记录聚合的成交笔数。
 	Side   uint16  `json:"side"`   // 0 主动买、1 主动卖、2 中性、5 盘后；其他值保留未知。
 }
 
 type RealtimeSnapshot struct {
-	Quotes        []RealtimeQuote `json:"quotes"`        // 本轮有效报价，不包含上轮过期值。
-	Trades        []RealtimeTrade `json:"trades"`        // 仅当前选中股票的有限成交窗口。
-	Selected      string          `json:"selected"`      // 当前主屏证券的规范键，如 sh600036。
-	ReceivedAt    time.Time       `json:"receivedAt"`    // 本机收到快照的 UTC 时间，不是交易所行情时间。
-	LatencyMS     int64           `json:"latencyMs"`     // 上游快照读取耗时；缓存命中不改写该值。
-	Cached        bool            `json:"cached"`        // 是否复用了短时间缓存。
-	DetailStatus  string          `json:"detailStatus"`  // available/empty/unavailable/not_requested，仅表示扩展成交接口状态。
-	DetailMessage string          `json:"detailMessage"` // 失败、无数据或能力边界提示，不推断账户是否有权限。
-	L2Verified    bool            `json:"l2Verified"`    // 当前无十档或授权接口，恒为 false，禁止按有明细就设置 true。
+	Names         map[string]string `json:"names,omitempty"` // 按市场和代码标识的名称，包含本轮未返回报价的自选证券。
+	Quotes        []RealtimeQuote   `json:"quotes"`          // 本轮有效报价，不包含上轮过期值。
+	Trades        []RealtimeTrade   `json:"trades"`          // 仅当前选中股票的有限成交窗口。
+	Selected      string            `json:"selected"`        // 当前主屏证券的规范键，如 sh600036。
+	ReceivedAt    time.Time         `json:"receivedAt"`      // 本机收到快照的 UTC 时间，不是交易所行情时间。
+	LatencyMS     int64             `json:"latencyMs"`       // 上游快照读取耗时；缓存命中不改写该值。
+	Cached        bool              `json:"cached"`          // 是否复用了短时间缓存。
+	DetailStatus  string            `json:"detailStatus"`    // available/empty/unavailable/not_requested，仅表示扩展成交接口状态。
+	DetailMessage string            `json:"detailMessage"`   // 失败、无数据或能力边界提示，不推断账户是否有权限。
+	L2Verified    bool              `json:"l2Verified"`      // 当前无十档或授权接口，恒为 false，禁止按有明细就设置 true。
 }
 
 // RealtimeWatch 只保存自选配置，不含报价；用于可选桌面组件复用主页面订阅。

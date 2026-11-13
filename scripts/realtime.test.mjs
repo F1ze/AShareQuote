@@ -5,7 +5,7 @@ import ts from "../frontend/node_modules/typescript/lib/typescript.js"
 
 const source = fs.readFileSync(new URL("../frontend/src/lib/realtime.ts", import.meta.url), "utf8")
 const javascript = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
-const { carryRealtimeQuotes, retainRealtimeNames, retainRealtimeTrades } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`)
+const { carryRealtimeQuotes, retainRealtimeNames, retainRealtimeTrades, stockKey, realtimePrice } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`)
 const a = { market: 1, code: "600036", name: "招商银行", price: 43.01 }
 const b = { market: 0, code: "000001", name: "平安银行", price: 11.89 }
 const snapshot = { selected: "sh600036", quotes: [a, b], trades: [{ time: "10:00:03", price: 43.01 }], receivedAt: "2026-11-10T02:00:00Z", detailStatus: "available" }
@@ -45,4 +45,20 @@ test("仅成交字段变化或切股时替换成交窗口引用", () => {
   }
   const switched = { ...after, selected: "sz000001" }
   assert.equal(retainRealtimeTrades(before, switched), switched)
+})
+
+test("实时自选自动识别沪深 ETF 和转债，价格保留有效小数位", () => {
+  for (const [code, key] of [["111024", "sh111024"], ["589020", "sh589020"], ["159915", "sz159915"], ["123001", "sz123001"], ["920002", "bj920002"]]) {
+    assert.equal(stockKey(code), key)
+  }
+  assert.equal(realtimePrice(0.882), "0.882")
+  assert.equal(realtimePrice(218.4557), "218.4557")
+  assert.equal(realtimePrice(42.6), "42.60")
+})
+
+test("没有报价的自选证券仍可显示异步补齐的名称", () => {
+  const codes = ["sh111024", "sh589020"]
+  const result = retainRealtimeNames({}, { ...snapshot, quotes: [], names: { sh111024: "澳弘转债", sh589020: "KC半导体" } }, codes)
+  assert.deepEqual(result.names, { sh111024: "澳弘转债", sh589020: "KC半导体" })
+  assert.deepEqual(result.data.quotes, [])
 })

@@ -4,12 +4,11 @@ import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YA
 import { api } from "@/lib/api"
 import { WatchlistTable } from "@/components/WatchlistTable"
 import { useRealtime } from "@/hooks/useRealtime"
-import { priceChange, quoteKey, readWatch, realtimeClock, stockKey } from "@/lib/realtime"
+import { priceChange, quoteKey, readWatch, realtimeClock, realtimePrice as price, stockKey } from "@/lib/realtime"
 import type { RealtimeSnapshot } from "@/types"
 import { OrderBook } from "@/components/OrderBookRow"
 
 const number = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 })
-const price = (value?: number) => value && Number.isFinite(value) ? value.toFixed(2) : "—"
 const change = (value: number | null) => value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`
 const tone = (value: number | null) => value === null || value === 0 ? "rt-neutral" : value > 0 ? "rt-up" : "rt-down"
 type Trade = RealtimeSnapshot["trades"][number]
@@ -35,7 +34,7 @@ export const RealtimeBoard = memo(function RealtimeBoard() {
   const add = (event: React.FormEvent) => {
     event.preventDefault()
     const key = stockKey(input)
-    if (!key) { setValidation("请输入六位 A 股代码，例如 600036、sz000001、bj920002。"); return }
+    if (!key) { setValidation("请输入六位证券代码，例如 600036、589020、111024。"); return }
     if (codes.includes(key)) { setSettings({ ...settings, selected: key }); setInput(""); setValidation(""); return }
     if (codes.length >= 20) { setValidation("最多监控 20 只股票，请先移除一只。"); return }
     setSettings({ ...settings, codes: [...codes, key], selected: key }); setInput(""); setValidation("")
@@ -61,7 +60,7 @@ export const RealtimeBoard = memo(function RealtimeBoard() {
     {error && <div role="alert" className="notice notice-warn"><CircleAlert className="size-4 shrink-0" /><span>{error}。{data ? "下方保留上次数据，已过期；" : "尚未取得行情；"}将自动退避重试，可检查顶部代理与站点。</span></div>}
     <div className="rt-layout">
       <section className="rt-main rt-card" aria-label="当前股票主屏">
-        <div className="rt-card-title"><div><span className="eyebrow">FOCUS / 当前股票</span><h2>{current?.name || names[selected] || "名称待补充"} <small>{selected.toUpperCase()}</small></h2></div><span className="rt-tag">{loading ? "刷新中" : paused ? "已暂停" : error ? "旧数据" : current ? "五档快照" : "等待行情"}</span></div>
+        <div className="rt-card-title"><div><span className="eyebrow">FOCUS / 当前证券</span><h2>{current?.name || names[selected] || "名称待补充"} <small>{selected.toUpperCase()}</small></h2></div><span className="rt-tag">{loading ? "刷新中" : paused ? "已暂停" : error ? "旧数据" : current ? "五档快照" : "等待行情"}</span></div>
         <div className="rt-price-block"><strong className={tone(movement)}>{price(current?.price)}</strong><span className={tone(movement)}>{change(movement)}</span><small>较昨收 {price(current?.lastClose)} 元</small></div>
         <div className="rt-metrics">{[["开盘", price(current?.open)], ["最高", price(current?.high)], ["最低", price(current?.low)], ["成交量 / 手", current ? number.format(current.volume) : "—"], ["成交额 / 万元", current ? number.format(current.amount / 10000) : "—"]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</div>
         <div className="rt-chart-heading"><h3>成交窗口走势</h3><span>最近至多 200 条 · 非全天分时</span></div>
@@ -82,21 +81,21 @@ export const RealtimeBoard = memo(function RealtimeBoard() {
           const popup = window.open(url, "qflux-widget", "popup,width=440,height=320,resizable=yes")
           if (!popup) setValidation("浏览器阻止了独立窗口，请允许此站点弹出窗口后重试。")
         }}><PanelsTopLeft className="size-3.5" />轻量窗口</button></div>
-        <form onSubmit={add} className="rt-add"><label htmlFor="watch-code" className="sr-only">添加股票代码</label><input id="watch-code" className="form-control" value={input} onChange={(event) => setInput(event.target.value)} placeholder="股票代码，如 600036" maxLength={16} /><button type="submit" className="secondary-button" aria-label="添加监控股票"><Plus className="size-4" /></button></form>
+        <form onSubmit={add} className="rt-add"><label htmlFor="watch-code" className="sr-only">添加股票代码</label><input id="watch-code" className="form-control" value={input} onChange={(event) => setInput(event.target.value)} placeholder="证券代码，如 600036、589020" maxLength={16} /><button type="submit" className="secondary-button" aria-label="添加监控股票"><Plus className="size-4" /></button></form>
         {validation && <p role="alert" className="rt-validation">{validation}</p>}
         <WatchlistTable names={names} codes={codes} selected={selected} quotes={quotes} receivedAt={data?.receivedAt} paused={paused} loading={loading} error={error} onSelect={(key) => setSettings({ ...settings, selected: key })} onRemove={remove} />
       </section>
       <section className="rt-tape rt-card" aria-label="扩展成交明细">
         <div className="rt-card-title"><h3>扩展成交明细 <small>{selected.toUpperCase()}</small></h3><span className="rt-tag">{data?.detailStatus === "available" ? `${trades.length} 条窗口` : "五档降级"}</span></div>
         <p className="rt-muted">{data?.detailMessage || "正在尝试读取扩展成交接口，不据此认定完整 L2 权限。"}</p>
-        <div className="rt-tape-scroll"><table><thead><tr><th>源端时间</th><th>成交价 / 元</th><th>成交量 / 手</th><th>聚合笔数</th><th>方向</th></tr></thead><tbody>{trades.length ? <TradeRows trades={trades} /> : <tr><td colSpan={5} className="rt-empty-cell">{loading ? "正在读取…" : "暂无明细；五档快照和自选监控独立可用"}</td></tr>}</tbody></table></div>
+        <div className="rt-tape-scroll"><table><thead><tr><th>源端时间</th><th>成交价 / 元</th><th>成交量 / 源端单位</th><th>聚合笔数</th><th>方向</th></tr></thead><tbody>{trades.length ? <TradeRows trades={trades} /> : <tr><td colSpan={5} className="rt-empty-cell">{loading ? "正在读取…" : "暂无明细；五档快照和自选监控独立可用"}</td></tr>}</tbody></table></div>
       </section>
     </div>
   </main>
 })
 
 const TradeChart = memo(function TradeChart({ trades }: { trades: Trade[] }) {
-  return <ResponsiveContainer width="100%" height="100%"><AreaChart data={trades} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}><defs><linearGradient id="rt-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#a7b6ff" stopOpacity={0.3} /><stop offset="100%" stopColor="#a7b6ff" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#29384f" strokeDasharray="3 6" vertical={false} /><XAxis dataKey="time" minTickGap={65} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["auto", "auto"]} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip isAnimationActive={false} contentStyle={{ background: "#131e2e", borderColor: "#3d506d", borderRadius: 8 }} formatter={(value) => [Number(value).toFixed(2), "成交价 / 元"]} /><Area type="linear" dataKey="price" stroke="#a7b6ff" strokeWidth={2} fill="url(#rt-fill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
+  return <ResponsiveContainer width="100%" height="100%"><AreaChart data={trades} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}><defs><linearGradient id="rt-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#a7b6ff" stopOpacity={0.3} /><stop offset="100%" stopColor="#a7b6ff" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#29384f" strokeDasharray="3 6" vertical={false} /><XAxis dataKey="time" minTickGap={65} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["auto", "auto"]} tick={{ fill: "#8c9eb8", fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip isAnimationActive={false} contentStyle={{ background: "#131e2e", borderColor: "#3d506d", borderRadius: 8 }} formatter={(value) => [price(Number(value)), "成交价 / 元"]} /><Area type="linear" dataKey="price" stroke="#a7b6ff" strokeWidth={2} fill="url(#rt-fill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
 })
 
 const TradeRows = memo(function TradeRows({ trades }: { trades: Trade[] }) {

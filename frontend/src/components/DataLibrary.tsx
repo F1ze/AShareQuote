@@ -190,7 +190,7 @@ export function DataLibrary({ outputDir, active, onTaskStarted }: Props) {
                 <span>
                   待补上市日期 {number.format(status?.instrumentsWithoutListingDate || 0)} 只
                 </span>
-                <span>成交量：股 · 价格/成交额：元</span>
+                <span>成交量：股 / 份 / 张 · 价格/成交额：元</span>
               </div>
             </div>
           </section>

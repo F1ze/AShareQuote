@@ -22,6 +22,39 @@ type RealtimeNames interface {
 	SecurityNames(context.Context, []domain.Security) (map[string]string, error)
 }
 
+// RealtimeNameFallback 返回当前缓存的名称，缺失时可异步补齐。
+type RealtimeNameFallback interface {
+	Names([]domain.Security) map[string]string
+}
+
+type realtimeNameLookup struct {
+	local    RealtimeNames        // 优先读取本地证券参考信息。
+	fallback RealtimeNameFallback // 仅补充本地缺失的名称。
+}
+
+func WithRealtimeNameFallback(local RealtimeNames, fallback RealtimeNameFallback) RealtimeNames {
+	return realtimeNameLookup{local: local, fallback: fallback}
+}
+
+func (n realtimeNameLookup) SecurityNames(ctx context.Context, stocks []domain.Security) (map[string]string, error) {
+	names, err := n.local.SecurityNames(ctx, stocks)
+	if err != nil || names == nil {
+		names = make(map[string]string)
+	}
+	var missing []domain.Security
+	for _, stock := range stocks {
+		if strings.TrimSpace(names[domain.MarketPrefix(stock.Market)+stock.Code]) == "" {
+			missing = append(missing, stock)
+		}
+	}
+	if len(missing) > 0 && ctx.Err() == nil {
+		for key, name := range n.fallback.Names(missing) {
+			names[key] = name
+		}
+	}
+	return names, nil
+}
+
 type realtimeEntry struct {
 	snapshot domain.RealtimeSnapshot // 构建后只读，返回 JSON 时不再修改其切片。
 	at       time.Time               // 缓存完成时间；不使用它替换源端实际接收时间。
@@ -47,7 +80,7 @@ func ParseRealtimeSelection(codes, selected string) ([]domain.Security, domain.S
 	}
 	stocks, err := domain.ParseCodes(codes)
 	if err != nil || len(stocks) == 0 || len(stocks) > 20 {
-		return nil, domain.Security{}, fmt.Errorf("请填写 1–20 只有效 A 股代码")
+		return nil, domain.Security{}, fmt.Errorf("请填写 1–20 只有效证券代码")
 	}
 	current, err := domain.ParseCodes(selected)
 	if err != nil || len(current) != 1 {
@@ -55,8 +88,8 @@ func ParseRealtimeSelection(codes, selected string) ([]domain.Security, domain.S
 	}
 	found := false
 	for _, stock := range stocks {
-		if !domain.IsAShare(stock) {
-			return nil, domain.Security{}, fmt.Errorf("%s 不是支持的 A 股代码", stock.Code)
+		if !domain.IsTDXInstrument(stock) {
+			return nil, domain.Security{}, fmt.Errorf("%s 不属于支持的 A 股、ETF 或可转债号段", stock.Code)
 		}
 		if stock.Market == current[0].Market && stock.Code == current[0].Code {
 			found = true
@@ -145,6 +178,7 @@ func (s *RealtimeService) snapshot(ctx context.Context, stocks []domain.Security
 	if s.names != nil {
 		names, e := s.names.SecurityNames(ctx, stocks)
 		if e == nil {
+			result.Names = names
 			for i := range quotes {
 				quotes[i].Name = names[domain.MarketPrefix(quotes[i].Market)+quotes[i].Code]
 			}

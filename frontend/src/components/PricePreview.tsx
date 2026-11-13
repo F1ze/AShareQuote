@@ -16,7 +16,7 @@ export function PricePreview({ file, onOpenChange, warehouseDataset }: { file: s
         <div className="metadata">行情预览</div>
         <SheetTitle className="break-all font-mono text-lg font-medium">{file || "行情预览"}</SheetTitle>
         <SheetDescription className="text-sm text-[var(--text-secondary)]">
-          {warehouseDataset ? "DuckDB 原始价 · 成交量单位：股" : "复权基于全部历史实时计算，原始 CSV 保持不变 · 成交量单位：手"} · 价格与成交额单位：元
+          {warehouseDataset ? "DuckDB 原始价 · 成交量单位：股 / 份 / 张" : "复权基于全部历史实时计算，原始 CSV 保持不变 · 成交量单位：百股 / 百份 / 百张"} · 价格与成交额单位：元
         </SheetDescription>
       </SheetHeader>
       {file && <PreviewLoader key={`${file}:${warehouseDataset?.period || "csv"}`} file={file} dataset={warehouseDataset} />}

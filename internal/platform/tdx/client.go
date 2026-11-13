@@ -364,6 +364,11 @@ func (c *Client) SecurityBars(category int, market uint8, code string, start, co
 	if len(code) != 6 || count < 1 || count > 800 || start < 0 || start > 65535 || count > 65536-start || category < 0 || category > 12 || market > 2 {
 		return nil, fmt.Errorf("K 线参数无效：单次数量须为 1–800，历史位置不得超出 0–65535")
 	}
+	security := Security{Market: market, Code: code}
+	isETF, isBond := domain.IsETF(security), domain.IsConvertibleBond(security)
+	if (isETF || isBond) && category == 9 {
+		category = 4 // ETF 和转债使用脚本已验证的日线周期；归档周期仍统一为 day。
+	}
 	payload := make([]byte, 26)
 	binary.LittleEndian.PutUint16(payload, uint16(market))
 	copy(payload[2:8], code)
@@ -423,7 +428,16 @@ func (c *Client) SecurityBars(category int, market uint8, code string, start, co
 		high := open + dHigh
 		low := open + dLow
 		base = closePrice
-		out = append(out, Bar{Date: date, Open: float64(open) / 1000, Close: float64(closePrice) / 1000, High: float64(high) / 1000, Low: float64(low) / 1000, Volume: decodeVolume(volumeRaw), Amount: decodeVolume(amountRaw)})
+		volume := decodeVolume(volumeRaw)
+		// 按每 100 个证券单位归档。0x052D 的 ETF 量已是份，转债量是 10 张一手。
+		// 用同日 0x053E 与 K 线量额交叉核对过，不能把转债原始量直接当张。
+		switch {
+		case isETF:
+			volume /= 100
+		case isBond:
+			volume /= 10
+		}
+		out = append(out, Bar{Date: date, Open: float64(open) / 1000, Close: float64(closePrice) / 1000, High: float64(high) / 1000, Low: float64(low) / 1000, Volume: volume, Amount: decodeVolume(amountRaw)})
 	}
 	return out, nil
 }

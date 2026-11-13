@@ -22,7 +22,7 @@ type Receipt struct {
 	From       string `json:"from"`       // 文件实际最早市场时间，YYYY-MM-DD HH:MM。
 	To         string `json:"to"`         // 文件实际最晚市场时间，不能从请求终点推定。
 	SHA256     string `json:"sha256"`     // CSV 实际字节的 SHA-256 十六进制值；入库和恢复均核对该值。
-	VolumeUnit string `json:"volumeUnit"` // 标准归档固定为 lots_100_shares，仓库据此换算为股。
+	VolumeUnit string `json:"volumeUnit"` // 标准归档固定为 lots_100_shares，仓库据此换算为股、份或张。
 }
 
 // Input 固定本地任务的一项输入；它保存路径而非文件内容，读取时仍需校验文件。

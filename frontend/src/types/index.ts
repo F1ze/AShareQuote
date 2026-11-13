@@ -211,6 +211,7 @@ export interface RealtimeTrade {
   side: number
 }
 export interface RealtimeSnapshot {
+  names?: Record<string, string>
   selected: string
   quotes: RealtimeQuote[]
   trades: RealtimeTrade[]

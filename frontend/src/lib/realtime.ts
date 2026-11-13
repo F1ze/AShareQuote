@@ -1,5 +1,9 @@
 import type { RealtimeQuote, RealtimeSnapshot } from "@/types"
 
+// 保留转债快照的第四位和 ETF/逐笔的第三位，股票仍至少显示两位。
+const priceFormat = new Intl.NumberFormat("zh-CN", { useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 4 })
+export const realtimePrice = (value?: number) => value && Number.isFinite(value) ? priceFormat.format(value) : "—"
+
 const clock = new Intl.DateTimeFormat("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
 
 export function realtimeClock(value?: string) {
@@ -17,7 +21,7 @@ export function stockKey(input: string): string | null {
   const match = /^(?:(sh|sz|bj))?(\d{6})$/.exec(text)
   if (!match) return null
   const code = match[2]
-  const market = match[1] || (/^[689]/.test(code) ? (/^[89]/.test(code) ? "bj" : "sh") : /^4/.test(code) ? "bj" : "sz")
+  const market = match[1] || (/^(920|[48])/.test(code) ? "bj" : /^(11|[569])/.test(code) ? "sh" : "sz")
   return `${market}${code}`
 }
 
@@ -47,7 +51,10 @@ export function carryRealtimeQuotes(previous: RealtimeSnapshot | null, codes: st
 // 名称是稳定元数据，不随某一轮报价缺失/名称查询失败而删除；按市场+代码匹配，禁止串股。
 export function retainRealtimeNames(previous: Readonly<Record<string, string>>, next: RealtimeSnapshot, codes: string[]) {
   const names: Record<string, string> = {}
-  for (const key of codes) if (previous[key]) names[key] = previous[key]
+  for (const key of codes) {
+    const name = next.names?.[key]?.trim() || previous[key]
+    if (name) names[key] = name
+  }
   for (const quote of next.quotes) if (codes.includes(quoteKey(quote)) && quote.name?.trim()) names[quoteKey(quote)] = quote.name.trim()
   return { names, data: { ...next, quotes: next.quotes.map((quote) => ({ ...quote, name: names[quoteKey(quote)] || "" })) } }
 }

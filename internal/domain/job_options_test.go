@@ -8,7 +8,7 @@ import (
 )
 
 func TestParseCodes(t *testing.T) {
-	codes, err := ParseCodes("600000，sz000001；bj430047, 600000\n000002、920002")
+	codes, err := ParseCodes("600000，sz000001；bj430047, 600000,111024,589020\n000002、920002")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,18 +16,20 @@ func TestParseCodes(t *testing.T) {
 	for i, code := range codes {
 		got[i] = MarketPrefix(code.Market) + code.Code
 	}
-	want := []string{"sz000001", "sz000002", "sh600000", "bj430047", "bj920002"}
+	want := []string{"sz000001", "sz000002", "sh111024", "sh589020", "sh600000", "bj430047", "bj920002"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("代码识别错误：got %v want %v", got, want)
 	}
 }
 
-func TestAShareOnlyOptionsUseFullStockRanges(t *testing.T) {
+func TestTDXExplicitCodesWithASharesOnly(t *testing.T) {
 	for _, tc := range []struct {
 		code  string
 		valid bool
 	}{
 		{"302132", true}, {"sz004001", true}, {"sz001000", true},
+		{"111024", true}, {"589020", true}, {"sz123001", true}, {"159915", true},
+		{"sz111024", false}, {"sz589020", false}, {"sh519001", false}, {"159900", false},
 		{"sz001001", false}, {"sz001199", false}, {"sz309800", false}, {"sh689009", false}, {"bj889001", false},
 	} {
 		t.Run(tc.code, func(t *testing.T) {

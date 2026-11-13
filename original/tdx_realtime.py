@@ -9,6 +9,7 @@
 3. 全链路只用标准库；连接、解析、差分、输出四层分开，便于替换。
 
 安全边界：只读网络，不碰安装目录；主机表来自 connect.cfg（spec.json 可现造）。
+帧、握手、记录编解码与价格分母全在 tdx_client，这里只负责池化、调度、差分与落盘。
 
 用法：
     python tdx_realtime.py probe-l2                        # 探测本服是否给 L2
@@ -23,7 +24,6 @@ import json
 import os
 import queue
 import random
-import socket
 import struct
 import sys
 import threading
@@ -168,8 +168,13 @@ def cmd_l2_check(args):
 
     # 在线回包必须完全盖住文件的时间窗，这段才可比
     live_lo, live_hi = _tick_order_key(min(live, key=_tick_order_key)),         _tick_order_key(max(live, key=_tick_order_key)) if live else (lo, lo)
-    live_cover = bool(live) and live_lo <= lo and live_hi >= hi
-    live_sum = sum(r["vol"] for r in live if lo <= _tick_order_key(r) <= hi)
+    live_cover = bool(live) and live_lo <= hi and live_hi >= lo
+    inter_lo, inter_hi = max(lo, live_lo), min(hi, live_hi)
+    covered = sum(1 for r in recs if inter_lo <= _tick_order_key(r) <= inter_hi)
+    if live_cover and covered < 0.9 * len(recs):
+        live_cover = False                    # 只盖住一小段就不算可比
+    live_sum = sum(r["vol"] for r in live if inter_lo <= _tick_order_key(r) <= inter_hi)
+    file_sum = sum(r["vol"] for r in recs if inter_lo <= _tick_order_key(r) <= inter_hi)
 
     try:
         base = day_volume(args.market, args.code.encode("ascii"))
@@ -192,34 +197,10 @@ def cmd_l2_check(args):
     return 0 if ok else 1
 
 
-# ---------------------------------------------------------------- 命令字
-
-CT_SNAPSHOT = 0x053E      # L1 快照（五档）：请求 12 字节前缀 + 7n，记录 56 字节
-CT_TICK = 0x0FC5          # L2 逐笔成交
-CT_ORDER = 0x0FC2         # L2 逐笔成交（带 3 秒时标，0FC5 是同一路的分钟版）
-CT_MINUTE = 0x051D        # 当日分时（一分钟一点）
-
-# 快照帧头：catword 0x0218 / ver 0x0093 / flag 0，被本服接受（37 章实测）。
-SNAP_CAT, SNAP_VER, SNAP_FLAG = 0x0218, 0x0093, 0
-# 逐笔族帧头：客户端真包是 0C 01 08 00 03 01，即 catword 0x0801 / ver 0x0300 / flag 1。
-# 旧值 0x0817 / 0x0101（3.5 的模板）在本服一帧不回，别改回去。
-TICK_CAT, TICK_VER, TICK_FLAG = 0x0801, 0x0300, 1
-
-SNAP_PREFIX = b"\x05\x00\x00\x00" + b"\x00\x00\x00\x00"   # 4 字节魔数 + 4 个零
-# 请求体末尾还要两个字节 0C 01（客户端原包同值）。位置在**证券表之后**，
-# 放到数量后面不会报错但服务端会按错位解析：代码只认末位、回包恒 600839 且错一条都是它导致的。
-SNAP_TAIL = b"\x0c\x01"
-SNAP_REC = 56                                              # 全零记录的固定长度，有值的记录是变长的
-
-HS1 = bytes.fromhex("0c0218930001030003000d0001")      # Setup1（有应答）
-HS2 = bytes.fromhex("0c0218940001030003000d0002")      # Setup2（有应答）
-HS3 = bytes.fromhex("0c0318990001200020000fdbd5d0c9ccd6a4a8af0000008fc22540130000d500c9ccbdf0d7ea00000002")
-
 BATCH_MAX = 80            # 单请求品种数上限（56 字节/只，回包约 4.5 KB）
 TICK_WINDOW = 50          # 采集器内轮询用的逐笔条数：客户端成交明细一次就要 115 条，50 够一轮不漏
 TICK_WINDOW_FRESH = 200   # 增量尾随用的窗口：活跃票一秒能出几十笔，窗口给足才不漏
 TICK_SEEN_MAX = 4000      # 每只记住的已见签名上限
-CALL_TRIES = 3            # 一次调用最多试几台主机：本服有成片"连上即关"的机器
 TICK_SEEN_MAX = 800       # 每只记多少条成交签名用于去重
 WATCH_DEFAULT = "watch.txt"
 
@@ -269,328 +250,56 @@ class Stats(object):
             }
 
 
-# ---------------------------------------------------------------- 价格与成交量解码
-
-def read_varint(buf, pos):
-    """带符号可变长整数，第一字节低 6 位起算：0x40 是符号位、0x80 是续位，随后每字节 7 位。
-
-    与 tdx_client.get_price 同一套编码（首字节只给 6 位），别按常见的 7 位 LEB128 实现。
-    """
-    n = buf[pos]
-    val = n & 0x3F
-    neg = bool(n & 0x40)
-    shift = 6
-    while n & 0x80:
-        pos += 1
-        n = buf[pos]
-        val += (n & 0x7F) << shift
-        shift += 7
-    pos += 1
-    return (-val if neg else val), pos
-
-
-def read_float4(buf, pos):
-    """4 字节对数浮点（成交量族）：与 K 线同一套编码。"""
-    raw = struct.unpack_from("<I", buf, pos)[0]
-    if raw == 0:                                          # 零点数据别解成 5.9e-39
-        return 0.0, pos + 4
-    return T.get_volume(raw), pos + 4
-
-
-# ---------------------------------------------------------------- 解析：快照
-
-# 记录字段顺序（用真实快照对齐过：基准价 1174 分 = 11.74 元、最高 1186、最低 1168、量 1437905 手、
-# 额 1689184000 元，与当日日线逐项吻合）。价格是相对基准价的差分，单位是**分**（1/100 元），不是千分之一。
-# 第 2 个 varint（amount_cents 之后的 skip1）语义未定，先留着；记录尾部还有 2 个原始字节与 4 个跳过位。
-SNAP_FIELDS = (
-    ("active", "u16"),
-    ("price", "price"),
-    ("last_close", "price"),
-    ("open", "price"),
-    ("high", "price"),
-    ("low", "price"),
-    ("amount_hundred", "varint"),
-    ("skip1", "varint"),
-    ("vol", "varint"),
-    ("cur_vol", "varint"),
-    ("amount", "float4"),
-    ("s_vol", "varint"),
-    ("b_vol", "varint"),
-    ("skip2", "varint"),
-    ("skip3", "varint"),
-)
-for _lvl in range(1, 6):
-    SNAP_FIELDS += (("bid%d" % _lvl, "price"), ("ask%d" % _lvl, "price"),
-                    ("bid_vol%d" % _lvl, "varint"), ("ask_vol%d" % _lvl, "varint"))
-SNAP_FIELDS += (("raw2", "raw2"), ("skip4", "varint"), ("skip5", "varint"),
-                ("skip6", "varint"), ("skip7", "varint"),
-                ("speed", "i16"), ("active2", "u16"))
-
-PRICE_SCALE = 100.0     # 快照价单位是分
-
-
-def parse_snapshot(body, want):
-    """解析 0x053E 应答。
-
-    body: 4 字节头（01 01 / u16 只数），随后每只一条记录：市场 u8 + 代码 6s + 字段。
-    want: 请求里的 [(market, code)]，顺序即回包顺序。头部之后第 k 条就是请求第 k 只，
-          回包的码也确实是它（实测 24 只双市场全对），want 只用来兜底改写。
-
-    记录是变长的（价量都是 varint，全零时 56 字节、带真实值 81 字节），所以从记录起点顺序推进。
-    单条坏了不影响后面的：捕获异常后整条标记 _truncated，位置由调用方按消费到的位置续。
-    """
-    if len(body) < 4:
-        return []
-    num = struct.unpack_from("<H", body, 2)[0]
-    out = []
-    pos = 4
-    for i in range(num):
-        start = pos
-        mkt = body[start]
-        code = body[start + 1:start + 7].decode("ascii", "replace")
-        if i < len(want):                                  # 按请求顺序回填，回包码只作核对
-            mkt, code = want[i][0], want[i][1].decode("ascii", "replace")
-        rec = {"market": mkt, "code": code}
-        pos = start + 7
-        base = 0
-        try:
-            for name, kind in SNAP_FIELDS:
-                if kind == "u16":
-                    rec[name] = struct.unpack_from("<H", body, pos)[0]
-                    pos += 2
-                elif kind == "i16":
-                    rec[name] = struct.unpack_from("<h", body, pos)[0] / 100.0
-                    pos += 2
-                elif kind == "raw2":
-                    rec[name] = body[pos:pos + 2].hex()
-                    pos += 2
-                elif kind == "float4":
-                    rec[name], pos = read_float4(body, pos)
-                elif kind == "varint":
-                    rec[name], pos = read_varint(body, pos)
-                else:
-                    delta, pos = read_varint(body, pos)
-                    if name == "price":
-                        base = delta                           # 基准价自身
-                        rec[name] = delta / PRICE_SCALE
-                    else:
-                        rec[name] = (base + delta) / PRICE_SCALE
-            rec["ts"] = time.time()
-        except (IndexError, struct.error):
-            rec["_truncated"] = True
-        out.append(rec)
-    return out
-
-
-# ---------------------------------------------------------------- 解析：逐笔
-
-def parse_tick(body):
-    """解析 0x0FC5 逐笔成交。体是 u16 条数，随后每条：
-
-        u16 时间（当日分钟数） / 价 varint / 量 varint / 笔数 varint / u16 方向
-
-    价是**差分**：0 表示与上一条相同，0x40 位是负号，单位分；第一条是绝对值。
-    量单位手，笔数是这一跳聚合的成交笔数，方向 u16 取 0 主动买 / 1 主动卖 /
-    2 中性 / 5 盘后固定价格（15:00 之后那批价格不动、全是 5）。
-    布局是用 200 条样本回溯出来的：整段恰好消费完 1472 字节，一条不多一条不少，
-    所以尾部那个 u16 不能省，省了后面全错位。
-    """
-    if len(body) < 2:
-        return []
-    num = struct.unpack_from("<H", body, 0)[0]
-    out = []
-    pos = 2
-    px = 0
-    for _ in range(num):
-        if pos + 4 > len(body):
-            break
-        tmin = struct.unpack_from("<H", body, pos)[0]
-        dp, pos2 = read_varint(body, pos + 2)
-        px += dp
-        vol, pos3 = read_varint(body, pos2)
-        cnt, pos4 = read_varint(body, pos3)
-        side = struct.unpack_from("<H", body, pos4)[0] if pos4 + 2 <= len(body) else 2
-        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, 0),
-                    "price": px / PRICE_SCALE, "vol": vol, "trades": cnt, "side": side})
-        pos = pos4 + 2
-    return out
-
-
-def parse_order(body):
-    """解析 0x0FC2。它是 0FC5 同一条成交流的细时标版：每条**末尾**多一个字节，那字节是秒。
-
-        u16 时间(分) / 价 varint（同上，0 与上一条相同） / 量 varint / 笔数 varint / u16 方向 / u8 秒
-
-    证据是条数守恒：3 条回 27 字节 = 2 + 3×8，6 条回 52 = 2 + 6×8，多出来那一字节落在每条末尾。
-    该字节是 0 到 59、相邻恒差 3 的秒（3600 条里 0 条越界，97% 以上相邻差正好 3，跨 60 回卷），
-    即时间是 3 秒粒度：t 输出到秒，sec 另给一份原值。与 0FC5 逐条比 1200 条，价格/量/方向完全一致。
-    """
-    if len(body) < 2:
-        return []
-    num = struct.unpack_from("<H", body, 0)[0]
-    out = []
-    pos = 2
-    px = 0
-    for _ in range(num):
-        if pos + 5 > len(body):
-            break
-        tmin = struct.unpack_from("<H", body, pos)[0]
-        dp, pos2 = read_varint(body, pos + 2)
-        px += dp
-        vol, pos3 = read_varint(body, pos2)
-        cnt, pos4 = read_varint(body, pos3)
-        side = struct.unpack_from("<H", body, pos4)[0] if pos4 + 2 <= len(body) else 2
-        sec = body[pos4 + 2] if pos4 + 2 < len(body) else 0
-        out.append({"t": "%02d:%02d:%02d" % (tmin // 60, tmin % 60, sec),
-                    "price": px / PRICE_SCALE, "vol": vol, "trades": cnt,
-                    "side": side, "sec": sec, "kind_code": sec})
-        pos = pos4 + 3
-    return out
-
 # ---------------------------------------------------------------- 连接工人
 
 class Worker(threading.Thread):
-    """一个工人 = 一条长连接 + 一条任务队列。
+    """一个工人 = 一条客户端连接 + 一条任务队列。
 
-    任务是一批 (market, code) 与一个回填回调。出错就地重连，退避 0.2s 起翻倍，封顶 5s；
-    连续失败到上限就绪后由调度器降并发。连接复用是延迟的关键：不要每批新建连接。
+    协议、握手、帧全在 tdx_client；这里只管排队、退避与主机簿记。
+    出错就地换机重连，退避 0.2s 起翻倍、封顶 5s。
     """
 
+    # ---- 连接与取数：协议全在 tdx_client，这里只留池子侧的簿记 ----
     def __init__(self, pool, idx):
-        threading.Thread.__init__(self)
-        self.daemon = True
+        threading.Thread.__init__(self, daemon=True)
         self.pool = pool
         self.idx = idx
-        self.q = queue.Queue(maxsize=8)
-        self.sock = None
+        self.q = queue.Queue()
+        self.stop = pool.stop
         self.backoff = 0.2
         self.host = None
+        self.conn = T.TdxConnection(hosts=pool.hosts(), timeout=pool.timeout,
+                                    on_ban=self._on_ban)
 
-    # ---- 连接 ----
-    # 实测：连上后只要稍有停歇，服务端就关连接（复用第一次就 closed），
-    # 所以每个批次都新建连接；握手三条帧与业务帧**一次发出**（流水线），只留一个 RTT。
-    def _connect(self):
-        last = None
-        for host, port in self.pool.hosts():
-            try:
-                s = socket.create_connection((host, port), timeout=self.pool.timeout)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.sock = s
-                self.host = host
-                self.pool.stats.bump("connects")
-                return
-            except Exception as exc:                      # noqa: BLE001
-                last = exc
-                self._drop()
-        raise RtdError("全部主机连不上: %r" % (last,))
+    def _on_ban(self, host):
+        """客户端换了台主机，池子这把表也挪一下队尾。"""
+        self.host = host
+        self.pool.ban(host)
 
     def _drop(self):
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
+        self.conn._close()
 
-    def _recv_exact(self, n):
-        buf = b""
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise RtdError("连接被关闭")
-            buf += chunk
-        return buf
-
-    def _read_message(self):
-        head = self._recv_exact(16)
-        ct = struct.unpack_from("<H", head, 10)[0]
-        zipsize, unzipsize = struct.unpack_from("<HH", head, 12)
-        raw = self._recv_exact(zipsize) if zipsize else b""
-        if zipsize != unzipsize:
-            import zlib
-            raw = zlib.decompress(raw)
-        return ct, raw
-
-    def _call(self, ct, payload, cat, ver, flag, extra=0, tries=CALL_TRIES):
-        """一次调用 = 一次连接，失败换主机重来。
-
-        有些主机接受连接后立刻关闭（实测 41.6），撞上必报"连接被关闭"。
-        这种关闭发生在 TCP 建连成功之后，_connect 的循环发现不了，所以必须在这一层重试：
-        每次失败把当前主机挪到队尾，重试用尽才把异常抛给调用方。
-        """
-        last = None
-        for i in range(tries):
-            try:
-                return self._call_once(ct, payload, cat, ver, flag, extra)
-            except (RtdError, OSError) as exc:
-                last = exc
-                self._drop()
-                if self.host:
-                    self.pool.ban(self.host)
-                self.pool.stats.bump("retries")
-                if i + 1 < tries:
-                    time.sleep(0.15 * (i + 1))
-        raise last
-
-    def _call_once(self, ct, payload, cat, ver, flag, extra=0):
-        """单次尝试：连接 -> 握手三帧与业务帧同发 -> 按 commtype 认领业务应答。
-
-        extra 是声明长度比实际体多出的字节数。逐笔族（0x0FC5）客户端声明的是体长加 2，
-        少这两字节服务端就一直等，一个字节都不回，所以 extra 只给逐笔用。
-        """
-        if self.sock is None:
-            self._connect()
-        declared = len(payload) + extra
-        frame = (b"\x0c" + struct.pack("<HHBHH", cat, ver, flag, declared, declared)
-                 + struct.pack("<H", ct) + payload)
-        t0 = time.time()
-        self.sock.sendall(HS1 + HS2 + HS3 + frame)
-        # 握手应答条数不固定（实测 1 到 2 条），所以不预读，统一按 commtype 认领业务应答。
-        for _ in range(8):                                # 丢弃握手应答与夹带推送
-            got_ct, body = self._read_message()
-            if got_ct == ct:
-                self.pool.stats.add_rtt((time.time() - t0) * 1000)
-                return body
-        raise RtdError("commtype 不匹配（期望 0x%04X）" % ct)
-
-    # ---- 业务 ----
+    # 委派给客户端，保持原来的调用名
     def snapshot(self, stocks):
-        """取快照。请求体：前缀 + 数量 + 证券表 + 0C 01，回包记录按请求顺序一条一只。
-
-        0C 01 必须放证券表之后（客户端原包如此）。放数量后面同样能回包，但服务端会按错位解析，
-        表现为代码只按末位匹配、回包恒带 600839、数据错开一条，三个老毛病都出自这一个字节位。
-        """
-        ask = list(stocks)
-        payload = (SNAP_PREFIX + struct.pack("<H", len(ask))
-                   + b"".join(struct.pack("<B6s", m, c) for m, c in ask) + SNAP_TAIL)
-        body = self._call(CT_SNAPSHOT, payload, SNAP_CAT, SNAP_VER, SNAP_FLAG)
-        recs = parse_snapshot(body, ask)
-        if len(recs) < len(ask):                            # 少给了按实际长度截
-            recs += [{}] * (len(ask) - len(recs))
-        out = recs[:len(ask)]
-        for rec, (mkt, code) in zip(out, stocks):
-            srv = rec.get("code", "")
-            rec["market"] = mkt
-            rec["code"] = code.decode("ascii", "replace")
-            rec["code_srv"] = srv
-            if srv and srv != rec["code"]:                  # 回包代码就是解析结果，正常应与请求一致
-                rec["mismatch"] = srv
+        t0 = time.time()
+        out = self.conn.snapshot(stocks)
+        self.pool.stats.add_rtt((time.time() - t0) * 1000)
+        self.host = self.conn.host
         return out
 
     def ticks(self, market, code, start=0, count=30):
-        payload = struct.pack("<H", market) + code.ljust(6, b"\x00") + struct.pack("<HH", start, count)
-        body = self._call(CT_TICK, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
-        return parse_tick(body)
+        t0 = time.time()
+        out = self.conn.ticks(market, code, start, count)
+        self.pool.stats.add_rtt((time.time() - t0) * 1000)
+        self.host = self.conn.host
+        return out
 
     def orders(self, market, code, start=0, count=30):
-        """取带秒的逐笔成交（0FC2）。请求体与 0FC5 相同，差别只在每条多一个秒字节。
-
-        本服 0FC0-0FC9 只有 0FC2 与 0FC5 应答，没有独立的逐笔委托流；
-        量价方向与 0FC5 逐条相同，时间细到 3 秒，所以对时间敏感的场景直接用这条。
-        """
-        payload = struct.pack("<H", market) + code.ljust(6, b"\x00") + struct.pack("<HH", start, count)
-        body = self._call(CT_ORDER, payload, TICK_CAT, TICK_VER, TICK_FLAG, extra=2)
-        return parse_order(body)
+        t0 = time.time()
+        out = self.conn.orders(market, code, start, count)
+        self.pool.stats.add_rtt((time.time() - t0) * 1000)
+        self.host = self.conn.host
+        return out
 
     def run(self):
         while not self.pool.stop.is_set():
@@ -650,41 +359,13 @@ class Pool(object):
                 return
 
     def _probe(self, host, port, timeout, out):
-        """单机健康探测：能回一条日线就算活，耗时入表。"""
-        sock = None
+        """单机健康探测：协议全交给客户端，只把耗时收进来。"""
+        t0 = time.time()
         try:
-            sock = socket.create_connection((host, port), timeout=timeout)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            p = b"\x00" + struct.pack("<H", 9) + struct.pack("<B6s", 1, b"600000") + struct.pack("<HH", 0, 1)
-            fr = (b"\x0c" + struct.pack("<HHBHH", SNAP_CAT, SNAP_VER, 0, len(p), len(p))
-                  + struct.pack("<H", 0x052D) + p)
-            t0 = time.time()
-            sock.sendall(HS1 + HS2 + HS3 + fr)
-            for _ in range(8):
-                head = b""
-                while len(head) < 16:
-                    ch = sock.recv(16 - len(head))
-                    if not ch:
-                        raise RtdError("closed")
-                    head += ch
-                ct = struct.unpack_from("<H", head, 10)[0]
-                z = struct.unpack_from("<H", head, 12)[0]
-                while z > 0:
-                    ch = sock.recv(z)
-                    if not ch:
-                        raise RtdError("closed")
-                    z -= len(ch)
-                if ct == 0x052D:
-                    out.append((round((time.time() - t0) * 1000, 1), host, port))
-                    return
+            T.TdxConnection(hosts=[(host, port)], timeout=timeout).probe()
+            out.append((round((time.time() - t0) * 1000, 1), host, port))
         except Exception:                                 # noqa: BLE001
             pass
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
 
     def health(self, keep=8, timeout=1.5, parallel=10):
         """并发探一遍主机，只留下会回包的，按耗时排序。
@@ -887,17 +568,48 @@ def jsonl_sink(path=None):
     return sink
 
 
+def guess_market(code):
+    """按代码前缀判市场：沪深两边都有 5 与 1 开头的品种，只看首字符会串市场。
+
+    沪：6/9 开头（股票、B 股）、5 开头（50-58 的 ETF 与 LOF）、11/13 开头（转债、可交换债）
+    深：0/2/3 开头（股票、B 股）、12/15/16/17/18 开头（转债、ETF、LOF、权证）
+    北交所是 8 开头与 920 号段（920 先判），调用方可用 市场:代码 显式指定。
+    """
+    if not code:
+        return 1
+    head = code[0]
+    if code[:2] == "92":
+        return 2                      # 北交所 920 号段先于 9 开头（9 开头别的号段是沪市 B 股）
+    if head in "69":
+        return 1
+    if head in "023":
+        return 0
+    if head == "5":
+        return 1                      # 50-58 全是沪市基金，深市 ETF 是 15 开头
+    if head == "8":
+        return 2                      # 北交所 8 开头
+    if head == "1":
+        return 1 if code[:2] in ("11", "13") else 0
+    return 1
+
+
 def parse_codes(text):
-    """600000,000001:0,sh600519 三种写法都认；默认市场 1，6 开头沪、0/3 开头深。"""
+    """600000、000001:0、sh600519 三种写法都认；市场按 guess_market 判，冒号可覆盖。"""
     out = []
     for item in text.replace(" ", "").split(","):
         if not item:
             continue
-        mkt = 1 if item[0] in "65" else 0
         code = item
+        mkt = guess_market(item)
+        if item.startswith(("sh", "sz", "bj")) and len(item) == 8:
+            mkt = {"sh": 1, "sz": 0, "bj": 2}[item[:2]]
+            code = item[2:]
         if ":" in item:
             head, code = item.split(":", 1)
             mkt = int(head)
+            if guess_market(code) != mkt:
+                print("提示: %s 按前缀看像市场 %d，这里按你写的市场 %d 发"
+                      % (code, guess_market(code), mkt), file=sys.stderr)
         if len(code) != 6:
             raise SystemExit("代码要 6 位: %s" % item)
         out.append((mkt, code.encode("ascii")))
@@ -1107,6 +819,42 @@ def cmd_rtt(args):
         pool.close()
 
 
+def snapshot_best(pool, stocks):
+    """取快照，价格全零的按前缀改判市场重取一次（常见于把 589020 写成 0:589020）。
+
+    服务端对错市场的代码照样回记录，只是价量额全零，很容易被当成"没数据"。
+    改判只在显式市场与 guess_market 不一致且首轮全零时发生，改判命中的记录带 remapped。
+    """
+    out = [{}] * len(stocks)
+    w = pool.workers[0]
+    try:
+        out = w.snapshot(stocks)
+    finally:
+        w._drop()
+    retry = [(i, s) for i, s in enumerate(stocks) if not out[i].get("price")]
+    if not retry:
+        return out
+    fixed = []
+    for i, (m, c) in retry:
+        guess = guess_market(c.decode("ascii", "replace"))
+        if guess == m:
+            continue
+        try:
+            got = w.snapshot([(guess, c)])[0]
+        except Exception:                              # noqa: BLE001
+            continue
+        finally:
+            w._drop()
+        if got.get("price"):
+            got["remapped"] = guess
+            out[i] = got
+            fixed.append((c.decode("ascii", "replace"), m, guess))
+    for code, was, now in fixed:
+        print("提示: %s 在市场 %d 全零，按前缀改判市场 %d 后取到" % (code, was, now),
+              file=sys.stderr)
+    return out
+
+
 def cmd_once(args):
     stocks = parse_codes(args.codes)
     pool = Pool(workers=1, timeout=8.0)
@@ -1115,10 +863,7 @@ def cmd_once(args):
         if args.mode != "l1":
             ok = Collector(pool).probe_l2()
             print("l2=%s" % ok, file=sys.stderr)
-        pool.submit(stocks, lambda out: got.extend(out))
-        deadline = time.time() + 15
-        while time.time() < deadline and len(got) < len(stocks):
-            time.sleep(0.05)
+        got = snapshot_best(pool, stocks)
         for rec in got:
             print(json.dumps(rec, ensure_ascii=False, sort_keys=True))
         if args.l2_orders:                        # 逐笔只在要的时候打，默认不打

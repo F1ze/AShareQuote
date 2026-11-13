@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react"
 import { ArrowDown, ArrowUp, Crosshair, Search, X } from "lucide-react"
 import type { RealtimeQuote } from "@/types"
-import { priceChange, realtimeClock } from "@/lib/realtime"
+import { priceChange, realtimeClock, realtimePrice as money } from "@/lib/realtime"
 
 type SortColumn = "name" | "price" | "change" | "absolute" | "volume" | "amount"
 interface Props {
@@ -17,9 +17,8 @@ interface Props {
   onRemove: (key: string) => void
 }
 const numeric = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 })
-const money = (value?: number) => value && Number.isFinite(value) ? value.toFixed(2) : "—"
 const compact = (value?: number) => value === undefined ? "—" : value >= 1e8 ? `${(value / 1e8).toFixed(2)}亿` : value >= 1e4 ? `${(value / 1e4).toFixed(2)}万` : numeric.format(value)
-const signed = (value: number | null, suffix = "") => value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}${suffix}`
+const signed = (value: number | null, suffix = "") => value === null ? "—" : `${value > 0 ? "+" : ""}${suffix ? value.toFixed(2) : value === 0 ? "0.00" : money(value)}${suffix}`
 const tone = (value: number | null) => value === null || value === 0 ? "rt-neutral" : value > 0 ? "rt-up" : "rt-down"
 
 // 排序和筛选仅改变展示顺序，不修改订阅数组，不触发额外行情请求。

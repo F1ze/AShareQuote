@@ -34,19 +34,40 @@ var aShareCodeRanges = map[uint8][]codeRange{
 // 它只识别候选号段，不证明代码已经发行、历史上市归属或当前可交易状态。
 // 北京旧码与股转系统存在重叠，具体上市身份仍须来源名录确认，不能由此自动合并新旧代码。
 func IsAShare(s Security) bool {
+	return inCodeRanges(s.Code, aShareCodeRanges[s.Market])
+}
+
+// ETF 与可转债使用交易代码号段，只判断支持范围，不推断证券是否已上市。
+var etfCodeRanges = map[uint8][]codeRange{
+	MarketSZ: {{"158000", "159899"}, {"159901", "159999"}}, // 159900 是申赎现金替代虚拟证券。
+	MarketSH: {{"510000", "513999"}, {"515000", "518999"}, {"560000", "563999"}, {"588000", "589999"}},
+}
+
+var convertibleCodeRanges = map[uint8][]codeRange{
+	MarketSZ: {{"123000", "123999"}, {"127000", "128999"}},
+	MarketSH: {{"110000", "111999"}, {"113000", "113999"}, {"118000", "118999"}},
+}
+
+func IsETF(s Security) bool { return inCodeRanges(s.Code, etfCodeRanges[s.Market]) }
+
+func IsConvertibleBond(s Security) bool { return inCodeRanges(s.Code, convertibleCodeRanges[s.Market]) }
+
+func IsTDXInstrument(s Security) bool { return IsAShare(s) || IsETF(s) || IsConvertibleBond(s) }
+
+func inCodeRanges(code string, ranges []codeRange) bool {
 	// 1. 只接受规范化后的六位 ASCII 数字，不在分类器中猜市场、补零或清理输入。
-	if len(s.Code) != 6 {
+	if len(code) != 6 {
 		return false
 	}
-	for i := 0; i < len(s.Code); i++ {
-		if s.Code[i] < '0' || s.Code[i] > '9' {
+	for i := 0; i < len(code); i++ {
+		if code[i] < '0' || code[i] > '9' {
 			return false
 		}
 	}
 	// 2. 按市场查询闭区间；等长 ASCII 数字的字典序等于数值序，无需转整数。
 	// 未知市场查到空规则，自然拒绝；名称、ST 或退市状态不参与号段分类。
-	for _, r := range aShareCodeRanges[s.Market] {
-		if s.Code >= r.first && s.Code <= r.last {
+	for _, r := range ranges {
+		if code >= r.first && code <= r.last {
 			return true
 		}
 	}

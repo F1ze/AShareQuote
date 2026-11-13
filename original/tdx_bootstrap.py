@@ -24,8 +24,20 @@ T0002_DIRS = ("bdhq_cache blocknew cache Certi cloud_cache cloud_cfg cloud_dax c
               "ds_cache export ext_cache gs_bak hq_cache info_cache invest lc log "
               "logoflash_v1 lzjy msg_hq msg_jy msg_tq msg_zx note pad qqdata signals sound "
               "tmp User usrdat utx_data wt_cache wt_data xml_cache zst_cache").split()
+# vipdoc 下的一级市场目录，与客户端 0x96a6c0 起的登记串一致：sh/sz/bj 是沪深京三个交易市场，
+# ds 是扩展行情（模板 vipdoc\ds\lday\%d#%s.day，放期货连续、美股、港股这类带序号前缀的标的），
+# ot 与 cw 是安装器预留下来的两个杂项目录（ot 本机为空、客户端字符串里没有它；cw 只放财务文件）。
+MIN_MAX = 24000          # 分钟族一次最多翻多少条：服务端只留约 22080 条
 MARKETS = ("bj", "sh", "sz", "ds", "ot", "cw")
-SUB_DIRS = ("lday", "minline", "fzline", "eday")
+# 每个市场各自的子目录：ds 只有三类分钟线与日线（没有 eday），ot 与 cw 没有子目录。
+MARKET_SUBS = {
+    "sh": ("lday", "minline", "fzline", "eday"),
+    "sz": ("lday", "minline", "fzline", "eday"),
+    "bj": ("lday", "minline", "fzline", "eday"),
+    "ds": ("lday", "minline", "fzline"),
+    "ot": (),
+    "cw": (),
+}
 REF_GLOBS = ("*.exe", "*.dll", "*.dax", "*.daq", "*.dai", "*.xmb", "*.ini", "*.dat",
              "*.dbf", "*.cfg", "*.json", "*.txt", "*.html", "*.css", "*.chm", "*.bmp",
              "*.jpg", "*.ql", "*.up")
@@ -36,14 +48,15 @@ REF_DIRS = ("chrome", "files", "funcs", "GNPlugins", "jspages", "QHData", "SEPlu
 
 # 文件读法：目录蓝图 → init/regen → fill 抓行情 → base 主表 → 登录探测 → 权息断点同步 → verify → CLI。
 # 写操作全在 root 里发生，--ref 只读；exe/DLL 是复制，不是重新生成。
-# 待建目录 = T0002 下 51 个缓存/板块子目录 + 6 个市场 × 4 类行情目录 + vipdoc/ds，共 76 个。
+# 待建目录 = T0002 下 51 个缓存/板块子目录 + vipdoc 的 6 个市场目录与 14 个行情子目录，共 71 个。
 
 def _dirs(root):
     out = [os.path.join(root, "T0002", d) for d in T0002_DIRS]
     for m in MARKETS:
-        for s in SUB_DIRS:
-            out.append(os.path.join(root, "vipdoc", m, s))
-    out.append(os.path.join(root, "vipdoc", "ds"))
+        base = os.path.join(root, "vipdoc", m)
+        out.append(base)
+        for s in MARKET_SUBS.get(m, ()):
+            out.append(os.path.join(base, s))
     return out
 
 
@@ -132,60 +145,132 @@ def regen(root, spec_path=None, ref=None):
     return cfg
 
 
-def fill(root, market, codes, days=250, cfg=None, merge=True):
-    """用 7709 客户端把日线写进 vipdoc。
+def fill(root, market, codes, days=250, cfg=None, merge=True, from_root=None, kind="day"):
+    """把行情写进 vipdoc。kind 取 day（日线）/ min（1 分钟）/ 5min（5 分钟）。
 
-    merge=True 时与已有 .day 按日期合并，新抓的覆盖同日旧值；这样每次只抓最近
-    days 根也能把历史一天天攒厚，不必一次拉满。
+    merge 为真时按时间键与已有文件合并，新抓的覆盖同一时间点，旧历史一根不丢。
+    分钟族服务端只留约两万两千条（92 个交易日，见报告 43 章），days 给 0 表示
+    能翻多深翻多深：start 一路加，取到空或到 MIN_MAX 为止。
     """
     import tdx_client
+    codes = tdx_client.normalize_codes(codes)
+    category, subdir, ext = tdx_client.KIND_MAP.get(kind, tdx_client.KIND_MAP["day"])
     pref = tdx_client.PREFIX[market]
-    outdir = os.path.join(root, "vipdoc", tdx_client.MARKET_DIR[market], "lday")
+    outdir = os.path.join(root, "vipdoc", tdx_client.MARKET_DIR[market], subdir)
     os.makedirs(outdir, exist_ok=True)
-    conn = tdx_client.TdxConnection(cfg_path=cfg or os.path.join(root, "connect.cfg"))
+    full = kind != "day" and days <= 0
+    want = MIN_MAX if full else min(days, 800)
+    step = 800 if kind != "day" else min(days, 800)
+
+    cfg = cfg or os.path.join(root, "connect.cfg")
+    if not from_root and not os.path.isfile(cfg):
+        # 目标树没配置时往回收：先仓库自带的生成样本，再退回安装目录的默认配置。
+        # 只给了个空目录就 fill 的场合很常见，不该直接抛"没有可用主机"。
+        for cand in (os.path.join(HERE, "connect.cfg"), os.path.join(HERE, "connect.gen.cfg")):
+            if os.path.isfile(cand):
+                cfg = cand
+                break
+        else:
+            cfg = None
+        print("提示: %s 下没有 connect.cfg，改用 %s" % (root, cfg or tdx_client.CFG_DEFAULT),
+              file=sys.stderr)
+
+    if from_root:
+        # 离线拷贝：退市股历史、或超出服务端保留深度的老分钟线，只能从旧树搬
+        src_dir = os.path.join(from_root, "vipdoc", tdx_client.MARKET_DIR[market], subdir)
+        out = []
+        for code in codes:
+            name = "%s%s%s" % (pref, code, ext)
+            src = os.path.join(src_dir, name)
+            if not os.path.isfile(src):
+                print("  %s 源树没有 %s" % (code, name), file=sys.stderr)
+                continue
+            dst = os.path.join(outdir, name)
+            if merge:
+                store = tdx_client.read_ticks_file(dst)          # 目标在前，同日以源为准
+                store.update(tdx_client.read_ticks_file(src))
+                tdx_client.write_all(dst, store)
+            else:
+                shutil.copyfile(src, dst)
+            out.append((code, os.path.getsize(dst) // (tdx_client.MIN_REC if kind != "day" else 32)))
+        return out
+
+    conn = tdx_client.TdxConnection(cfg_path=cfg)
     conn.connect()
-    written = []
+    written, misses = [], []
     try:
         for code in codes:
-            recs = conn.security_bars(9, market, code, 0, min(days, 800))
-            path = os.path.join(outdir, "%s%s.day" % (pref, code))
-            # 合并写：先把旧文件按日期读进字典（32 字节记录：u32 日期 + 4 个 u32 价 + f32 额 + u32 量 + u32 保留），
-            # 新抓的同日覆盖，最后按日期升序整体重写，旧历史一根不丢。
-            if merge and os.path.exists(path):
-                old = {}
-                with open(path, "rb") as fh:
-                    raw = fh.read()
-                for off in range(0, len(raw) - 31, 32):
-                    old[struct.unpack_from("<I", raw, off)[0]] = raw[off:off + 32]
-                for r in recs:
-                    y, mo, d = r["dt"][0], r["dt"][1], r["dt"][2]
-                    old[y * 10000 + mo * 100 + d] = struct.pack(
-                        "<IIIIIfII", y * 10000 + mo * 100 + d,
-                        int(round(r["open"] * 100)), int(round(r["high"] * 100)),
-                        int(round(r["low"] * 100)), int(round(r["close"] * 100)),
-                        float(r["amount"]), int(r["vol"]), 0)
-                with open(path, "wb") as fh:
-                    for k in sorted(old):
-                        fh.write(old[k])
-                written.append((code, len(recs)))
+            rows, start_ = [], 0
+            while len(rows) < want:
+                batch = None
+                for _try in range(3):                  # 主机有成片的"连上即关"，同段失败了退一步重连再试
+                    try:
+                        batch = conn.security_bars(category, market, code, start_, step)
+                        break
+                    except Exception as exc:           # noqa: BLE001
+                        conn._close()
+                        print("  %s 第 %d 段失败重试: %r" % (code, start_, exc), file=sys.stderr)
+                if batch is None:
+                    break
+                if not batch:
+                    break
+                rows.extend(batch)
+                start_ += len(batch)
+                # 指数与板块一次只回一根，不能因为不满一段就收工；空包才停
+                if len(batch) == 0:
+                    break
+            path = os.path.join(outdir, "%s%s%s" % (pref, code, ext))
+            if not rows:
+                # 退市、摘牌、或超出服务端保留深度；保留旧文件，没有旧文件就不造空文件
+                kept = 0
+                if os.path.exists(path):
+                    kept = os.path.getsize(path) // (tdx_client.MIN_REC if kind != "day" else 32)
+                misses.append((code, kept))
+                if kept:
+                    written.append((code, 0))
                 continue
-            with open(path, "wb") as fh:
-                for r in sorted(recs, key=lambda x: x["dt"]):
-                    y, mo, d = r["dt"][0], r["dt"][1], r["dt"][2]
-                    fh.write(struct.pack("<IIIIIfII", y * 10000 + mo * 100 + d,
-                                         int(round(r["open"] * 100)), int(round(r["high"] * 100)),
-                                         int(round(r["low"] * 100)), int(round(r["close"] * 100)),
-                                         float(r["amount"]), int(r["vol"]), 0))
-            written.append((code, len(recs)))
+            store = {}
+            if merge:
+                store = tdx_client.read_ticks_file(path)
+            for r in rows:
+                y, mo, d, hh, mm = r["dt"]
+                key = y * 100000000 + mo * 1000000 + d * 10000 + hh * 100 + mm
+                if kind == "day":
+                    store[y * 10000 + mo * 100 + d] = tdx_client.pack_day(
+                        y * 10000 + mo * 100 + d, r["open"], r["high"], r["low"], r["close"],
+                        r["amount"], r["vol"])
+                else:
+                    store[(y, mo, d, hh, mm)] = tdx_client.pack_min(
+                        y, mo, d, hh, mm, r["open"], r["high"], r["low"], r["close"],
+                        float(r["amount"]), int(r["vol"]))
+            tdx_client.write_all(path, store)
+            written.append((code, len(rows)))
     finally:
         conn._close()
+    if misses:
+        for code, kept in misses:
+            print("  %s 无数据（退市、摘牌或超出保留深度）%s"
+                  % (code, "，保留本地旧文件 %d 条" % kept if kept else ""), file=sys.stderr)
     return written
 
 
 def gen_base(root, markets, limit=0, cfg=None):
     """按服务端证券清单生成 base.dbf，替代参照安装里的 3.8 MB 主表。"""
     import tdx_client
-    conn = tdx_client.TdxConnection(cfg_path=cfg or os.path.join(root, "connect.cfg"))
+    cfg = cfg or os.path.join(root, "connect.cfg")
+    if not os.path.isfile(cfg):
+        # 目标树没配置时往回收：先仓库自带的生成样本，再退回安装目录的默认配置。
+        # 只给了个空目录就 fill 的场合很常见，不该直接抛"没有可用主机"。
+        for cand in (os.path.join(HERE, "connect.cfg"), os.path.join(HERE, "connect.gen.cfg")):
+            if os.path.isfile(cand):
+                cfg = cand
+                break
+        else:
+            cfg = None
+        print("提示: %s 下没有 connect.cfg，改用 %s" % (root, cfg or tdx_client.CFG_DEFAULT),
+              file=sys.stderr)
+
+    conn = tdx_client.TdxConnection(cfg_path=cfg)
     conn.connect()
     rows = []
     try:
@@ -258,9 +343,24 @@ def sync_gbbq(root, market, codes=None, limit=None, cfg=None, redo=False, jobs=6
     import threading
     import tdx_adjust
     import tdx_client
+    if codes:
+        codes = tdx_client.normalize_codes(codes)
     state = _load_state(root)
     done = {} if redo else dict(state["done"].get(str(market), {}))
-    conn = tdx_client.TdxConnection(cfg_path=cfg or os.path.join(root, "connect.cfg"))
+    cfg = cfg or os.path.join(root, "connect.cfg")
+    if not os.path.isfile(cfg):
+        # 目标树没配置时往回收：先仓库自带的生成样本，再退回安装目录的默认配置。
+        # 只给了个空目录就 fill 的场合很常见，不该直接抛"没有可用主机"。
+        for cand in (os.path.join(HERE, "connect.cfg"), os.path.join(HERE, "connect.gen.cfg")):
+            if os.path.isfile(cand):
+                cfg = cand
+                break
+        else:
+            cfg = None
+        print("提示: %s 下没有 connect.cfg，改用 %s" % (root, cfg or tdx_client.CFG_DEFAULT),
+              file=sys.stderr)
+
+    conn = tdx_client.TdxConnection(cfg_path=cfg)
     conn.connect()
     if not codes:
         codes, start = [], 0
@@ -419,6 +519,9 @@ def main(argv=None):
     p.add_argument("--days", type=int, default=250)
     p.add_argument("--no-merge", action="store_true", help="覆盖写，不与已有日线合并")
     p.add_argument("--cfg", default=None)
+    p.add_argument("--from", dest="from_root", help="从旧安装/备份的 vipdoc 拷贝，不走网络")
+    p.add_argument("--kind", default="day", choices=("day", "min", "5min", "15min", "30min", "60min"),
+                   help="day 日线 / min 1 分钟 / 5min 5 分钟 / 15min / 30min / 60min；分钟族 days 给 0 表示翻到底")
     p = sub.add_parser("sync")
     p.add_argument("root")
     p.add_argument("--market", type=int, default=1)
@@ -439,11 +542,19 @@ def main(argv=None):
     p.add_argument("--markets", default="0,1")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--cfg")
+    p = sub.add_parser("delisted")
+    p.add_argument("src", help="现成的安装目录或旧备份，扫它 vipdoc 里的 .day")
+    p.add_argument("--markets", default="0,1")
+    p.add_argument("--out", help="把结果写成 市场:代码 一行一个")
+    p = sub.add_parser("archive")
+    p.add_argument("src", help="安装目录、树根或 base.dbf 路径")
+    p.add_argument("--out", help="存档目录，默认 db/base")
+    p.add_argument("--day", help="存档日期，默认今天")
     p = sub.add_parser("verify")
     p.add_argument("root")
     a = ap.parse_args(argv)
     # 相对路径统一按当前目录展开，后续一律用绝对路径，避免受 cwd 变化影响
-    a.root = os.path.abspath(a.root)
+    a.root = os.path.abspath(getattr(a, "root", None) or getattr(a, "src", ""))
     for k in ("spec", "ref", "cfg"):
         v = getattr(a, k, None)
         if v:
@@ -468,10 +579,12 @@ def main(argv=None):
         return 0
     if a.cmd == "fill":
         got = fill(a.root, a.market, [c.strip() for c in a.codes.split(",") if c.strip()],
-                   a.days, a.cfg)
+                   a.days, a.cfg, from_root=a.from_root, kind=a.kind)
         for code, n in got:
-            print("  %s 写入 %d 条日线" % (code, n))
-        print("合计 %d 只 / %d 条" % (len(got), sum(n for _, n in got)))
+            print("  %s 写入 %d 条%s" % (code, n, "日线" if a.kind == "day" else "分钟线"))
+        miss = len([c for c in a.codes.split(",") if c.strip()]) - len(got)
+        print("合计 %d 只 / %d 条%s" % (len(got), sum(n for _, n in got),
+                                       "，%d 只无数据" % miss if miss else ""))
         return 0
     if a.cmd == "sync":
         codes = [c.strip() for c in a.codes.split(",")] if a.codes else None
@@ -495,6 +608,19 @@ def main(argv=None):
         n, path = gen_base(a.root, [int(x) for x in a.markets.split(",") if x.strip()],
                            a.limit, a.cfg)
         print("已生成 %s：%d 条" % (path, n))
+        return 0
+    if a.cmd == "archive":
+        path, wrote = archive_base(a.src, a.out, a.day)
+        print("%s %s" % ("已存档" if wrote else "今日已有，未改", path))
+        return 0
+    if a.cmd == "delisted":
+        import tdx_client
+        rows, n = tdx_client.list_delisted(a.src, [int(x) for x in a.markets.split(",") if x.strip()], a.out)
+        print("码表 %d 只，本地有而码表没有（退市/摘牌）：%d 只" % (n, len(rows)))
+        for m, code in rows[:20]:
+            print("  %d:%s" % (m, code))
+        if len(rows) > 20:
+            print("  ...")
         return 0
     problems, stats = verify(a.root)
     for p_ in problems:

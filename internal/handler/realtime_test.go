@@ -26,7 +26,7 @@ func TestRealtimeHTTPValidatesAndPreservesL1(t *testing.T) {
 	for _, tc := range []struct {
 		query  string
 		status int
-	}{{"codes=sh600036&selected=sh600036", 200}, {"codes=sh600036&selected=sz000001", 400}, {"codes=../secret&selected=sh600036", 400}, {"", 400}} {
+	}{{"codes=sh600036&selected=sh600036", 200}, {"codes=111024,589020&selected=111024", 200}, {"codes=sz111024&selected=sz111024", 400}, {"codes=sh600036&selected=sz000001", 400}, {"codes=../secret&selected=sh600036", 400}, {"", 400}} {
 		h := NewServer(Dependencies{Realtime: source}).Handler()
 		request := httptest.NewRequest("GET", "/api/realtime?"+tc.query, nil)
 		response := httptest.NewRecorder()

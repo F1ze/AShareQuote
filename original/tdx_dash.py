@@ -54,16 +54,11 @@ def cached(key, ttl, fn):
 
 def do_snap(codes):
     pairs = R.parse_codes(codes)
-    w = _pool.workers[0]
-    payload = R.SNAP_PREFIX + R.struct.pack("<H", len(pairs)) + b"".join(
-        R.struct.pack("<B6s", m, c) for m, c in pairs) + R.SNAP_TAIL
-    body = w._call(R.CT_SNAPSHOT, payload, R.SNAP_CAT, R.SNAP_VER, R.SNAP_FLAG)
-    w._drop()
-    recs = R.parse_snapshot(body, pairs)
+    recs = R.snapshot_best(_pool, pairs)     # 市场写错会按前缀改判重取
     keep = ("code", "market", "price", "last_close", "open", "high", "low", "vol", "cur_vol",
             "amount", "b_vol", "s_vol", "bid1", "ask1", "bid_vol1", "ask_vol1", "bid2", "ask2",
             "bid_vol2", "ask_vol2", "bid3", "ask3", "bid_vol3", "ask_vol3", "bid4", "ask4",
-            "bid_vol4", "ask_vol4", "bid5", "ask5", "bid_vol5", "ask_vol5", "mismatch")
+            "bid_vol4", "ask_vol4", "bid5", "ask5", "bid_vol5", "ask_vol5", "mismatch", "remapped")
     return [{k: r.get(k) for k in keep if k in r} for r in recs]
 
 

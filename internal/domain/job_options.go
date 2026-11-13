@@ -103,9 +103,13 @@ func NormalizeDownloadOptions(o DownloadOptions, defaultOutput string, now time.
 			return o, err
 		}
 		if o.ASharesOnly {
+			supported := IsAShare
+			if o.Source == "tdx" && o.ImportDir == "" {
+				supported = IsTDXInstrument
+			}
 			for _, security := range codes {
-				if !IsAShare(security) {
-					return o, fmt.Errorf("%s%s 不属于支持的 A 股代码范围", MarketPrefix(security.Market), security.Code)
+				if !supported(security) {
+					return o, fmt.Errorf("%s%s 不属于该来源支持的证券代码范围", MarketPrefix(security.Market), security.Code)
 				}
 			}
 		}
@@ -139,6 +143,11 @@ func ParseCodes(value string) ([]Security, error) {
 		}
 		if market == 255 {
 			switch item[0] {
+			case '1':
+				market = MarketSZ
+				if strings.HasPrefix(item, "11") {
+					market = MarketSH
+				}
 			case '5', '6', '9':
 				market = 1
 			case '4', '8':

@@ -1,6 +1,6 @@
 import { useState } from "react"
 import type { RealtimeQuote } from "@/types"
-import { priceChange } from "@/lib/realtime"
+import { priceChange, realtimePrice } from "@/lib/realtime"
 
 const number = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 })
 
@@ -15,7 +15,7 @@ export function OrderBook({ quote, animated }: { quote?: RealtimeQuote; animated
   const movement = priceChange(quote)
   return <>
     {[4, 3, 2, 1, 0].map((level) => <OrderBookRow key={`ask${level}`} label={`卖 ${level + 1}`} level={quote?.asks[level]} side="ask" reference={scale} animated={animated} />)}
-    <div className={`rt-book-mid ${movement === null || movement === 0 ? "rt-neutral" : movement > 0 ? "rt-up" : "rt-down"}`}>{quote && quote.price > 0 ? quote.price.toFixed(2) : "—"}<span>{movement === null ? "—" : `${movement > 0 ? "+" : ""}${movement.toFixed(2)}%`}</span></div>
+    <div className={`rt-book-mid ${movement === null || movement === 0 ? "rt-neutral" : movement > 0 ? "rt-up" : "rt-down"}`}>{realtimePrice(quote?.price)}<span>{movement === null ? "—" : `${movement > 0 ? "+" : ""}${movement.toFixed(2)}%`}</span></div>
     {[0, 1, 2, 3, 4].map((level) => <OrderBookRow key={`bid${level}`} label={`买 ${level + 1}`} level={quote?.bids[level]} side="bid" reference={scale} animated={animated} />)}
   </>
 }
@@ -25,7 +25,7 @@ export function OrderBookRow({ label, level, side, reference, animated }: { labe
   const fraction = volume / (volume + reference)
   return <div className={`rt-book-row ${side}`} data-level={label}>
     <i className="book-quantity-bar" data-animated={animated} style={{ transform: `scaleX(${fraction})` }} title="条长使用固定基准的压缩刻度；准确数量见右侧数字" />
-    <span>{label}</span><strong>{level && level.price > 0 ? level.price.toFixed(2) : "—"}</strong>
+    <span>{label}</span><strong>{realtimePrice(level?.price)}</strong>
     <span className="book-volume">{level ? number.format(level.volume) : "—"}</span>
   </div>
 }

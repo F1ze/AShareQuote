@@ -127,7 +127,7 @@ func (t *jobRun) run() {
 			return
 		}
 	}
-	if t.options.ASharesOnly {
+	if t.options.ASharesOnly && strings.TrimSpace(t.options.Codes) == "" {
 		filtered := make([]Security, 0, len(securities))
 		for _, s := range securities {
 			if domain.IsAShare(s) {

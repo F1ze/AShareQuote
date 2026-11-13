@@ -17,7 +17,7 @@ type DownloadOptions struct {
 	Timeout        int    `json:"timeout"`        // 通达信拨号/读写超时秒数，0 使用默认 8，允许 2–60；不是整项任务总时限。
 	OutputDir      string `json:"outputDir"`      // 原始 CSV 和因子附件的目录；空值用 JobService 默认目录，启动时转绝对路径。
 	GBBQPath       string `json:"gbbqPath"`       // 可选通达信 gbbq 文件路径；显式指定却无法读取时任务失败。
-	ASharesOnly    bool   `json:"aSharesOnly"`    // 通达信批量筛选 A 股；手填清单中的非 A 股会被拒绝，历史源/本地导入本身也筛 A 股。
+	ASharesOnly    bool   `json:"aSharesOnly"`    // 按市场筛选 A 股；通达信手填清单同时支持 ETF 和可转债。
 	Incremental    bool   `json:"incremental"`    // 从已有归档最新日回看 7 个自然日重取，合并时保留更早历史；不自动补齐远期空洞。
 	Storage        string `json:"storage"`        // duckdb=归档后入库；csv 或空值=仅归档，数据库是 CSV 之外的附加存储。
 	ImportDir      string `json:"importDir"`      // 非空时走本地历史导入流程；空值时从网络来源采集。

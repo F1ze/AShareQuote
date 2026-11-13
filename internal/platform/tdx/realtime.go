@@ -97,8 +97,8 @@ func (c *Client) RealtimeQuotes(stocks []Security) ([]domain.RealtimeQuote, erro
 	payload[0] = 5
 	binary.LittleEndian.PutUint16(payload[8:], uint16(len(stocks)))
 	for _, s := range stocks {
-		if !domain.IsAShare(s) {
-			return nil, fmt.Errorf("无效 A 股代码 %s", s.Code)
+		if !domain.IsTDXInstrument(s) {
+			return nil, fmt.Errorf("无效行情证券代码 %s", s.Code)
 		}
 		payload = append(payload, s.Market)
 		payload = append(payload, []byte(s.Code)...)
@@ -151,13 +151,15 @@ func decodeRealtimeQuotes(body []byte, stocks []Security) ([]domain.RealtimeQuot
 		if err != nil {
 			return nil, err
 		}
-		q.Price = float64(base) / 100
+		// 0x053E 按证券品种缩放，包括昨收、OHLC 和五档。实时轮询无需重新扫描码表。
+		scale := realtimePriceScale(Security{Market: market, Code: q.Code}, true)
+		q.Price = float64(base) / scale
 		for _, p := range []*float64{&q.LastClose, &q.Open, &q.High, &q.Low} {
 			v, e := d.price()
 			if e != nil {
 				return nil, e
 			}
-			*p = float64(base+v) / 100
+			*p = float64(base+v) / scale
 		}
 		for j := 0; j < 4; j++ {
 			v, e := d.price()
@@ -197,8 +199,8 @@ func decodeRealtimeQuotes(body []byte, stocks []Security) ([]domain.RealtimeQuot
 			if e != nil {
 				return nil, e
 			}
-			q.Bids[level] = domain.BookLevel{Price: float64(base+bid) / 100, Volume: bv}
-			q.Asks[level] = domain.BookLevel{Price: float64(base+ask) / 100, Volume: av}
+			q.Bids[level] = domain.BookLevel{Price: float64(base+bid) / scale, Volume: bv}
+			q.Asks[level] = domain.BookLevel{Price: float64(base+ask) / scale, Volume: av}
 		}
 		if _, err = d.take(2); err != nil {
 			return nil, err
@@ -220,8 +222,8 @@ func decodeRealtimeQuotes(body []byte, stocks []Security) ([]domain.RealtimeQuot
 }
 
 func (c *Client) RealtimeTrades(stock Security) ([]domain.RealtimeTrade, error) {
-	if !domain.IsAShare(stock) {
-		return nil, fmt.Errorf("无效 A 股代码")
+	if !domain.IsTDXInstrument(stock) {
+		return nil, fmt.Errorf("无效行情证券代码")
 	}
 	payload := make([]byte, 12)
 	binary.LittleEndian.PutUint16(payload, uint16(stock.Market))
@@ -231,10 +233,21 @@ func (c *Client) RealtimeTrades(stock Security) ([]domain.RealtimeTrade, error) 
 	if err != nil {
 		return nil, err
 	}
-	return decodeRealtimeTrades(body)
+	return decodeRealtimeTrades(body, realtimePriceScale(stock, false))
 }
 
-func decodeRealtimeTrades(body []byte) ([]domain.RealtimeTrade, error) {
+// 0x0FC2 与快照不同：转债逐笔使用 3 位小数，快照使用 4 位。
+func realtimePriceScale(stock Security, snapshot bool) float64 {
+	if domain.IsConvertibleBond(stock) && snapshot {
+		return 10000
+	}
+	if domain.IsConvertibleBond(stock) || domain.IsETF(stock) {
+		return 1000
+	}
+	return 100
+}
+
+func decodeRealtimeTrades(body []byte, scale float64) ([]domain.RealtimeTrade, error) {
 	d := decoder{buf: body}
 	n, err := d.u16()
 	if err != nil {
@@ -274,7 +287,7 @@ func decodeRealtimeTrades(body []byte) ([]domain.RealtimeTrade, error) {
 			return nil, fmt.Errorf("成交明细字段无效")
 		}
 		base += delta
-		out = append(out, domain.RealtimeTrade{Time: fmt.Sprintf("%02d:%02d:%02d", minute/60, minute%60, second), Price: float64(base) / 100, Volume: volume, Trades: trades, Side: side})
+		out = append(out, domain.RealtimeTrade{Time: fmt.Sprintf("%02d:%02d:%02d", minute/60, minute%60, second), Price: float64(base) / scale, Volume: volume, Trades: trades, Side: side})
 	}
 	if d.remaining() != 0 {
 		return nil, fmt.Errorf("成交明细存在未解析字节：%d", d.remaining())

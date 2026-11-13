@@ -6,7 +6,9 @@
 
 ## 0. 读法
 
-先看第 1 章的分层与调用关系，再看你要用的那个脚本那一章，最后看第 9 章的流程与第 11 章的排错。
+只想快点跑起来：直接抄第 14 章的样例，报错查第 15 章对照表。
+
+要读懂再改：先看第 1 章的分层与调用关系，再看你要用的那个脚本那一章，流程看第 9 章，排错看第 11 章。
 
 命令都在仓库根执行。示例里用两个变量指代路径，粘贴前先按自己的机器设好：
 
@@ -27,13 +29,18 @@
 
 ~~~
 tdx_local.py      本地资产提取 + connect.cfg 解析/生成/校验       只读(仅输出)
-tdx_client.py     7709 协议客户端 + 本地 .day/.lc1 读取 + 复权入口  联网+只读
+tdx_client.py     7709 协议层：帧/握手常量、各记录编解码、价格精度、
+                  码表、本地读写、复权入口                        联网+只读
 tdx_adjust.py     gbbq 解密/加密、因子计算、复权应用               只读
 tdx_factors.py    复权事件库(SQLite)，线上同步与 gbbq 回写         写入+联网
 tdx_bootstrap.py  从零造目录树、填数、同步权息、校验               写入+联网
+tdx_realtime.py   采集调度：连接池、差分、增量落盘与回放、看板取数     联网
+tdx_dash.py       本地看板服务，把快照与逐笔喂给 dash.html          联网
 ~~~
 
-依赖方向（箭头表示 import）：tdx_bootstrap → tdx_local、tdx_client、tdx_adjust；tdx_factors → tdx_adjust、tdx_client；tdx_client → tdx_adjust（仅在 --adjust 时才 import，避免默认依赖）。
+职责边界：帧结构、握手、记录编解码、价格分母这些协议知识只在 tdx_client；tdx_realtime 只管连谁、什么时候发、失败了怎么办、数据落到哪。新增记录类型时先改 tdx_client，再在采集层调用。
+
+依赖方向（箭头表示 import）：tdx_bootstrap → tdx_local、tdx_client、tdx_adjust；tdx_factors → tdx_adjust、tdx_client；tdx_client → tdx_adjust（仅在 --adjust 时才 import，避免默认依赖）；tdx_realtime → tdx_client；tdx_dash → tdx_realtime。
 
 全部脚本只依赖标准库：argparse、base64、collections、configparser、csv、json、os、re、socket、sqlite3、struct、sys、threading、time、zlib、shutil、glob。没有 pandas、没有第三方包。
 
@@ -237,8 +244,15 @@ python tdx_local.py snapshot --out zs.csv --top 0
 | transaction_data(market, code, start, count) | 逐笔 | [{time, price, vol, num, buyorsell}] | buyorsell 0 买 1 卖 2 中性 |
 | request_raw(commtype, payload=b"", catword=1, ver=0, flag=0) | 裸帧请求 | 按 commtype 对齐的应答体 | 命令字在头 10..12、body 原样、两段长度相等即不压缩；最多丢 8 条夹带推送，3 次重连 |
 | info_hello() | 资讯口问候（0x1F7E） | {raw,time,build,path,f10,table} | 打 INFOHOST，必须先 handshake=False 与 sections=(INFOHOST,DSHOST) |
+| call(commtype, payload, catword, ver, flag, extra=0) | 组帧并走完整重试 | 应答体 | 全工程唯一的组帧入口；extra 抬高声明长度（逐笔族 +2），失败换机 |
+| list_page(market, start) | 取一页码表 | 应答体 | 握三条要逐条读应答，声明长度含 commtype |
+| snapshot(stocks) | 五档快照 | [记录字典] | 体形 = 前缀 + 数量 + 证券表 + 0C 01，尾部位置不能动 |
+| ticks(market, code, start, count) / orders(同) | 逐笔分钟版 / 带秒版 | [{t, price, vol, trades, side}] | 两者同一条流，只是后者多一个秒字节 |
+| probe() | 健康探测 | 应答体 | 打一条日线，能回就算活 |
 
-重试语义：_request 内 3 次，每次失败先 _close() 再重连——实测该服务端每连接只服务一次业务请求，不重连就必然拿不到第二条。上层不需要再包重试。
+**组帧只在这里**：0x0C 头、双长度、commtype、握手序列、价格分母都在本模块；tdx_realtime 与 tdx_bootstrap 只传参、不碰字节。
+
+重试语义：_request 与 call 内各 3 次，每次失败先 _close() 再换一台主机——实测该服务端每连接只服务一次业务请求，不重连就必然拿不到第二条，而换机是因为有一批机器连上即关。上层不需要再包重试。
 
 ### 3.4 本地读取与复权入口
 
@@ -414,8 +428,9 @@ build_factors 的前收查找是“日期严格小于事件日、且在库中最
 
 | 名称 | 内容 | 作用 |
 |---|---|---|
-| T0002_DIRS | 51 个目录名 | T0002 下的固定骨架（连 vipdoc 的 25 个共 76 个目录）（缓存、cloud_*、wt_*、User、log 等） |
-| MARKETS | bj、sh、sz、ds、ot、cw | vipdoc 一级市场目录 |
+| T0002_DIRS | 51 个目录名 | T0002 下的固定骨架（缓存、cloud_*、wt_*、User、log 等），连 vipdoc 的 21 个共 72 个目录 |
+| MARKETS | bj、sh、sz、ds、ot、cw | vipdoc 一级市场目录，含义见下方 |
+| MARKET_SUBS | 每个市场各自的周期子目录 | 沪、深、京四类（含 eday），ds 三类（无 eday），ot、cw 无 |
 | SUB_DIRS | lday、minline、fzline、eday | 每市场的周期子目录 |
 | REF_GLOBS | exe/dll/dax/daq/dai/xmb/ini/dat/dbf/cfg/json/txt/html/css/chm/bmp/jpg/ql/up | 从 --ref 复制的根文件白名单 |
 | REF_SKIP | connect.cfg、base.dbf | 不复制配置与主表，必须由生成器现造 |
@@ -438,7 +453,9 @@ verify 检查：目录齐全、connect.cfg 可解析且有主站、gbbq 长度�
 
 bootstrap.json 记 build_at、spec 与 cfg 的 sha256、目录数、复制清单；它同时是 verify 的比对基准，手改 connect.cfg 会让哈希校验失败。
 
-fill 与 sync_gbbq 都从目标树自己的 connect.cfg 取站点（--cfg 可覆盖），所以树必须先 init。
+fill 与 sync_gbbq 都从目标树自己的 connect.cfg 取站点，树必须先 init；--cfg 可直接指别处的配置。
+
+目标树没有 connect.cfg 时 fill 不再直接报错：依次回退到仓库根的 connect.cfg、connect.gen.cfg，最后回退安装目录的默认配置，并在 stderr 打一行提示说明改用了哪份。回退只解决连得上，树本身还是空的——T0002 骨架与 base.dbf 仍要 init 才有。只给一个空目录就 fill，报的是 connect.cfg 与 newhost.lst 都没有可用主机，就是这一条：树没造过。
 
 ### 6.3 命令
 
@@ -446,18 +463,22 @@ fill 与 sync_gbbq 都从目标树自己的 connect.cfg 取站点（--cfg 可覆
 |---|---|---|
 | plan | root | 0 |
 | init | root --spec --ref | 0 |
-| fill | root --market --codes --days --cfg、--no-merge | 0 |
+| fill | root --market --codes --days --cfg、--kind、--from、--no-merge | 0 |
+| delisted | src --markets --out | 0 |
+| archive | src --out --day | 0 |
 | sync | root --market --codes --limit --cfg、--redo、--jobs(默认 64) | 0 |
 | base | root --markets --limit --cfg | 0 |
 | login | root --cfg | 0 |
 | regen | root --spec --ref | 0 |
 | verify | root | 通过 0，有问题 1 |
 
-fill 默认合并写：按日期并进已有 .day，同日以新抓为准，旧历史保留，用来一天天攒长历史；只有 --no-merge 才整文件覆盖。
+fill 默认合并写：按时间键并进已有文件，同一时间点以新抓为准，旧历史保留，用来一天天攒长历史；只有 --no-merge 才整文件覆盖。--kind 选周期（day/min/5min/15min/30min/60min），--from 从别的树拷而不是走网络，退市股与超出保留深度的历史只能这样搬。
+
+delisted 扫一份现成 vipdoc，列出“本地有、主站码表没有”的代码，就是该保种的退市清单。archive 把 base.dbf 按日存档到 db/base，供日后回算 PB 一类估值。
 
 ### 6.4 实测规模
 
-init 产 76 目录、142 静态件、合计约 3836 文件（chrome 占 70）；不带 --ref 的裸 init 也能过（76 目录、4 站点、0 复制），只是没 exe。
+init 产 72 目录、148 静态件、合计约 3836 文件（chrome 占 70）；不带 --ref 的裸 init 也能过（72 目录、4 站点、0 复制），只是没 exe。
 
 ### 6.5 注意
 
@@ -468,7 +489,9 @@ init 产 76 目录、142 静态件、合计约 3836 文件（chrome 占 70）；
 
 ## 7. 小工具
 
-全部收在 re-tools\ 下，与建库主链隔离，说明见 re-tools\README.md。
+抓包与探针收在 re-tools\ 下，与建库主链隔离，说明见 re-tools\README.md；行情侧的常驻脚本是 tdx_realtime.py 与 tdx_dash.py，用法见第 14 章与 11.13-11.24。
+
+探针允许自己拼原始帧——它们就是拿去摸协议的，故意不走 tdx_client 的封装；主链脚本则一律用 tdx_client 的 call/snapshot/ticks/orders/list_page，模块里不再出现 0x0C 头。
 
 | 文件 | 作用 |
 |---|---|
@@ -523,6 +546,21 @@ identity（身份与品牌键）、hosts、try_hosts、info_hosts、wt_hosts、d
 build_at、spec_sha256、cfg_sha256、dirs、hosts、copied。verify 以 cfg_sha256 判定配置是否被手改。
 
 站点 name 留空时，build_sitecfg 会按分区自动命名（行情主站1、候选站1、数据站1、资讯站1、交易站1 各自的序号），spec 里写死 name 则原样采用。
+
+### 8.7 六个市场目录各是什么
+
+MARKETS 就是 vipdoc 下面那六个一级目录，客户端从 0x96a6c0 起按这串登记（ds\minline、bj\lday、sh\fzline、sz\eday 都在里面）：
+
+| 目录 | 含义 | 本机实况 |
+|---|---|---|
+| sh | 上海证券交易所 | 4837 个 day 文件，如 sh000001.day（上证指数） |
+| sz | 深圳证券交易所 | 4347 个 day 文件，如 sz000001.day |
+| bj | 北京证券交易所 | 353 个 day 文件，如 bj899050.day、bj920000.day |
+| ds | 扩展行情位，文件名带市场号前缀（模板 vipdoc\ds\lday\%d#%s.day），放期货连续、美股、港股这类非沪深京标的（静态串里就有 IFL0/AAPL/00001 三个例子） | 空目录，只有三个子目录、没有 eday |
+| ot | 杂项预留位，客户端字符串里查不到它，安装器照样建 | 空目录，连子目录都没有 |
+| cw | 财务位，放 gpcw<年月>.dat、gpsh999999.dat 与 gpcw.txt、gpszsh.txt 清单 | 只有两份 txt 清单（见 35 章） |
+
+只有前三个是真市场，行情文件按 市场前缀加六位代码 命名；ds 是另一套带 # 的命名；ot 与 cw 不走 %s\lday 那套。造树时按 MARKET_SUBS 分派子目录，别给 ds 建 eday、也别给 ot 和 cw 建子目录——实测这样造出来的树与安装目录逐目录一致，客户端能正常起窗。
 
 ## 9. 组合流程
 
@@ -815,6 +853,8 @@ python build\pw468.py     # 可复现回归：截断前后同一请求的日期�
 
 ### 11.13 tdx_realtime.py：盘口采集（41 章）
 
+> 本节写的是采集层的用法（池化、节奏、落盘）。帧、握手、记录编解码与价格分母都在 tdx_client，本模块只传参；要改协议去第 3 章。
+
 只读网络，不碰安装目录。协议细节与实测数字在报告 41 章，这里只讲怎么用、怎么坏、怎么修。
 
 ~~~
@@ -996,6 +1036,118 @@ python tdx_dash.py --port 8811
 
 边界：单进程两个 worker，只适合看几只票；要成规模还得走 run 那条采集链。
 
+### 11.18 RtdError: 连接被关闭 是什么
+
+不是协议错，是主机表里有“接受连接后立刻关闭”的机器（报告 41.6 记的那批）。这种关闭发生在 TCP 建连成功之后，_connect 的循环发现不了，于是 sendall 看着成功、recv 立刻回空，报成连接被关闭。
+
+本轮已从两头堵住：
+
+1. Worker._call 现在带 CALL_TRIES=3 的重试，每失败一次就把该主机挪到队尾（Pool.ban，留最后一台兜底），重试用尽才把异常抛给调用方。这个重试对池内所有取数都生效，不只网页。
+2. 看板连续错 5 次会自动重跑一遍 host 健康探测（note_error 起后台线程），长跑进程不会再抱着死表不放。
+
+实测：改前 40 次连打 40 错，改后 0 错；三只票各 6 次也全通。看到这条报错先确认服务在跑；仍高频出现就重跑 python tdx_dash.py（进程重启会重探主机），别只刷新页面。
+
+
+### 11.19 l2 子命令：逐笔增量落盘与回放
+
+逐笔是 3 秒粒度的流水，一只票一天几千条。要长期用就得先落盘，别每次现拉。
+
+~~~
+python tdx_realtime.py l2 fetch --codes 1:601881 --count 3000 --out build\ticks   # 往回翻
+python tdx_realtime.py l2 tail  --codes 1:601881 --seconds 60 --out build\ticks   # 只落新的
+python tdx_realtime.py l2 replay --market 1 --code 601881 --speed 1 --out build\ticks
+python tdx_realtime.py l2 check  --market 1 --code 601881 --out build\ticks
+~~~
+
+文件是 <根>/YYYYMMDD/<市场><代码>.<种类>.jsonl，一行一条，按 (分钟, 秒, 价, 量, 笔数) 去重，写入时按时间正序。tail 启动时从文件尾部回种已见签名，重启接着采，不重不漏；kind 进文件名，成交（order，0FC2）与不带秒的 tick（0FC5）不会互串。
+
+check 两套判据：**窗内**（默认主判据，缺省 0.5%）拿文件的整段去比在线回包同一时间窗的量，盘中就能用；**日线**那条要对到当日整日量，盘中文件只覆盖一段必然偏小，只作参考。任一条过就算通过。
+
+判据要点：服务端对 0FC2 一次最多回五百多条（实测 800 与 3000 都只回 561），往回翻靠 start 递增，单次别指望拿全；日线记录是日期倒序、0 是最新那根。
+
+主站分页上限意味着 fetch 的 count 只是上限，取不满就是没有了，别当失败。
+
+
+### 11.20 退市股：fill 的空结果、--from 拷贝、delisted 清单（42 章）
+
+主站只服务在册证券，退市代码（300431、300104 这类）日线一律 0 条，25 台主机与 13 个 category 全试过，码表里也没有。别以为是站的问题、别指望换站。
+
+fill 遇到 0 条的处置：
+
+- 有旧文件就原样保留，只报一行“无数据（退市或已摘牌）”，不会写成 0 字节
+- 没有任何文件就不造空文件
+- 末尾汇总带“N 只无数据”，一眼能看出这轮有几只是白问
+
+三条配套命令：
+
+~~~
+python tdx_bootstrap.py delisted C:\旧安装 --out build\delisted.txt     # 本地有、码表没有的代码
+python tdx_bootstrap.py fill 新树 --market 0 --codes 301139 --from C:\旧安装   # 离线拷 .day，按日合并
+python tdx_bootstrap.py sync 新树 --codes 300431                        # 权息还能取，因子照算
+~~~
+
+判据要点：差集里不全是退市，转债到期、ETF 摘牌、B 股、指数都会命中；代码前导零会被 PowerShell 当数字数组吃掉（000016 变 16），fill 与 sync 已统一按六位补零（norm_codes），别处调用要自己补。
+
+
+
+### 11.21 分钟线：kind 与 24k 条硬顶（43 章）
+
+分钟族有两道闸：单只单周期约 24000 条，以及滚动只留约两年。1 分钟先撞条数闸，只有四个半月；5/15/30 分钟都停在 2024-10 下旬（实测 23904/7920/3976 条，起点 10-21/10-24/10-22）。25 台主机结果一致，换站无解；日线不受影响。2015 年起的分钟只能靠旧备份 .lc1、客户端盘后数据下载或第三方源补齐。
+
+~~~
+python tdx_bootstrap.py fill 树 --market 1 --codes 600000 --days 0 --kind min
+python tdx_bootstrap.py fill 树 --market 1 --codes 600000 --days 0 --kind 5min
+~~~
+
+- kind：day（cat 9，lday/.day）、min（cat 7，minline/.lc1）、5min（cat 0，fzline/.lc5）、15min/30min/60min（cat 1/2/3，fzline/.lc15/.lc30/.lc60）
+- days 给 0 才翻到底；给数字就按条数收（单包上限 800）
+- 合并键是 (日, 时, 分)，重跑幂等；单段失败就地重连重试三次；0 条保留旧文件、不造空文件
+- 分钟记录 32 字节，打包日在 bit11 以上（年-2004），低 11 位是 月*100+日
+
+校验口径：把某日的分钟量求和与当日日线量比，应等于 1.0000（600000 五个交易日实测都是 1.0000）。改了分钟解析或打包必须重跑这个比值。
+
+
+### 11.22 价量之外有什么、PB 怎么算（44 章）
+
+服务端**没有** PB/PE/换手率这类现成字段，都是客户端拿财务与当日价自己算的。能拿的是：逐笔（含方向与笔数）、当日 240 点分时、五档与内外盘、0x000F 的股本与分配、码表里的每手股数与小数位，以及本地 base.dbf 的 40 个财务字段（总资产、净资产、净利润、主营收入、股东人数、行业、总股本、流通 A 股等）。
+
+财务只有"现在"一期，历史某天的每股净资产取不到，所以按天的估值只能自己攒：
+
+~~~
+python tdx_bootstrap.py archive C:\安装目录          # 存 db\base\YYYYMMDD.dbf
+python tdx_bootstrap.py archive 树 --day 20261105   # 补存指定日
+~~~
+
+归档的是 base.dbf 整份，同一天重复跑只要大小一致就不重写。自造 base.dbf 的财务字段是 0，必须用真安装的副本。
+
+派生量写法：PB = 价 ÷ (净资产/总股本)，PE = 价 ÷ (净利润/总股本)，换手率 = 当日量 ÷ 流通 A 股。财务包金额字段仍未解（35/36/39 章），解开才能补历史估值。
+
+
+### 11.23 ETF 与基金的市场判定（45 章）
+
+ETF 不用额外接口，053E 一样给，问题只出在市场判定。老规则"6/5 算沪、其余算深"会把 1 开头的沪市 ETF 判成深市、把 15 开头的深市 ETF 判成沪市，回包变成全零记录。
+
+现在的 guess_market：6/9 沪、0/2/3 深、5 沪、11/13 沪、12/15/16/17/18 深、8 与 920 北交所。冒号写法优先；显式市场与前缀不符先提示，若首轮价为零再按前缀改判重取，命中记录带 remapped。
+
+~~~
+python tdx_realtime.py once --codes 589020
+python tdx_dash.py --port 8811        # 或直接开 http://127.0.0.1:8811/?c=1:589020
+~~~
+
+实测：589020 回 8.82、159915 判 0 回 25.24、511880 判 1 回 1009.61。改判只救市场写错，代码本身写错仍是全零；4 开头的老三板按沪市兜底。
+
+
+### 11.24 价格分母按证券类型分三种（46 章）
+
+固定系数一定会错。三个通道口径不同【实连】：053E 快照是 10 的 小数位 次方（股票 1/100、ETF 1/1000、转债 1/10000），052D K 线一律 1/1000，0FC2/0FC5 逐笔股票 1/100、ETF 与转债 1/1000。小数位取自码表 0x0450 记录偏移 20。
+
+小数位表按市场整体拉一次，落 db\precision.json 缓存一周（首拉约 20 秒、之后 5 秒内），过期自动重拉。
+
+码表这族命令的写法与快照不同，抄错就超时：三条握手要一条一条发、每条读应答；声明长度要把 2 字节 commtype 算进去；一页 1000 条、页间 0.05 秒、失败换机重试五次。表按市场加载一次进内存，失败按 100 兜底。
+
+校验：python tdx_realtime.py once --codes 600036,589020,111024 --mode l1 应给 42.63 / 0.882 / 218.455，与同日 K 线收盘一致。改任一口径都要重对这三只的三通道。
+
+成交量单位另有一层：快照是手，K 线是股（ETF 是份、转债是张）。算换手率要乘每手股数，别拿两边直接除。
 ## 12. 变更须知
 
 源码里的中文注释是给 review 用的：改了帧字段、密钥表偏移、记录布局，注释要跟着改，别留过期说明。
@@ -1008,3 +1160,298 @@ python tdx_dash.py --port 8811
 6. 新增字段先加进 SCHEMA 的建表语句，再改 upsert，最后改 export，顺序反了会静默丢列。
 
 ## 13. 从零自举教程（不依赖 exe）
+
+目标：只用本仓库的脚本，从空目录造出一棵能连行情、能起窗的客户端树。全程不装官方安装器、不联网下载安装包；唯一的外部依赖是可选的 --ref 参照目录（提供 exe 与 chrome 等二进制，exe 是 VMP 的造不出来）。
+
+下面把 $root 当目标目录，示例用 data\tut；$tdx 当参照安装目录，例如 D:\neptune。
+
+### 13.1 先看清单
+
+~~~powershell
+python tdx_bootstrap.py plan data\tut
+~~~
+
+打印将创建的目录数与几个样例，并说明会写 connect.cfg、gbbq 占位、bootstrap.json。此时什么都没落盘，先确认目标路径。
+
+### 13.2 造骨架
+
+~~~powershell
+python tdx_bootstrap.py init data\tut --ref $tdx
+~~~
+
+产出 72 个目录、connect.cfg（25 分区、站点由参照的种子填）、gbbq 空占位、bootstrap.json 清单，并按白名单复制 148 个静态件。期望末行是"已生成 ... 目录 72"。
+
+不想碰安装目录也能跑：去掉 --ref，得到 72 目录、4 站点、0 复制的纯脚本树，只是没有 exe。
+
+### 13.3 造证券主表
+
+~~~powershell
+python tdx_bootstrap.py base data\tut
+~~~
+
+从码表抓在册证券，写成 T0002\hq_cache\base.dbf（约 5 万行、25 MB）。这一步联网、按市场分页，耗时几十秒；中途撞上连上即关的主机会自动换机重试。
+
+### 13.4 补权息
+
+~~~powershell
+python tdx_bootstrap.py sync data\tut --market 1 --limit 50
+python tdx_bootstrap.py sync data\tut --market 0 --limit 50
+~~~
+
+从 0x000F 抓除权除息写 gbbq，断点续传，重跑只补缺的。默认并发 64，失败会自动补抓三轮。要全市场就把 --limit 去掉慢慢跑。
+
+### 13.5 补行情
+
+~~~powershell
+python tdx_bootstrap.py fill data\tut --market 1 --codes 600000,600036 --days 800
+~~~
+
+按日期合并写入 vipdoc\sh\lday。攒历史就每天跑一次；--days 给多大取多少，最多 800。
+
+### 13.6 校验
+
+~~~powershell
+python tdx_bootstrap.py verify data\tut
+~~~
+
+期望"结论: 通过"。它逐项查目录、配置分区与站点、gbbq 长度自洽、主表行数与快照日；有缺项会列出来并返回 1。
+
+### 13.7 起窗
+
+~~~powershell
+Start-Process data\tut\TdxW.exe -WorkingDirectory (Resolve-Path data\tut)
+~~~
+
+等 20-30 秒看有没有主窗口。判据必须是**窗口**，不是进程存活——缺 chrome/ 时进程活着、日志只有版本号、永不建窗。
+
+### 13.8 常见偏差
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| init 报目标非空 | 目录里已有文件 | 换目录，或先清空 |
+| verify 报 UserHost.IPAddress 为空 | 配置没带站点种子 | 用 --ref 重跑 init，或 regen |
+| 进程在但没有窗口 | 缺 chrome/ 等程序目录 | 带 --ref 重新 init（会补复制） |
+| base 行数远少于预期 | 主站限流或站点全挂 | 换站后重跑，别连打 |
+| sync 失败一堆 | 并发过高 | 降到 --jobs 16 再跑 |
+
+### 13.9 这一章的边界
+
+自举出来的树能连行情、能起窗，但**交易通道仍要登录**（checkuser 密文未解，见 32 章），L2 权限同理。树里的 gbbq 与 vipdoc 都是自己抓的，来源可控；base.dbf 是现造，财务字段为 0，要真值得靠财务包（35、36 章）。
+
+## 14. 使用样例（照抄即可）
+
+下面每条都是能在仓库根直接跑的。命令都写 python，Windows 用 py 也一样；输出里有中文，控制台乱码时先 chcp 65001 或加 PYTHONIOENCODING=utf-8。
+
+### 14.1 先确认环境
+
+~~~powershell
+python -m py_compile tdx_local.py tdx_client.py tdx_adjust.py tdx_factors.py tdx_bootstrap.py tdx_realtime.py tdx_dash.py
+python tdx_client.py smoke --market 1 --code 600000
+python tdx_realtime.py probe-l2
+~~~
+
+期望：编译 0；smoke 连通并回包；probe-l2 输出 l2 true。任一条红先看第 11 章，别往下走。
+
+### 14.2 一份实时快照
+
+~~~powershell
+python tdx_realtime.py once --codes 600036
+python tdx_realtime.py once --codes 600036,000001,589020
+~~~
+
+一行一只的 JSON，字段含价、前收、开高低、量额、五档。批量一次最多 80 只，多了拆包并发走 rtt 那套。
+
+### 14.3 逐笔（带 3 秒时标）
+
+~~~powershell
+python tdx_realtime.py once --codes 600036 --l2-orders
+~~~
+
+给的是最近几十笔。要连续流水别用 once，用增量落盘：
+
+~~~powershell
+python tdx_realtime.py l2 tail --codes 1:600036,0:000001 --seconds 60 --out 数据目录
+python tdx_realtime.py l2 replay --market 1 --code 600036 --speed 60 --out 数据目录
+python tdx_realtime.py l2 check  --market 1 --code 600036 --out 数据目录
+~~~
+
+落盘是 <根>/YYYYMMDD/<市场><代码>.order.jsonl，一行一笔，按时间正序；tail 重启接着采不重放。check 的窗内偏差应接近 0。
+
+### 14.4 当日分时
+
+~~~powershell
+python tdx_client.py minute --market 1 --code 600036
+~~~
+
+240 个点，一分钟一个。要落文件用 --out。跨日分时见 14.6。
+
+### 14.5 看板
+
+~~~powershell
+python tdx_dash.py --port 8811
+~~~
+
+开 http://127.0.0.1:8811/ ，或直接双击 dash.html（file 协议也能用，服务没起会提示）。换票用顶栏，或带参数 http://127.0.0.1:8811/?c=1:589020 直接进 ETF。
+
+### 14.6 历史行情
+
+~~~powershell
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 600036 --days 800        # 日线，最多 800 根
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 600036 --days 0 --kind min   # 1 分钟，翻到底
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 600036 --days 0 --kind 5min  # 5 分钟
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 600036 --days 0 --kind 30min # 30 分钟
+~~~
+
+日线能到 2003；分钟族只留约 24000 条且滚动两年（1 分钟 4.5 个月，5/15/30 分钟到 2024 年 10 月，见 43 章）。**取指定日期**就是按 days 往回取够，再从落盘文件里按日期过滤——记录是定长 32 字节，日期在头 4 字节（分钟是 u16 打包日）。
+
+### 14.7 ETF 与转债
+
+~~~powershell
+python tdx_realtime.py once --codes 589020,159915
+python tdx_realtime.py once --codes 111024
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 589020 --days 0 --kind min
+~~~
+
+市场会自动按前缀判（5 沪、15 深、11 沪），写错市场会提示并按前缀改判。价格口径三种：快照按证券小数位、K 线一律 1/1000，别拿两边的价直接比。ETF 与转债的量单位是份与张，不是股。
+
+### 14.8 退市股与旧历史
+
+~~~powershell
+python tdx_bootstrap.py delisted C:\旧安装 --out build\delisted.txt
+python tdx_bootstrap.py fill 数据树 --market 0 --codes 301139 --from C:\旧安装
+python tdx_bootstrap.py fill 数据树 --market 1 --codes 589020 --kind min --from C:\旧安装
+~~~
+
+delisted 列出“本地有、主站没有”的代码（退市、到期转债、摘牌 ETF 都会中）；--from 只拷不联网，合并写不覆盖已有记录。
+
+### 14.9 权息与复权
+
+~~~powershell
+python tdx_bootstrap.py sync 数据树 --market 1 --codes 600000 --limit 5
+python tdx_adjust.py dump --gbbq 数据树\T0002\hq_cache\gbbq --out build\ev.csv
+python tdx_client.py bars --category 4 --market 1 --code 600000 --adjust hfq
+~~~
+
+sync 断点续传，重复跑只补缺的；复权用 hfq 或 qfq，因子缺失会明说并按不复权输出。
+
+### 14.10 估值（PB/PE）
+
+~~~powershell
+python tdx_bootstrap.py archive C:\安装目录
+python tdx_bootstrap.py archive C:\安装目录 --day 20261105
+~~~
+
+每天存一份 db/base/YYYYMMDD.dbf，之后按 PB = 价 ÷ (净资产/总股本) 回算。自造 base.dbf 的财务字段是 0，要用真安装的副本。
+
+### 14.11 换站
+
+~~~powershell
+python tdx_local.py hosts-update --cfg connect.cfg --path 清单目录
+python tdx_local.py sitecfg-check --path connect.cfg
+~~~
+
+只重写 HQHOST/TRYHQHOST/INFOHOST/DSHOST 四段，写前自检、留 .bak。
+
+### 14.12 自举一棵能起窗的树
+
+~~~powershell
+python tdx_bootstrap.py init 新树 --ref C:\neptune
+python tdx_bootstrap.py base 新树
+python tdx_bootstrap.py verify 新树
+~~~
+
+要起窗必须有 chrome/ 等程序目录，所以 --ref 指安装目录；纯脚本自举按第 13 章做。
+
+
+### 14.13 沪深指数与板块指数
+
+指数也是证券，接口一样通，但有三处与个股不同：代码歧义、没有五档、K 线一次只回一根。
+
+~~~
+python tdx_realtime.py once --codes 1:000001          # 上证指数
+python tdx_realtime.py once --codes 0:399001          # 深证成指
+python tdx_realtime.py once --codes 1:880008          # 板块指数（这里是 880008）
+python tdx_client.py bars --market 1 --code 000001 --category 4 --count 5
+python tdx_client.py minute --market 1 --code 000001
+python tdx_client.py tick --market 1 --code 880008 --count 5
+~~~
+
+实测：000001 回 3655.83、399001 回 11197.98、880008 回 1329.16；日线、分时 240 点、逐笔都出数，逐笔方向多为 2（中性），量是全市场合计。
+
+**代码歧义**：裸写 000001 会按前缀判成深市，也就是平安银行；指数必须带市场（1:000001 或 sh000001）。399xxx 属深市，880/881 属沪市。
+
+**没有五档**：指数的 bid1/ask1 与量是残值，别当真；看价、量、额、开高低就够。要盘口深度得用个股。
+
+**K 线与分时一次一根**：指数请求 count 再大也只回一根，所以 fill 与 minute 都改成按根往后挪。分时 240 点等于 240 次请求，比个股慢一个量级，批量取指数别开大并发。
+
+板块指数清单在安装目录的 T0002\hq_cache\tdxzsbase.cfg：管道分隔，第 1 列市场、第 2 列代码，880/881 前缀是板块，共 1072 条；个股码表里没有它们，所以 delisted 这类按码表比对的命令不会碰到板块。
+
+## 15. 报错对照
+
+| 报错 | 真因 | 处置 |
+|---|---|---|
+| connect.cfg 与 newhost.lst 都没有可用主机 | 目标树没建过、没有站点表 | 先 init，或 --cfg 指别的配置 |
+| RtdError: 连接被关闭 | 撞上"接受连接后立刻关闭"的主机 | 已内建换机重试；仍多就重启进程重探主机 |
+| TdxError: commtype 不匹配 | 帧头或声明长度写错 | 对照 46.1 与第 3 章，别凭记忆改 |
+| 回包价量全零 | 市场写错（例如 0:589020） | 写对市场，或让前缀自动判 |
+| 代码只按末位匹配、回包恒带 600839 | 快照尾巴 0C 01 放错位置 | 尾巴必须排在证券表之后 |
+| 分钟只回几十条就空 | 撞到 24000 条保留闸 | 用 5/15/30 分钟，或从旧树搬 |
+| 退市股 0 条 | 主站库只留在册证券 | delisted 找旧备份，fill --from 拷 |
+| Python 里文件名带中文报错 | 控制台编码 | chcp 65001 或 PYTHONIOENCODING=utf-8 |
+| 看板显示"连不上服务" | 服务没起 | 先 python tdx_dash.py --port 8811 |
+
+
+## 附录 A. 命令一览
+
+一行一条，只写用途；参数细节看对应章节。全部在仓库根执行，路径按自己的机器改。
+
+**看行情（tdx_client.py / tdx_realtime.py）**
+
+| 命令 | 用途 | 样例 |
+|---|---|---|
+| client smoke | 连通自检，回 5 笔逐笔 | python tdx_client.py smoke --code 600000 |
+| client count / codes | 证券数 / 码表分页 | python tdx_client.py codes --market 1 --count 5 |
+| client bars | K 线，--category 4 日线、7 分钟 | python tdx_client.py bars --code 111024 --category 4 --count 5 |
+| client minute | 当日分时 240 点 | python tdx_client.py minute --code 589020 |
+| client tick | 逐笔（无秒） | python tdx_client.py tick --code 111024 --count 5 |
+| client local | 读本地行情文件 | python tdx_client.py local --code 600036 |
+| client xdxr / login / info-hello | 除权除息 / 登录口探测 / 资讯口问候 | python tdx_client.py xdxr --code 600000 |
+| realtime once | 一份快照，加 --l2-orders 出带秒逐笔 | python tdx_realtime.py once --codes 589020 |
+| realtime probe-l2 | 本服是否给逐笔 | python tdx_realtime.py probe-l2 |
+| realtime rtt | 量往返 | python tdx_realtime.py rtt --codes 600000 --n 3 |
+| realtime run | 按订阅表轮询 | python tdx_realtime.py run --watch watch.txt |
+| realtime l2 fetch / tail | 历史逐笔 / 实时落盘 | python tdx_realtime.py l2 tail --codes 1:600036 --seconds 30 --out build\b1 |
+| realtime l2 replay / check | 回放 / 落盘量核对 | python tdx_realtime.py l2 check --market 1 --code 600036 --out build\b1 |
+| dash | 起看板 | python tdx_dash.py --port 8811 |
+
+**造树与数据（tdx_bootstrap.py）**
+
+| 命令 | 用途 | 样例 |
+|---|---|---|
+| plan / init / regen | 预览 / 造树 / 重造配置 | python tdx_bootstrap.py init data\tut --ref $tdx |
+| base | 生成证券主表 | python tdx_bootstrap.py base data\tut |
+| sync | 抓权息，断点续传 | python tdx_bootstrap.py sync data\tut --limit 50 |
+| fill | 抓行情落盘，--kind 选周期 | python tdx_bootstrap.py fill data\tut --market 1 --codes 600036 --days 800 |
+| fill --from | 从旧树拷，不走网络 | python tdx_bootstrap.py fill data\tut --codes 301139 --from C:\旧安装 |
+| delisted | 列“本地有、主站没有”的代码 | python tdx_bootstrap.py delisted C:\旧安装 --out build\d.txt |
+| archive | 按日存 base.dbf，供估值回算 | python tdx_bootstrap.py archive C:\安装目录 |
+| login / verify | 探登录口 / 校验树 | python tdx_bootstrap.py verify data\tut |
+
+**权息与因子（tdx_adjust.py / tdx_factors.py）**
+
+| 命令 | 用途 | 样例 |
+|---|---|---|
+| adjust check | 校验 gbbq | python tdx_adjust.py check --gbbq $tdx\T0002\hq_cache\gbbq |
+| adjust dump / factors / apply | 导出事件 / 算因子 / 套复权 | python tdx_adjust.py factors --gbbq $tdx\T0002\hq_cache\gbbq --market 1 --code 600000 |
+| factors import / sync / export / gbbq | 入库 / 线上同步 / 导出 CSV / 回写 gbbq | python tdx_factors.py export --db factors.db --out build\f.csv |
+
+**配置与升级（tdx_local.py）**
+
+| 命令 | 用途 | 样例 |
+|---|---|---|
+| sitecfg-parse / -check / -build / -defaults | 解析 / 自检 / 生成 / 默认值 | python tdx_local.py sitecfg-check --path connect.gen.cfg |
+| hosts-update | 按清单换站（--path 目标 cfg） | python tdx_local.py hosts-update --path connect.cfg --from T0002\newhost.lst --dry |
+| master / industry / index / snapshot / blocks / files | 主表 / 行业 / 指数 / 横截面 / 板块 / 文件清单 | python tdx_local.py --root $tdx master --limit 5 |
+| autoup-list / autoup-get / autoup-probe | 升级清单 / 取整包 / 探包名 | python tdx_local.py autoup-probe --base http://<站>/autoup/ a.zip b.zip |
+
+市场写法：可省（按前缀判），要精确就写 市场:代码，例如 1:000001 是上证指数、0:000001 是平安银行。指数与板块没有五档、K 线一次一根（见 14.13）。

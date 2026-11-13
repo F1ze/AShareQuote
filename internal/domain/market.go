@@ -79,15 +79,15 @@ type PriceFactor struct {
 // ExchangeTime 是行情使用的北京时间口径，与宿主操作系统时区无关。
 var ExchangeTime = time.FixedZone("Asia/Shanghai", 8*60*60)
 
-// Bar 始终使用未复权价，价格和成交额单位为元，时间使用市场时区，成交量为手（100 股）。
-// 成交量允许小数手；DuckDB/Parquet 适配器统一换算为股，不在领域层混用两种单位。
+// Bar 始终使用未复权价，价格和成交额单位为元，时间使用市场时区，成交量以百个证券单位计（股票为百股、ETF 为百份、转债为百张）。
+// 成交量允许小数手；DuckDB/Parquet 适配器统一换算为股、份或张，不在领域层混用两种单位。
 type Bar struct {
 	Date   time.Time `json:"date"`   // K 线市场时间；非分钟周期归档时归一到所属日期零点，分钟线保留时分。
 	Open   float64   `json:"open"`   // 周期内开盘价，未复权人民币元，必须为正。
 	High   float64   `json:"high"`   // 周期内最高价，元，应不低于开盘、收盘和最低价。
 	Low    float64   `json:"low"`    // 周期内最低价，元，应不高于开盘、收盘和最高价。
 	Close  float64   `json:"close"`  // 周期内收盘价，未复权人民币元，必须为正。
-	Volume float64   `json:"volume"` // 成交量，手；1 手=100 股，允许 0.95 手等奇数股对应值。
+	Volume float64   `json:"volume"` // 每 100 个证券单位为 1，保留不足 100 个单位的小数。
 	Amount float64   `json:"amount"` // 成交额，人民币元；不按价格×成交量重新推算，保留来源值。
 }
 

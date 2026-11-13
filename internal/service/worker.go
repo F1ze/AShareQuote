@@ -72,7 +72,7 @@ func (t *jobRun) persistBatch(batch domain.Batch, started time.Time) (FileResult
 	}
 	// 第 2 步：仅当本次确实载入了 gbbq 时更新对应附件；未配置不等于清空既有因子。
 	// 当前实现将 gbbq 写失败降级为覆盖警告；BaoStock 因子的失败策略在 remote.go 中处理。
-	if t.factors != nil {
+	if t.factors != nil && domain.IsAShare(batch.Security) {
 		events := t.factors[domain.FactorKey(batch.Security.Market, batch.Security.Code)]
 		if err := t.factorRepository.SaveAdjustment(t.ctx, t.output, batch.Security, events); err != nil {
 			batch.Warning += "；复权因子保存失败"

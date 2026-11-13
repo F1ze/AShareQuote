@@ -198,13 +198,17 @@ func run() error {
 			realtimeHosts = append(realtimeHosts, host)
 		}
 	}
-	realtime := service.NewRealtimeService(func(ctx context.Context) service.RealtimeSource {
+	realtimeClient := func(ctx context.Context) *tdx.Client {
 		client := tdx.NewClient(realtimeHosts, 3*time.Second, rand.IntN(len(realtimeHosts)))
 		client.SetContext(ctx)
 		client.SetDialer(dialer.DialContext)
 		client.SetWaitFunc(limiter.Wait)
 		return client
-	}, warehouse)
+	}
+	catalog := tdx.NewRealtimeNameCatalog(ctx, realtimeClient)
+	realtime := service.NewRealtimeService(func(ctx context.Context) service.RealtimeSource {
+		return realtimeClient(ctx)
+	}, service.WithRealtimeNameFallback(warehouse, catalog))
 	apiHandler := handler.NewServer(handler.Dependencies{
 		Realtime: realtime,
 		Jobs:     manager, Workspace: service.NewWorkspaceService(filesys.NewBrowser(manager.DefaultOutput()), provider, factory),
